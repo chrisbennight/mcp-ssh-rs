@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true
+  },
+  "enabledManagers": ["cargo", "dockerfile", "github-actions", "custom.regex"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Cargo updates are security-only; image and workflow references remain eligible for routine updates.",
+      "matchManagers": ["cargo"],
+      "enabled": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update explicit rustup and Rust toolchain version hints; checksum changes remain a reviewed manual step.",
+      "fileMatch": ["^\\.gitea/workflows/.*\\.ya?ml$", "^rust-toolchain\\.toml$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s*\\n\\s*(?:[A-Z0-9_]+|channel)\\s*[:=]\\s*\"(?<currentValue>[^\"]+)\""
+      ]
+    }
+  ]
+}

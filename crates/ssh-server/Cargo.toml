@@ -1,0 +1,42 @@
+[package]
+name = "ssh-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "mcp-ssh-rs"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+schemars = { workspace = true }
+anyhow = { workspace = true }
+askama = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+ssh-core = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# Only to make a real private key in tests. Committing one, even a throwaway,
+# puts key material in the repository and in every scanner's findings.
+russh = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

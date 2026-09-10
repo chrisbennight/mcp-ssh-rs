@@ -1,0 +1,25 @@
+blocked_paths: []
+# Orienting context. These notes make no claim about what the service
+# guarantees, and they do not narrow review — the supply-chain note below adds
+# a concern rather than deflecting one, which is the distinction that matters
+# for a file that is itself part of the diff.
+#
+# An earlier revision summarized the design's security properties, the way the
+# fleet's other services do. Within one commit the summary had drifted: one note
+# described a containment boundary as stronger than the design actually
+# provides, where the design defers that strengthening to optional later work.
+# A reviewer trusting the summary would have assessed code against a boundary
+# the service does not have — a review aid that makes review worse than none.
+#
+# Later revisions kept clauses telling the reviewer what to assess and what to
+# weigh less. Those were flagged, correctly: this file is part of the diff and a
+# sensitive path, so text here that narrows review is self-serving whatever its
+# stated reason.
+#
+# So: name what the service is and where its properties are defined. Do not
+# re-add a summary, however accurate it looks at the time, and do not add a
+# clause that tells the reviewer to weigh something less.
+notes:
+  - "This service mediates SSH access for AI agents acting on behalf of a human principal. What it guarantees, and what it deliberately does not, is defined in docs/design.md under 'Trust boundaries and invariants'."
+  - "docs/design.md is a sensitive path in this repository's review policy. A change to the trust boundaries or invariants is a change to the security contract, not documentation."
+  - "Container and workflow changes are supply-chain sensitive: digest pins, locked builds, non-root runtime, and configuration that references secrets rather than embedding them."

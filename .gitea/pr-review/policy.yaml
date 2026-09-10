@@ -1,0 +1,62 @@
+enabled: true
+repo: bennight/mcp-ssh-rs
+base_branches:
+  - main
+renovate_mode: eval
+status_context: pr-review/gate
+intent_sources:
+  include_pr_body: true
+  include_linked_issues: true
+  include_pr_comments: true
+  include_referenced_files: true
+intent_requirements:
+  require_design_goal: true
+  require_acceptance_criteria: true
+  minimum_sections_present: 2
+  max_referenced_files: 8
+  allowed_reference_extensions:
+    - .cedar
+    - .json
+    - .md
+    - .rs
+    - .sql
+    - .toml
+    - .yaml
+    - .yml
+review:
+  llm_required: true
+  max_diff_chars: 900000
+  max_comment_chars: 16000
+  agent_enabled: true
+verdict_states:
+  DO NOT MERGE: failure
+  RECOMMEND REVIEW: failure
+  RECOMMEND MERGE: success
+sensitive_paths:
+  - docs/design.md
+  - crates/**
+  - policy/**
+  - migrations/**
+  - Dockerfile
+  - gateway-manifest.yaml
+  - .gitea/workflows/**
+  - .gitea/pr-review/**
+impact_map:
+  docs/design.md: "The sole definition of the service's trust boundaries and invariants — what it guarantees, and what later implementation is held against"
+  crates/**: "SSH mediation, authorization, approval, and audit implementation"
+  policy/**: "Cedar authorization policies and the command classification catalog — the authorization contract"
+  migrations/**: "Session, approval grant, and hash-chained audit schema"
+  Dockerfile: "Published non-root service image and build supply chain"
+  gateway-manifest.yaml: "Gateway authorization, risk, side-effect, and PII classification contract"
+  .gitea/workflows/**: "CI, registry publication, and dependency-review boundary"
+  .gitea/pr-review/**: "AERB review and security policy"
+research:
+  enabled: true
+  max_collect_steps: 15
+  max_enhance_steps: 8
+  max_page_chars: 12000
+  max_sources: 10
+  max_report_chars: 16000
+  timeout_seconds: 300
+security_policy: security.yaml
+timeout_seconds: 120

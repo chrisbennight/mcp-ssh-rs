@@ -1,0 +1,898 @@
+//! What the process needs from its environment before it can mediate anything.
+//!
+//! Separate from [`ssh_core::config::Config`], which holds only the listen
+//! address, because the healthcheck is a second process reading the same
+//! environment: it needs to know where to probe and nothing else. Requiring it
+//! to also resolve a registry, a credential set, and the gateway's keys would
+//! make an unrelated misconfiguration read as an unhealthy container.
+
+use std::env::VarError;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use ssh_core::approval::Windows;
+use ssh_core::mediate::Bounds;
+use ssh_core::run::Limits;
+use ssh_core::session::Lifetime;
+use url::Url;
+
+use crate::ingress::{IdentitySettings, IngressError, SharedBearer};
+
+/// Separately authenticated source allowed to append advisory evaluations.
+#[derive(Clone)]
+pub struct EvaluatorSettings {
+    pub bearers: Arc<SharedBearer>,
+    /// Deployment-owned identity; evaluators cannot choose their audit name.
+    pub name: String,
+}
+
+/// Everything `serve` needs that is not compiled in.
+///
+/// `Debug` is written by hand: `SharedBearer` redacts itself and most of the
+/// rest is a path, a URL, and an issuer name - but the notify endpoint may
+/// embed a credential in its path, the way webhook services commonly issue
+/// them, so only its presence is shown.
+pub struct Settings {
+    /// Where the host and role registry is read from.
+    pub registry: PathBuf,
+    /// The gateway's service credential, current and previous.
+    pub bearers: SharedBearer,
+    /// The reverse proxy's credential for the dashboard, current and previous.
+    ///
+    /// Deliberately a different value from the gateway's. The dashboard decides
+    /// whether a flagged command runs, and the gateway is how the agent that
+    /// asked reaches this service - so one credential for both surfaces would
+    /// let a caller that reached the tools approve its own requests.
+    pub proxy_bearers: SharedBearer,
+    /// Optional, separately authenticated advisory-evaluation writer.
+    ///
+    /// It is neither the agent gateway nor the human review proxy: accepting
+    /// either credential here would let a decision participant manufacture
+    /// evidence under the evaluator's name.
+    pub evaluator: Option<EvaluatorSettings>,
+    /// Internal, read-only endpoint for the deployment-owned durable audit
+    /// source. Absent leaves historical dashboard views explicitly unavailable.
+    pub audit_query: Option<Url>,
+    /// Where the gateway publishes its signing keys, and what it calls itself.
+    pub identity: IdentitySettings,
+    /// Where to post a note when a command is waiting on a human.
+    ///
+    /// Absent means nobody is told. That is a supported configuration: the
+    /// dashboard still holds every waiting request, and a notifier is a pointer
+    /// to it rather than a channel for deciding.
+    pub notify: Option<Url>,
+    /// The approvals page's address as a human reaches it. Links in notes and
+    /// in held tool answers are this address with the waiting request's
+    /// identifier as the fragment, and nothing else is derived from it.
+    ///
+    /// Absent means notes are not sent even if an endpoint is configured, and
+    /// held answers name no page: a link that goes nowhere looks like the way
+    /// to answer, and is not.
+    pub dashboard: Option<Url>,
+    /// Where a deployment's replacement policy is read from, if it wrote one.
+    ///
+    /// Absent means the shipped policy. Present, the file's text replaces the
+    /// replaceable policy wholesale - the ceiling rules are prepended to it
+    /// either way, so a replacement narrows or widens what is allowed within
+    /// them and can never delete them.
+    pub policy: Option<PathBuf>,
+    /// The Host authorities the gateway reaches the MCP surface by, added to
+    /// the transport's loopback-only default so a request naming one is not
+    /// turned away as a rebinding attempt.
+    ///
+    /// The gateway addresses this service by a network name rather than by
+    /// loopback, so without this the transport's Host guard would refuse every
+    /// gateway call before the ingress ever saw it. Naming the authority in the
+    /// deployment — beside the URL the gateway is given — keeps the two in step
+    /// without compiling a name into the image. Empty leaves the default in
+    /// place: loopback only, which is every case that reaches this surface over
+    /// loopback and none that reaches it by name.
+    pub trusted_hosts: Vec<String>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("registry", &self.registry)
+            .field("bearers", &self.bearers)
+            .field("proxy_bearers", &self.proxy_bearers)
+            .field("evaluator_configured", &self.evaluator.is_some())
+            .field("audit_query_configured", &self.audit_query.is_some())
+            .field("identity", &self.identity)
+            .field("notify_configured", &self.notify.is_some())
+            .field("dashboard", &self.dashboard)
+            .field("trusted_hosts", &self.trusted_hosts)
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
+impl Settings {
+    pub const REGISTRY_VAR: &'static str = "MCP_SSH_REGISTRY";
+    pub const BEARER_VAR: &'static str = "MCP_SSH_GATEWAY_BEARER_CURRENT";
+    pub const PREVIOUS_BEARER_VAR: &'static str = "MCP_SSH_GATEWAY_BEARER_PREVIOUS";
+    pub const PROXY_BEARER_VAR: &'static str = "MCP_SSH_PROXY_BEARER_CURRENT";
+    pub const PREVIOUS_PROXY_BEARER_VAR: &'static str = "MCP_SSH_PROXY_BEARER_PREVIOUS";
+    pub const EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_CURRENT";
+    pub const PREVIOUS_EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_PREVIOUS";
+    pub const EVALUATOR_NAME_VAR: &'static str = "MCP_SSH_EVALUATOR_NAME";
+    pub const AUDIT_QUERY_VAR: &'static str = "MCP_SSH_AUDIT_QUERY_URL";
+    pub const NOTIFY_VAR: &'static str = "MCP_SSH_NOTIFY_URL";
+    pub const DASHBOARD_VAR: &'static str = "MCP_SSH_DASHBOARD_URL";
+    pub const JWKS_VAR: &'static str = "MCP_SSH_IDENTITY_JWKS_URL";
+    pub const ISSUER_VAR: &'static str = "MCP_SSH_IDENTITY_ISSUER";
+    pub const TRUSTED_HOSTS_VAR: &'static str = "MCP_SSH_TRUSTED_HOSTS";
+    pub const POLICY_VAR: &'static str = "MCP_SSH_POLICY_PATH";
+
+    pub fn from_env() -> Result<Self, SettingsError> {
+        Self::from_lookup(std::env::var)
+    }
+
+    /// Taking the lookup as a parameter lets tests exercise the real rules
+    /// without mutating the process environment, which is shared by every test
+    /// in the binary.
+    pub fn from_lookup<F>(lookup: F) -> Result<Self, SettingsError>
+    where
+        F: Fn(&'static str) -> Result<String, VarError>,
+    {
+        let registry = PathBuf::from(required(&lookup, Self::REGISTRY_VAR)?);
+
+        let current = required(&lookup, Self::BEARER_VAR)?;
+        SharedBearer::new(current.clone(), None).map_err(|source| SettingsError::Invalid {
+            var: Self::BEARER_VAR,
+            source,
+        })?;
+        let previous = optional(&lookup, Self::PREVIOUS_BEARER_VAR)?;
+        let bearer_error_var = if previous.is_some() {
+            Self::PREVIOUS_BEARER_VAR
+        } else {
+            Self::BEARER_VAR
+        };
+        let proxy_current = required(&lookup, Self::PROXY_BEARER_VAR)?;
+        SharedBearer::new(proxy_current.clone(), None).map_err(|source| {
+            SettingsError::Invalid {
+                var: Self::PROXY_BEARER_VAR,
+                source,
+            }
+        })?;
+        let proxy_previous = optional(&lookup, Self::PREVIOUS_PROXY_BEARER_VAR)?;
+        let proxy_error_var = if proxy_previous.is_some() {
+            Self::PREVIOUS_PROXY_BEARER_VAR
+        } else {
+            Self::PROXY_BEARER_VAR
+        };
+        let evaluator_current = optional(&lookup, Self::EVALUATOR_BEARER_VAR)?;
+        let evaluator_previous = optional(&lookup, Self::PREVIOUS_EVALUATOR_BEARER_VAR)?;
+        let evaluator_name = optional(&lookup, Self::EVALUATOR_NAME_VAR)?;
+        if evaluator_current.is_none() && (evaluator_previous.is_some() || evaluator_name.is_some())
+        {
+            return Err(SettingsError::Unusable {
+                var: Self::EVALUATOR_BEARER_VAR,
+            });
+        }
+        if evaluator_current.is_some() && evaluator_name.is_none() {
+            return Err(SettingsError::Unusable {
+                var: Self::EVALUATOR_NAME_VAR,
+            });
+        }
+        if evaluator_name.as_ref().is_some_and(|name| name.len() > 128) {
+            return Err(SettingsError::Unusable {
+                var: Self::EVALUATOR_NAME_VAR,
+            });
+        }
+
+        // The dashboard and the MCP surface are separated *by* these
+        // credentials: a value accepted on both would let whoever reaches the
+        // tools also open the page that approves their held commands. A
+        // deployment that configures that has removed the boundary, so startup
+        // refuses it, naming the proxy-side variable carrying the shared
+        // value.
+        let gateway_values = [Some(current.as_str()), previous.as_deref()];
+        for (proxy_value, var) in [
+            (Some(proxy_current.as_str()), Self::PROXY_BEARER_VAR),
+            (proxy_previous.as_deref(), Self::PREVIOUS_PROXY_BEARER_VAR),
+        ] {
+            let Some(proxy_value) = proxy_value else {
+                continue;
+            };
+            if gateway_values.iter().flatten().any(|v| *v == proxy_value) {
+                return Err(SettingsError::Invalid {
+                    var,
+                    source: IngressError::BearersSharedAcrossSurfaces,
+                });
+            }
+        }
+        let protected_values = [
+            Some(current.as_str()),
+            previous.as_deref(),
+            Some(proxy_current.as_str()),
+            proxy_previous.as_deref(),
+        ];
+        for (value, var) in [
+            (evaluator_current.as_deref(), Self::EVALUATOR_BEARER_VAR),
+            (
+                evaluator_previous.as_deref(),
+                Self::PREVIOUS_EVALUATOR_BEARER_VAR,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            if protected_values.iter().flatten().any(|held| *held == value) {
+                return Err(SettingsError::Invalid {
+                    var,
+                    source: IngressError::BearersSharedAcrossSurfaces,
+                });
+            }
+        }
+
+        let bearers =
+            SharedBearer::new(current, previous).map_err(|source| SettingsError::Invalid {
+                var: bearer_error_var,
+                source,
+            })?;
+        let proxy_bearers = SharedBearer::new(proxy_current, proxy_previous).map_err(|source| {
+            SettingsError::Invalid {
+                var: proxy_error_var,
+                source,
+            }
+        })?;
+        let evaluator = match (evaluator_current, evaluator_name) {
+            (Some(current), Some(name)) => {
+                let error_var = if evaluator_previous.is_some() {
+                    Self::PREVIOUS_EVALUATOR_BEARER_VAR
+                } else {
+                    Self::EVALUATOR_BEARER_VAR
+                };
+                let bearers = SharedBearer::new(current, evaluator_previous).map_err(|source| {
+                    SettingsError::Invalid {
+                        var: error_var,
+                        source,
+                    }
+                })?;
+                Some(EvaluatorSettings {
+                    bearers: Arc::new(bearers),
+                    name,
+                })
+            }
+            (None, None) => None,
+            _ => unreachable!("partial evaluator settings were refused above"),
+        };
+
+        let raw_jwks = required(&lookup, Self::JWKS_VAR)?;
+        let jwks_url = Url::parse(&raw_jwks).map_err(|_| SettingsError::Unusable {
+            var: Self::JWKS_VAR,
+        })?;
+        let identity = IdentitySettings {
+            jwks_url,
+            issuer: required(&lookup, Self::ISSUER_VAR)?,
+        };
+        identity
+            .validate()
+            .map_err(|source| SettingsError::Invalid {
+                var: if matches!(source, IngressError::IssuerBlank) {
+                    Self::ISSUER_VAR
+                } else {
+                    Self::JWKS_VAR
+                },
+                source,
+            })?;
+
+        Ok(Self {
+            registry,
+            bearers,
+            proxy_bearers,
+            evaluator,
+            // The runtime image deliberately has no TLS backend. Loki query
+            // access is internal-only in this deployment, on a shared Docker
+            // network, so a configured reader must name that plaintext hop.
+            audit_query: optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?,
+            identity,
+            // Refused here by variable name rather than later by whatever
+            // consumes them: an endpoint this image could never reach (it
+            // carries no TLS backend) and a dashboard link that is not a web
+            // address would each fail after startup, silently or in a note.
+            notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http"])?,
+            dashboard: optional_url(&lookup, Self::DASHBOARD_VAR, &["http", "https"])?,
+            trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
+            policy: optional(&lookup, Self::POLICY_VAR)?.map(PathBuf::from),
+        })
+    }
+}
+
+/// What the service will not exceed, until a deployment says otherwise.
+///
+/// Chosen here rather than read from the environment. Every value below is a
+/// bound on what one caller may consume, and a deployment that has not thought
+/// about them is better served by ones that were thought about than by none.
+/// They become configuration when an operator has a reason to disagree with a
+/// specific one, which is a smaller change than exposing knobs nobody has set.
+#[must_use]
+pub fn bounds() -> Bounds {
+    Bounds {
+        lifetime: Lifetime {
+            // Long enough for one piece of work to span a day, including long
+            // pauses between commands, while still bounding an abandoned
+            // session.
+            //
+            // Also has to outlast a command held for a person, with room to
+            // spare. The hold is the last thing that touches the session, and
+            // the answer is collected by a later attempt in that same session,
+            // so deciding and collecting both have to fit inside it or a
+            // decision dies with the session that was entitled to make it.
+            //
+            // Room to spare, because a lapse is only observable *after* the
+            // agreement stops being collectable: an agent that returns late
+            // learns nothing from a session that ended at the same moment its
+            // window did. Somebody agreeing at the last permitted moment is
+            // the case that decides this, so the session outlives that by a
+            // further collection window — long enough for the attempt that
+            // was owed the answer to come back and be told.
+            idle: 24 * 60 * 60 * 1_000,
+            // A ceiling on the window regardless of activity, so a session in
+            // continuous use is still a bounded grant rather than a standing
+            // one. It matches the idle window: either way, one day is the most
+            // a session can remain usable.
+            max: 24 * 60 * 60 * 1_000,
+            // Long enough that an agent retrying after a pause is told what its
+            // session was for rather than that it never existed.
+            grace: 10 * 60 * 1_000,
+        },
+        // Enough for an agent working several hosts at once; far short of what
+        // it takes to exhaust the service by opening sessions.
+        sessions_per_principal: 8,
+        run: Limits::default(),
+        approval: Windows {
+            // Long enough that somebody who was away from the keyboard when the
+            // request arrived can answer within the hour, and short enough that
+            // a question nobody wants stops waiting on its own.
+            decide_within: 60 * 60 * 1_000,
+            // The agent's turnaround is what this has to cover, not the
+            // person's: the window opens when the answer is given rather than
+            // when it was asked for. Long enough that an agent which left to
+            // tell somebody, and came back, still collects what it was given.
+            //
+            // An agreement is armed while it lasts — the approved command runs
+            // whenever the agent next asks, and nothing recalls it — so this is
+            // bounded rather than generous. One that outlives the window is not
+            // dropped quietly: the next attempt is told that it lapsed.
+            redeem_within: 15 * 60 * 1_000,
+        },
+        // A human-facing queue is the scarce resource. Keep one session from
+        // burying the request that matters while allowing a few related steps.
+        waiting_per_session: 4,
+    }
+}
+
+fn required<F>(lookup: &F, var: &'static str) -> Result<String, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    match lookup(var) {
+        Ok(value) if !value.trim().is_empty() => Ok(value.trim().to_owned()),
+        Ok(_) | Err(VarError::NotPresent) => Err(SettingsError::Missing { var }),
+        Err(VarError::NotUnicode(_)) => Err(SettingsError::Unusable { var }),
+    }
+}
+
+fn optional<F>(lookup: &F, var: &'static str) -> Result<Option<String>, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    match lookup(var) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value.trim().to_owned())),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(SettingsError::Unusable { var }),
+    }
+}
+
+/// A comma-separated list, trimmed, with empty entries dropped. Absent or all
+/// separators yields an empty list — the same as not setting it, because a
+/// value that names nothing asked for nothing.
+fn list<F>(lookup: &F, var: &'static str) -> Result<Vec<String>, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    let Some(raw) = optional(lookup, var)? else {
+        return Ok(Vec::new());
+    };
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn optional_url<F>(
+    lookup: &F,
+    var: &'static str,
+    schemes: &[&str],
+) -> Result<Option<Url>, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    let Some(raw) = optional(lookup, var)? else {
+        return Ok(None);
+    };
+    let url = Url::parse(&raw).map_err(|_| SettingsError::Unusable { var })?;
+    // A URL is not enough: `mailto:` parses. What these settings name is a
+    // place on the network, so anything without an allowed scheme and a host
+    // is refused under the variable that carries it.
+    if !schemes.contains(&url.scheme()) || !url.has_host() {
+        return Err(SettingsError::Unusable { var });
+    }
+    Ok(Some(url))
+}
+
+fn optional_base_url<F>(lookup: &F, var: &'static str) -> Result<Option<Url>, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    let Some(url) = optional_url(lookup, var, &["http"])? else {
+        return Ok(None);
+    };
+    if url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(SettingsError::Unusable { var });
+    }
+    Ok(Some(url))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    #[error("{var} must be set; the service cannot mediate access without it")]
+    Missing { var: &'static str },
+    #[error("{var} is set to something this service cannot read")]
+    Unusable { var: &'static str },
+    #[error("{var} is set to something this service cannot use: {source}")]
+    Invalid {
+        var: &'static str,
+        #[source]
+        source: IngressError,
+    },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const BEARER: &str = "0123456789abcdef0123456789abcdef";
+    const PROXY_BEARER: &str = "89abcdef0123456789abcdef01234567";
+
+    fn complete() -> HashMap<&'static str, String> {
+        HashMap::from([
+            (
+                Settings::REGISTRY_VAR,
+                "/etc/mcp-ssh/registry.json".to_owned(),
+            ),
+            (Settings::BEARER_VAR, BEARER.to_owned()),
+            (Settings::PROXY_BEARER_VAR, PROXY_BEARER.to_owned()),
+            (
+                Settings::JWKS_VAR,
+                "http://mcp-gateway:8080/.well-known/jwks.json".to_owned(),
+            ),
+            (Settings::ISSUER_VAR, "https://mcp.cacahuate.org".to_owned()),
+        ])
+    }
+
+    fn read<'a>(
+        vars: &'a HashMap<&'static str, String>,
+    ) -> impl Fn(&'static str) -> Result<String, VarError> + 'a {
+        move |name| vars.get(name).cloned().ok_or(VarError::NotPresent)
+    }
+
+    #[test]
+    fn a_complete_environment_is_accepted() {
+        let vars = complete();
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert_eq!(
+            settings.registry,
+            PathBuf::from("/etc/mcp-ssh/registry.json")
+        );
+        assert!(settings.bearers.accepts(BEARER.as_bytes()));
+        assert_eq!(settings.identity.issuer, "https://mcp.cacahuate.org");
+    }
+
+    /// The service authenticates its only caller and decides what that caller
+    /// may reach, so starting without any of these would mean starting without
+    /// the thing it exists to do. Every one of them is refused by name, because
+    /// "failed to start" is not an answer an operator can act on.
+    #[test]
+    fn every_setting_the_service_cannot_work_without_is_named_when_it_is_missing() {
+        for var in [
+            Settings::REGISTRY_VAR,
+            Settings::BEARER_VAR,
+            Settings::PROXY_BEARER_VAR,
+            Settings::JWKS_VAR,
+            Settings::ISSUER_VAR,
+        ] {
+            let mut vars = complete();
+            vars.remove(var);
+            let err = Settings::from_lookup(read(&vars)).unwrap_err();
+            assert!(
+                matches!(err, SettingsError::Missing { var: named } if named == var),
+                "{var} missing produced {err:?}"
+            );
+
+            // Present but blank is the same failure as absent: a variable set
+            // to nothing is a deployment that meant to set it.
+            let mut blanked = complete();
+            blanked.insert(var, "   ".to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&blanked)).unwrap_err(),
+                SettingsError::Missing { .. }
+            ));
+        }
+    }
+
+    /// The dashboard and the MCP surface are separated by their credentials,
+    /// so a value accepted on both is a configuration that removed the
+    /// boundary; startup refuses it, naming the proxy-side variable that
+    /// carries the shared value.
+    #[test]
+    fn a_credential_shared_between_the_gateway_and_the_proxy_is_refused() {
+        for (var, value) in [
+            (Settings::PROXY_BEARER_VAR, BEARER),
+            (Settings::PREVIOUS_PROXY_BEARER_VAR, BEARER),
+        ] {
+            let mut vars = complete();
+            vars.insert(var, value.to_owned());
+            let err = Settings::from_lookup(read(&vars)).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    SettingsError::Invalid {
+                        var: named,
+                        source: IngressError::BearersSharedAcrossSurfaces,
+                    } if *named == var
+                ),
+                "sharing via {var} produced {err:?}"
+            );
+        }
+
+        // The other direction of a rotation: the gateway's *previous* value
+        // reused as the proxy's current one is the same removed boundary.
+        let mut vars = complete();
+        vars.insert(Settings::PREVIOUS_BEARER_VAR, PROXY_BEARER.to_owned());
+        assert!(matches!(
+            Settings::from_lookup(read(&vars)).unwrap_err(),
+            SettingsError::Invalid {
+                var: Settings::PROXY_BEARER_VAR,
+                source: IngressError::BearersSharedAcrossSurfaces,
+            }
+        ));
+    }
+
+    #[test]
+    fn evaluator_settings_are_optional_and_separately_authenticated() {
+        let vars = complete();
+        assert!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .evaluator
+                .is_none()
+        );
+
+        let evaluator_bearer = "fedcba9876543210fedcba9876543210";
+        let mut vars = complete();
+        vars.insert(Settings::EVALUATOR_BEARER_VAR, evaluator_bearer.to_owned());
+        vars.insert(Settings::EVALUATOR_NAME_VAR, "intent-reviewer".to_owned());
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        let evaluator = settings.evaluator.expect("evaluator configured");
+        assert!(evaluator.bearers.accepts(evaluator_bearer.as_bytes()));
+        assert!(!evaluator.bearers.accepts(BEARER.as_bytes()));
+        assert!(!evaluator.bearers.accepts(PROXY_BEARER.as_bytes()));
+        assert_eq!(evaluator.name, "intent-reviewer");
+    }
+
+    #[test]
+    fn durable_audit_reader_is_optional_and_accepts_only_an_internal_http_base() {
+        let vars = complete();
+        assert!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .audit_query
+                .is_none()
+        );
+
+        let mut configured = complete();
+        configured.insert(Settings::AUDIT_QUERY_VAR, "http://loki:3100/".to_owned());
+        assert_eq!(
+            Settings::from_lookup(read(&configured))
+                .unwrap()
+                .audit_query
+                .as_ref()
+                .map(Url::as_str),
+            Some("http://loki:3100/")
+        );
+
+        for value in [
+            "https://loki:3100/",
+            "http://user:secret@loki:3100/",
+            "http://loki:3100/a/path",
+            "http://loki:3100/?token=secret",
+        ] {
+            let mut invalid = complete();
+            invalid.insert(Settings::AUDIT_QUERY_VAR, value.to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&invalid)).unwrap_err(),
+                SettingsError::Unusable {
+                    var: Settings::AUDIT_QUERY_VAR
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn partial_or_shared_evaluator_settings_are_refused() {
+        let evaluator_bearer = "fedcba9876543210fedcba9876543210";
+        for (var, value, expected) in [
+            (
+                Settings::EVALUATOR_NAME_VAR,
+                "intent-reviewer",
+                Settings::EVALUATOR_BEARER_VAR,
+            ),
+            (
+                Settings::EVALUATOR_BEARER_VAR,
+                evaluator_bearer,
+                Settings::EVALUATOR_NAME_VAR,
+            ),
+        ] {
+            let mut vars = complete();
+            vars.insert(var, value.to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&vars)).unwrap_err(),
+                SettingsError::Unusable { var } if var == expected
+            ));
+        }
+
+        for shared in [BEARER, PROXY_BEARER] {
+            let mut vars = complete();
+            vars.insert(Settings::EVALUATOR_BEARER_VAR, shared.to_owned());
+            vars.insert(Settings::EVALUATOR_NAME_VAR, "intent-reviewer".to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&vars)).unwrap_err(),
+                SettingsError::Invalid {
+                    var: Settings::EVALUATOR_BEARER_VAR,
+                    source: IngressError::BearersSharedAcrossSurfaces,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn evaluator_credentials_are_redacted_from_debug_output() {
+        let secret = "fedcba9876543210fedcba9876543210";
+        let mut vars = complete();
+        vars.insert(Settings::EVALUATOR_BEARER_VAR, secret.to_owned());
+        vars.insert(Settings::EVALUATOR_NAME_VAR, "intent-reviewer".to_owned());
+        let rendered = format!("{:?}", Settings::from_lookup(read(&vars)).unwrap());
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("evaluator_configured"));
+    }
+
+    /// A webhook endpoint commonly carries its credential in the path, and a
+    /// settings value is exactly the kind of thing diagnostics format whole -
+    /// so the rendered form must say whether a notifier is configured and
+    /// nothing about where it points.
+    #[test]
+    fn debug_output_never_contains_the_notify_endpoint() {
+        let mut vars = complete();
+        vars.insert(
+            Settings::NOTIFY_VAR,
+            "http://ntfy/hook/a-secret-token-nobody-may-see".to_owned(),
+        );
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        let rendered = format!("{settings:?}");
+        assert!(
+            !rendered.contains("a-secret-token-nobody-may-see") && !rendered.contains("ntfy"),
+            "the notify endpoint reached the debug form: {rendered}"
+        );
+        assert!(rendered.contains("notify_configured"));
+    }
+
+    /// The notifier settings are optional, but a present value has to name a
+    /// place on the network this image can reach: a `mailto:` dashboard or an
+    /// `https` webhook (this image has no TLS backend) would each fail after
+    /// startup instead of at it, under nobody's name.
+    #[test]
+    fn a_notifier_setting_that_could_never_work_is_refused_by_name() {
+        for (var, value) in [
+            (Settings::NOTIFY_VAR, "https://ntfy/mcp-ssh"),
+            (Settings::NOTIFY_VAR, "not a url"),
+            (Settings::DASHBOARD_VAR, "mailto:chris@example.org"),
+            (Settings::DASHBOARD_VAR, "data:text/plain,hello"),
+        ] {
+            let mut vars = complete();
+            vars.insert(var, value.to_owned());
+            let err = Settings::from_lookup(read(&vars)).unwrap_err();
+            assert!(
+                matches!(&err, SettingsError::Unusable { var: named } if *named == var),
+                "{var}={value} produced {err:?}"
+            );
+        }
+
+        let mut vars = complete();
+        vars.insert(Settings::NOTIFY_VAR, "http://ntfy/mcp-ssh".to_owned());
+        vars.insert(
+            Settings::DASHBOARD_VAR,
+            "https://ssh.cacahuate.org/".to_owned(),
+        );
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(settings.notify.is_some());
+        assert!(settings.dashboard.is_some());
+    }
+
+    /// The previous bearer is the one setting that is genuinely optional: it
+    /// exists only while a rotation is in flight.
+    #[test]
+    fn the_previous_bearer_is_optional_and_accepted_when_present() {
+        let previous = "fedcba9876543210fedcba9876543210";
+        let mut vars = complete();
+        assert!(Settings::from_lookup(read(&vars)).is_ok());
+
+        vars.insert(Settings::PREVIOUS_BEARER_VAR, previous.to_owned());
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(settings.bearers.accepts(BEARER.as_bytes()));
+        assert!(settings.bearers.accepts(previous.as_bytes()));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_a_setting() {
+        let mut vars = complete();
+        vars.insert(
+            Settings::ISSUER_VAR,
+            "  https://mcp.cacahuate.org  ".to_owned(),
+        );
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert_eq!(settings.identity.issuer, "https://mcp.cacahuate.org");
+    }
+
+    #[test]
+    fn unusable_ingress_settings_are_refused_by_name() {
+        let cases = [
+            (
+                Settings::BEARER_VAR,
+                Settings::BEARER_VAR,
+                "short".to_owned(),
+            ),
+            (
+                Settings::PREVIOUS_BEARER_VAR,
+                Settings::PREVIOUS_BEARER_VAR,
+                "short".to_owned(),
+            ),
+            (
+                Settings::PREVIOUS_BEARER_VAR,
+                Settings::PREVIOUS_BEARER_VAR,
+                BEARER.to_owned(),
+            ),
+            (
+                Settings::JWKS_VAR,
+                Settings::JWKS_VAR,
+                "https://mcp-gateway.invalid/jwks.json".to_owned(),
+            ),
+        ];
+        for (changed, expected, value) in cases {
+            let mut vars = complete();
+            vars.insert(changed, value);
+            let error = Settings::from_lookup(read(&vars)).unwrap_err();
+            assert!(
+                matches!(error, SettingsError::Invalid { var, .. } if var == expected),
+                "{changed} produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_key_set_url_is_refused_by_name() {
+        let mut vars = complete();
+        vars.insert(Settings::JWKS_VAR, "not a url".to_owned());
+        assert!(matches!(
+            Settings::from_lookup(read(&vars)).unwrap_err(),
+            SettingsError::Unusable {
+                var: Settings::JWKS_VAR
+            }
+        ));
+    }
+
+    /// Trusted hosts are a list beside the gateway's URL, not a single value:
+    /// absent means the transport keeps its loopback-only default, and a set
+    /// value is split, trimmed, and stripped of the empty entries a trailing or
+    /// doubled comma leaves — so the same nothing whether unset or set to
+    /// separators alone.
+    #[test]
+    fn trusted_hosts_are_an_optional_trimmed_list() {
+        let vars = complete();
+        assert!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .trusted_hosts
+                .is_empty(),
+            "an unset list produced entries"
+        );
+
+        for blank in ["", "   ", " , ,"] {
+            let mut vars = complete();
+            vars.insert(Settings::TRUSTED_HOSTS_VAR, blank.to_owned());
+            assert!(
+                Settings::from_lookup(read(&vars))
+                    .unwrap()
+                    .trusted_hosts
+                    .is_empty(),
+                "{blank:?} produced entries"
+            );
+        }
+
+        let mut vars = complete();
+        vars.insert(
+            Settings::TRUSTED_HOSTS_VAR,
+            " mcp-ssh:8080 , mcp-ssh ,".to_owned(),
+        );
+        assert_eq!(
+            Settings::from_lookup(read(&vars)).unwrap().trusted_hosts,
+            ["mcp-ssh:8080", "mcp-ssh"],
+        );
+    }
+
+    /// A deployment's policy is a path, and optional: absent means the
+    /// shipped policy, and a present value is carried as-is for startup to
+    /// read - the ceiling rules apply either way.
+    #[test]
+    fn the_policy_path_is_optional() {
+        let vars = complete();
+        assert!(Settings::from_lookup(read(&vars)).unwrap().policy.is_none());
+
+        let mut vars = complete();
+        vars.insert(Settings::POLICY_VAR, "/etc/mcp-ssh/policy.cedar".to_owned());
+        assert_eq!(
+            Settings::from_lookup(read(&vars)).unwrap().policy,
+            Some(PathBuf::from("/etc/mcp-ssh/policy.cedar"))
+        );
+    }
+
+    /// The bounds are a deliberate set rather than defaults nobody chose, so
+    /// their operating windows are pinned rather than left implicit in
+    /// arithmetic at the construction site.
+    #[test]
+    fn the_shipped_windows_match_the_operating_budget() {
+        let bounds = bounds();
+        assert_eq!(bounds.lifetime.idle, 24 * 60 * 60 * 1_000);
+        assert_eq!(bounds.lifetime.max, 24 * 60 * 60 * 1_000);
+        assert_eq!(bounds.approval.decide_within, 60 * 60 * 1_000);
+        assert_eq!(bounds.approval.redeem_within, 15 * 60 * 1_000);
+    }
+
+    /// The bounds are a deliberate set rather than defaults nobody chose, so
+    /// this pins the relationships that would be wrong in any deployment: a
+    /// session cannot idle for longer than it may live, a lapsed session must
+    /// be remembered for long enough to say so, and a session must outlast a
+    /// command held in it.
+    #[test]
+    fn the_shipped_bounds_are_internally_coherent() {
+        let bounds = bounds();
+        assert!(bounds.lifetime.idle <= bounds.lifetime.max);
+        assert!(bounds.lifetime.grace > 0);
+        assert!(bounds.sessions_per_principal > 0);
+        // Holding a command is the last thing that touches its session, and the
+        // answer is collected by a later attempt in that same session. Deciding
+        // and collecting therefore both have to fit inside an idle session, or
+        // a person is left entitled to decide something no attempt can act on.
+        //
+        // And a further collection window beyond that, because a lapse becomes
+        // reportable only once the agreement has stopped being collectable, and
+        // only while the session is still there to report it in. Sized to the
+        // case that decides it: somebody agreeing at the last permitted moment,
+        // whose agreement then expires at the latest instant it can.
+        assert!(
+            bounds.lifetime.idle
+                >= bounds.approval.decide_within + 2 * bounds.approval.redeem_within,
+            "a lapse could become reportable only after its session had gone"
+        );
+    }
+}

@@ -1,0 +1,8 @@
+# The build stage compiles from source, so anything already built is useless to
+# it. CI runs the test suite before building the image, which leaves a large
+# target directory in the context; without this every image build would transfer
+# and snapshot it.
+target/
+**/target/
+
+.git/
