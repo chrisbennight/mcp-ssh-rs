@@ -19,8 +19,10 @@ cargo doc --workspace --no-deps --locked
 
 CI also checks `Cargo.lock` against the public RustSec advisory database. To
 reproduce it locally, install the `cargo-audit` version pinned in
-[CI](.github/workflows/ci.yml), then run `cargo audit --file Cargo.lock`.
-This fails on known vulnerable dependencies and does not require GitHub's
+[CI](.github/workflows/ci.yml), then run `python3 .ci/audit.py` with Python 3.11
+or newer. This fails on yanked dependencies and known vulnerabilities except
+the version-bounded [RSA assessment](docs/dependency-security.md).
+It does not require GitHub's
 Dependabot alerts to be enabled. It runs when CI runs; it does not continuously
 monitor an unchanged branch or prove that dependencies have no vulnerabilities.
 
