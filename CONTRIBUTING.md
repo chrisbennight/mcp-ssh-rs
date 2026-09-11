@@ -17,6 +17,13 @@ cargo test --workspace --all-features --locked
 cargo doc --workspace --no-deps --locked
 ```
 
+CI also checks `Cargo.lock` against the public RustSec advisory database. To
+reproduce it locally, install the `cargo-audit` version pinned in
+[CI](.github/workflows/ci.yml), then run `cargo audit --file Cargo.lock`.
+This fails on known vulnerable dependencies and does not require GitHub's
+Dependabot alerts to be enabled. It runs when CI runs; it does not continuously
+monitor an unchanged branch or prove that dependencies have no vulnerabilities.
+
 Tests use loopback servers and generated keys. They must not contact real SSH
 targets or use production credentials. Changes to behavior need a regression
 test. Read the [design](docs/design.md) before changing authorization or execution.
@@ -36,11 +43,11 @@ authenticated MCP session or a real SSH target.
 
 ## GitHub checks and images
 
-[CI](.github/workflows/ci.yml) runs `test` and `verify-image` on pull requests
+[CI](.github/workflows/ci.yml) runs `audit`, `test`, and `verify-image` on pull requests
 and pushes to `main`, using GitHub-hosted runners and public dependencies.
 The Dockerfile's optional crate mirror is not required by CI.
 
-After both checks pass on a push to `main`, `publish` builds and checks its own
+After all checks pass on a push to `main`, `publish` builds and checks its own
 image, then pushes `ghcr.io/chrisbennight/mcp-ssh-rs:sha-<full-commit-sha>`.
 Only that job receives package-write permission. It uses the workflow's
 `GITHUB_TOKEN`; no Infisical credentials or deployment webhook are needed.
@@ -56,7 +63,7 @@ sharing a pull command. Repository visibility does not itself publish a package.
 
 GitHub repository settings and installed apps are managed separately from the
 checked-in workflow. Before merging, configure a rule for `main` requiring a
-pull request, up-to-date branches, `test`, `verify-image`, and `pr-review/gate`.
+pull request, up-to-date branches, `audit`, `test`, `verify-image`, and `pr-review/gate`.
 Restrict force pushes and deletion. Do not require `publish` on PRs: it runs
 only after a push to `main`.
 

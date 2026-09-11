@@ -19,8 +19,8 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Update the pinned Rust toolchain.",
-      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
+      "description": "Update explicitly pinned Rust tool versions.",
+      "managerFilePatterns": ["/^rust-toolchain\\.toml$/", "/^\\.github/workflows/ci\\.yml$/"],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s*\\n\\s*(?:[A-Z0-9_]+|channel)\\s*[:=]\\s*\"(?<currentValue>[^\"]+)\""
       ]

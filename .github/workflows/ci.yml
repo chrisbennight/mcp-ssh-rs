@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # renovate: datasource=crate depName=cargo-audit
+      CARGO_AUDIT_VERSION: "0.22.2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+      - name: Check the lockfile against RustSec advisories
+        run: cargo audit --file Cargo.lock
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -42,7 +57,7 @@ jobs:
         run: python3 .ci/smoke_image.py mcp-ssh-ci
 
   publish:
-    needs: [test, verify-image]
+    needs: [audit, test, verify-image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
