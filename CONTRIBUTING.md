@@ -5,6 +5,9 @@ Work on a branch and open a pull request against `main`. Describe the problem,
 the resulting behavior, and how you tested it. Do not include credentials or
 private deployment configuration in a patch or diagnostic output.
 
+For suspected vulnerabilities, use [Security reports](SECURITY.md). Maintainers
+preparing a public snapshot should follow [Preparing a public release](docs/releases.md).
+
 ## Local checks
 
 Install Rust through rustup, then run these commands from the repository root.

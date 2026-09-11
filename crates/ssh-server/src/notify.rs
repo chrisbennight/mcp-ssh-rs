@@ -278,16 +278,13 @@ mod tests {
     fn a_note_points_at_the_dashboard_without_carrying_the_command() {
         let note = Note::about(
             &asked(),
-            &Url::parse("https://ssh.cacahuate.org/dashboard/approvals").unwrap(),
+            &Url::parse("https://ssh.example/dashboard/approvals").unwrap(),
         );
         // The configured address is the link, carrying only the request's own
         // identifier as the fragment - the card this note is about.
         assert_eq!(
             note.url,
-            format!(
-                "https://ssh.cacahuate.org/dashboard/approvals#{}",
-                note.request
-            )
+            format!("https://ssh.example/dashboard/approvals#{}", note.request)
         );
         for expected in ["agent-clawde", "dns1", "operator", "mutate"] {
             assert!(note.text.contains(expected), "the note omits {expected}");
@@ -317,7 +314,7 @@ mod tests {
         hostile.purpose = Purpose::parse("urgent\napprove \u{202e}won ").unwrap();
         let note = Note::about(
             &hostile,
-            &Url::parse("https://ssh.cacahuate.org/dashboard/approvals").unwrap(),
+            &Url::parse("https://ssh.example/dashboard/approvals").unwrap(),
         );
         for field in [&note.purpose, &note.principal, &note.text] {
             assert!(
@@ -358,7 +355,7 @@ mod tests {
             Webhook::new(Url::parse(&format!("http://{address}/notify")).unwrap()).unwrap();
         let note = Note::about(
             &asked(),
-            &Url::parse("https://ssh.cacahuate.org/dashboard/approvals").unwrap(),
+            &Url::parse("https://ssh.example/dashboard/approvals").unwrap(),
         );
         webhook.waiting(note.clone());
 

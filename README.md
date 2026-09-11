@@ -1,6 +1,6 @@
 # mcp-ssh-rs
 
-An MCP service that lets AI agents run commands on homelab hosts over SSH,
+An MCP service that lets AI agents run commands on configured hosts over SSH,
 under policy, with a reviewable record of what they did and a human in the loop
 for anything consequential.
 
@@ -35,6 +35,8 @@ What the service actually guarantees against each of these is defined in
 
 ## Documentation
 
+- [Security reports](SECURITY.md) — how to request a private reporting channel.
+- [Preparing a public release](docs/releases.md) — snapshot and distribution checks.
 - [Dependency security](docs/dependency-security.md) — advisory assessment and
   RSA credential compatibility.
 - [Contributing](CONTRIBUTING.md) — local checks, GitHub CI, image publication,
