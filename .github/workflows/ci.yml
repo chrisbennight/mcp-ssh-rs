@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup show active-toolchain
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --all-features --locked
+      - name: Rust documentation
+        run: cargo doc --workspace --no-deps --locked
+
+  verify-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build from public dependencies
+        run: docker build --tag mcp-ssh-ci .
+      - name: Check the container
+        run: python3 .ci/smoke_image.py mcp-ssh-ci
+
+  publish:
+    needs: [test, verify-image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Build in this trusted job rather than loading an artifact from a PR.
+      - name: Build the publication candidate
+        run: |
+          docker build --tag mcp-ssh-publish \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" .
+      - name: Check the publication candidate
+        run: python3 .ci/smoke_image.py mcp-ssh-publish
+      - name: Publish to GHCR and verify the image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-${GITHUB_SHA}"
+          image_id=$(docker image inspect --format '{{.Id}}' mcp-ssh-publish)
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker tag "$image_id" "$image"
+          docker push "$image"
+          docker image rm "$image"
+          docker pull "$image"
+          test "$(docker image inspect --format '{{.Id}}' "$image")" = "$image_id"
+          docker image inspect --format '{{json .RepoDigests}}' "$image"

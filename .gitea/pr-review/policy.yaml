@@ -1,5 +1,5 @@
 enabled: true
-repo: bennight/mcp-ssh-rs
+repo: chrisbennight/mcp-ssh-rs
 base_branches:
   - main
 renovate_mode: eval
@@ -35,20 +35,16 @@ verdict_states:
 sensitive_paths:
   - docs/design.md
   - crates/**
-  - policy/**
-  - migrations/**
   - Dockerfile
-  - gateway-manifest.yaml
-  - .gitea/workflows/**
+  - .ci/**
+  - .github/workflows/**
   - .gitea/pr-review/**
 impact_map:
   docs/design.md: "The sole definition of the service's trust boundaries and invariants — what it guarantees, and what later implementation is held against"
   crates/**: "SSH mediation, authorization, approval, and audit implementation"
-  policy/**: "Cedar authorization policies and the command classification catalog — the authorization contract"
-  migrations/**: "Session, approval grant, and hash-chained audit schema"
   Dockerfile: "Published non-root service image and build supply chain"
-  gateway-manifest.yaml: "Gateway authorization, risk, side-effect, and PII classification contract"
-  .gitea/workflows/**: "CI, registry publication, and dependency-review boundary"
+  .ci/**: "Container verification scripts"
+  .github/workflows/**: "CI and GHCR publication"
   .gitea/pr-review/**: "AERB review and security policy"
 research:
   enabled: true

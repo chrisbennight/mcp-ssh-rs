@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
-repository = "https://gitea.cacahuate.org/bennight/mcp-ssh-rs"
+repository = "https://github.com/chrisbennight/mcp-ssh-rs"
 
 [workspace.dependencies]
 anyhow = "1"

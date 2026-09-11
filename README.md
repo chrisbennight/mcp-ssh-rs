@@ -35,6 +35,8 @@ What the service actually guarantees against each of these is defined in
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md) — local checks, GitHub CI, image publication,
+  and maintainer setup.
 - **`docs/design.md`** — intent, trust boundaries, component responsibilities,
   and the decisions behind them. Read its **non-goals** section first. Several
   plausible-sounding features are excluded deliberately, and that boundary is
