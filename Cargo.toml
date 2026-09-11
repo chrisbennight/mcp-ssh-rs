@@ -17,6 +17,7 @@ anyhow = "1"
 aws-lc-rs = "1.18"
 askama = "0.16"
 axum = "0.8"
+base64 = "0.22"
 cedar-policy = "4.12"
 clap = { version = "4", features = ["derive"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
