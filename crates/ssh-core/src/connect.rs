@@ -24,6 +24,8 @@ use crate::registry::{CredentialRef, PinnedHostKey, Target};
 use crate::secret::Secret;
 use crate::{HostId, RoleId};
 
+mod rsa;
+
 /// Where the service gets the material it authenticates with.
 ///
 /// A seam rather than a concrete store: the values live in the fleet's secret
@@ -129,6 +131,14 @@ impl<S: CredentialSource> Connector<S> {
                 reference: target.credential().as_str().to_owned(),
             }
         })?;
+        let mut rsa_signer = key
+            .key_data()
+            .rsa()
+            .map(|rsa| rsa::RsaSigner::new(rsa, key.public_key().clone()))
+            .transpose()
+            .map_err(|_| ConnectError::UnusableCredential {
+                reference: target.credential().as_str().to_owned(),
+            })?;
 
         // `keepalive_max` is left at russh's default. It is how many questions
         // may go unanswered before the connection is given up on, and the
@@ -180,16 +190,29 @@ impl<S: CredentialSource> Connector<S> {
             .ok()
             .flatten()
             .flatten();
-        let authenticated = handle
-            .authenticate_publickey(
-                target.user(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
-            )
-            .await
-            .map_err(|_| ConnectError::AuthenticationFailed {
-                host: target.host().to_string(),
-                user: target.user().to_owned(),
-            })?;
+        let authenticated = if let Some(signer) = rsa_signer.as_mut() {
+            handle
+                .authenticate_publickey_with(
+                    target.user(),
+                    key.public_key().clone(),
+                    rsa_hash,
+                    signer,
+                )
+                .await
+                .map_err(|_| ())
+        } else {
+            handle
+                .authenticate_publickey(
+                    target.user(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
+                )
+                .await
+                .map_err(|_| ())
+        }
+        .map_err(|_| ConnectError::AuthenticationFailed {
+            host: target.host().to_string(),
+            user: target.user().to_owned(),
+        })?;
         if !authenticated.success() {
             return Err(ConnectError::AuthenticationRejected {
                 host: target.host().to_string(),
@@ -312,7 +335,13 @@ pub fn usable_credential(material: &Secret<String>) -> bool {
     // passphrase to give and no way to ask for one, so such a key would pass a
     // check that only asked whether it parsed and then fail on the first
     // connection — which is the discovery this check exists to move earlier.
-    PrivateKey::from_openssh(material.expose()).is_ok_and(|key| !key.is_encrypted())
+    PrivateKey::from_openssh(material.expose()).is_ok_and(|key| {
+        !key.is_encrypted()
+            && key
+                .key_data()
+                .rsa()
+                .is_none_or(|rsa| rsa::RsaSigner::new(rsa, key.public_key().clone()).is_ok())
+    })
 }
 
 fn parse_pinned(pinned: &PinnedHostKey) -> Result<PublicKey, ConnectError> {
@@ -546,17 +575,29 @@ mod tests {
     /// authentication are protocol behaviour, and a fake that agreed with our
     /// own idea of the protocol would pass while a real target refused.
     async fn start_server(answer: Answer) -> Running {
+        start_server_with_rsa_sha1_only(answer, false).await
+    }
+
+    async fn start_server_with_rsa_sha1_only(answer: Answer, legacy_rsa: bool) -> Running {
         let host_key =
             keys::PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519).unwrap();
         let pinned =
             PinnedHostKey::parse(&host_key.public_key().to_openssh().unwrap().to_string()).unwrap();
 
-        let config = Arc::new(server::Config {
+        let mut config = server::Config {
             inactivity_timeout: Some(Duration::from_secs(30)),
             auth_rejection_time: Duration::from_millis(1),
             keys: vec![host_key],
             ..server::Config::default()
-        });
+        };
+        if legacy_rsa {
+            config.preferred.key = vec![
+                keys::Algorithm::Ed25519,
+                keys::Algorithm::Rsa { hash: None },
+            ]
+            .into();
+        }
+        let config = Arc::new(config);
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -582,6 +623,48 @@ mod tests {
             .to_openssh(ssh_key::LineEnding::LF)
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn authenticates_with_an_rsa_credential() {
+        let pair = ssh_key::private::RsaKeypair::random(&mut rand::rng(), 2048).unwrap();
+        let private = PrivateKey::from(pair);
+        let key = private
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        assert!(usable_credential(&Secret::new(key.clone())));
+        let server = start_server(Answer::Accept).await;
+        let connector = connector(FakeStore::with(REFERENCE, &key));
+        let registry = registry_for(&server.address, &server.host_key);
+        let target = registry.resolve(&host(), &role()).unwrap();
+        let connection = connector.connect(&target).await.unwrap();
+        assert_eq!(
+            *server.seen.lock().unwrap(),
+            vec![(
+                "mcp-ro".to_owned(),
+                private.public_key().to_openssh().unwrap()
+            )]
+        );
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_rsa_credential_cannot_fall_back_to_sha1_signing() {
+        let pair = ssh_key::private::RsaKeypair::random(&mut rand::rng(), 2048).unwrap();
+        let key = PrivateKey::from(pair)
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let server = start_server_with_rsa_sha1_only(Answer::Accept, true).await;
+        let connector = connector(FakeStore::with(REFERENCE, &key));
+        let registry = registry_for(&server.address, &server.host_key);
+        let target = registry.resolve(&host(), &role()).unwrap();
+        assert!(matches!(
+            connector.connect(&target).await,
+            Err(ConnectError::AuthenticationFailed { .. })
+        ));
+        assert!(server.seen.lock().unwrap().is_empty());
     }
 
     const REFERENCE: &str = "mcp-ssh/test/readonly";

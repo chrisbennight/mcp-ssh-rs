@@ -14,11 +14,12 @@ repository = "https://github.com/chrisbennight/mcp-ssh-rs"
 
 [workspace.dependencies]
 anyhow = "1"
+aws-lc-rs = "1.18"
 askama = "0.16"
 axum = "0.8"
 cedar-policy = "4.12"
 clap = { version = "4", features = ["derive"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 # No TLS backend. Every reqwest request is plaintext on the internal network:
 # the healthcheck's GET to itself over loopback, the ingress fetching the
 # gateway's signing keys from a sibling container, and the notifier posting a
@@ -31,6 +32,7 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # key set that answers with anything unexpected is refused, not believed.
 # russh brings its own crypto, because SSH is cryptography and that one is used.
 rand = "0.10"
+rsa = "0.10.0-rc.18"
 rmcp = { version = "=2.2.0", default-features = false, features = [
     "server",
     # The transport the gateway speaks to upstreams. Enabled here rather than in

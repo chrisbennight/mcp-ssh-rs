@@ -1,0 +1,4 @@
+[advisories]
+# Application-specific assessment: docs/dependency-security.md.
+# .ci/audit.py requires reassessment when the affected dependency changes.
+ignore = ["RUSTSEC-2023-0071"]
