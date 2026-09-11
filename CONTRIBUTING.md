@@ -37,6 +37,7 @@ and OpenSSH's `ssh-keygen`, then run:
 docker build --tag mcp-ssh-ci .
 python3 .ci/smoke_image.py mcp-ssh-ci
 python3 .ci/verify_https.py --image mcp-ssh-ci
+python3 .ci/verify_quickstart.py mcp-ssh-ci
 ```
 
 The smoke test uses a generated key, a disposable registry, and an isolated
@@ -51,6 +52,12 @@ Loki reads with trusted, untrusted, expired, and wrong-host certificates, and
 checks that redirects are not followed. Its container mode requires a local
 Linux Docker daemon. Generated credentials and containers are removed; the
 small target image remains cached.
+
+The separate Quickstart check starts a disposable SSH target and exercises the
+real MCP route, a permitted command, a held command, the separate operator
+login, cross-origin refusal, result collection, and audit identities. It removes
+its containers and generated credentials afterward. Stop an existing tutorial
+before running it; the check refuses to reuse `.quickstart/`.
 
 ## GitHub checks and images
 

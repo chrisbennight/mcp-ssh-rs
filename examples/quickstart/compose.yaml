@@ -1,0 +1,39 @@
+services:
+  target:
+    build:
+      context: .
+    volumes:
+      - ${DEMO_DATA_DIR}/host_key:/etc/ssh/ssh_host_ed25519_key:ro
+      - ${DEMO_DATA_DIR}/client_key.pub:/etc/ssh/demo_authorized_keys:ro
+    networks: [demo]
+    healthcheck:
+      test: [CMD-SHELL, 'test -s /run/sshd.pid && kill -0 "$$(cat /run/sshd.pid)"']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+  service:
+    image: ${DEMO_SERVICE_IMAGE:-mcp-ssh-demo-service}
+    build:
+      context: ../..
+    environment:
+      MCP_SSH_AUTH_MODE: standalone
+      MCP_SSH_BEARER: ${DEMO_MCP_BEARER}
+      MCP_SSH_OPERATOR_PASSWORD: ${DEMO_OPERATOR_PASSWORD}
+      MCP_SSH_REGISTRY: /config/registry.json
+      MCP_SSH_CREDENTIAL_DEMO: ${DEMO_SSH_KEY}
+      MCP_SSH_DASHBOARD_URL: http://localhost:${DEMO_PORT}/dashboard/approvals
+    volumes:
+      - ${DEMO_DATA_DIR}/registry.json:/config/registry.json:ro
+    ports:
+      - 127.0.0.1:${DEMO_PORT}:8080
+    networks: [demo, front]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      target:
+        condition: service_healthy
+networks:
+  front: {}
+  demo:
+    internal: true

@@ -4,6 +4,7 @@
 debug/
 target/
 .worktrees/
+.quickstart/
 __pycache__/
 .env
 .env.*

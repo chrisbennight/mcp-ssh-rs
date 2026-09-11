@@ -4,7 +4,7 @@ Instructions for coding agents working in `mcp-ssh-rs`.
 
 ## Purpose
 
-An MCP service that lets AI agents run commands on homelab hosts over SSH,
+An MCP service that lets AI agents run commands on configured hosts over SSH,
 under policy and with a human in the loop for anything consequential. What it
 guarantees, and what it deliberately does not, is defined in the design rather
 than summarized here.

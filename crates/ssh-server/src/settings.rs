@@ -10,6 +10,7 @@ use std::env::VarError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ssh_core::PrincipalId;
 use ssh_core::approval::Windows;
 use ssh_core::mediate::Bounds;
 use ssh_core::run::Limits;
@@ -17,6 +18,15 @@ use ssh_core::session::Lifetime;
 use url::Url;
 
 use crate::ingress::{IdentitySettings, IngressError, SharedBearer};
+
+#[derive(Clone, Debug)]
+pub enum Authentication {
+    Gateway(IdentitySettings),
+    Standalone {
+        principal: PrincipalId,
+        operator: String,
+    },
+}
 
 /// Separately authenticated source allowed to append advisory evaluations.
 #[derive(Clone)]
@@ -35,9 +45,9 @@ pub struct EvaluatorSettings {
 pub struct Settings {
     /// Where the host and role registry is read from.
     pub registry: PathBuf,
-    /// The gateway's service credential, current and previous.
+    /// The MCP credential, current and optional previous value.
     pub bearers: SharedBearer,
-    /// The reverse proxy's credential for the dashboard, current and previous.
+    /// The dashboard proxy credential, or standalone operator password.
     ///
     /// Deliberately a different value from the gateway's. The dashboard decides
     /// whether a flagged command runs, and the gateway is how the agent that
@@ -53,8 +63,8 @@ pub struct Settings {
     /// Internal, read-only endpoint for the deployment-owned durable audit
     /// source. Absent leaves historical dashboard views explicitly unavailable.
     pub audit_query: Option<Url>,
-    /// Where the gateway publishes its signing keys, and what it calls itself.
-    pub identity: IdentitySettings,
+    /// Explicit identity source for the MCP and human surfaces.
+    pub identity: Authentication,
     /// Where to post a note when a command is waiting on a human.
     ///
     /// Absent means nobody is told. That is a supported configuration: the
@@ -108,6 +118,11 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
+    pub const AUTH_MODE_VAR: &'static str = "MCP_SSH_AUTH_MODE";
+    pub const STANDALONE_BEARER_VAR: &'static str = "MCP_SSH_BEARER";
+    pub const PRINCIPAL_VAR: &'static str = "MCP_SSH_PRINCIPAL";
+    pub const OPERATOR_PASSWORD_VAR: &'static str = "MCP_SSH_OPERATOR_PASSWORD";
+    pub const OPERATOR_NAME_VAR: &'static str = "MCP_SSH_OPERATOR_NAME";
     pub const REGISTRY_VAR: &'static str = "MCP_SSH_REGISTRY";
     pub const BEARER_VAR: &'static str = "MCP_SSH_GATEWAY_BEARER_CURRENT";
     pub const PREVIOUS_BEARER_VAR: &'static str = "MCP_SSH_GATEWAY_BEARER_PREVIOUS";
@@ -136,22 +151,67 @@ impl Settings {
         F: Fn(&'static str) -> Result<String, VarError>,
     {
         let registry = PathBuf::from(required(&lookup, Self::REGISTRY_VAR)?);
-
-        let current = required(&lookup, Self::BEARER_VAR)?;
+        let standalone = match optional(&lookup, Self::AUTH_MODE_VAR)?.as_deref() {
+            None | Some("gateway") => false,
+            Some("standalone") => true,
+            Some(_) => {
+                return Err(SettingsError::Unusable {
+                    var: Self::AUTH_MODE_VAR,
+                });
+            }
+        };
+        let incompatible: &[&'static str] = if standalone {
+            &[
+                Self::BEARER_VAR,
+                Self::PREVIOUS_BEARER_VAR,
+                Self::PROXY_BEARER_VAR,
+                Self::PREVIOUS_PROXY_BEARER_VAR,
+                Self::JWKS_VAR,
+                Self::ISSUER_VAR,
+            ]
+        } else {
+            &[
+                Self::STANDALONE_BEARER_VAR,
+                Self::PRINCIPAL_VAR,
+                Self::OPERATOR_PASSWORD_VAR,
+                Self::OPERATOR_NAME_VAR,
+            ]
+        };
+        for &var in incompatible {
+            if optional(&lookup, var)?.is_some() {
+                return Err(SettingsError::Unusable { var });
+            }
+        }
+        let current_var = if standalone {
+            Self::STANDALONE_BEARER_VAR
+        } else {
+            Self::BEARER_VAR
+        };
+        let proxy_current_var = if standalone {
+            Self::OPERATOR_PASSWORD_VAR
+        } else {
+            Self::PROXY_BEARER_VAR
+        };
+        let current = required(&lookup, current_var)?;
         SharedBearer::new(current.clone(), None).map_err(|source| SettingsError::Invalid {
-            var: Self::BEARER_VAR,
+            var: current_var,
             source,
         })?;
         let previous = optional(&lookup, Self::PREVIOUS_BEARER_VAR)?;
         let bearer_error_var = if previous.is_some() {
             Self::PREVIOUS_BEARER_VAR
         } else {
-            Self::BEARER_VAR
+            current_var
         };
-        let proxy_current = required(&lookup, Self::PROXY_BEARER_VAR)?;
+        let proxy_current = required(&lookup, proxy_current_var)?;
+        if standalone && proxy_current.len() > 1024 {
+            return Err(SettingsError::Unusable {
+                var: proxy_current_var,
+            });
+        }
         SharedBearer::new(proxy_current.clone(), None).map_err(|source| {
             SettingsError::Invalid {
-                var: Self::PROXY_BEARER_VAR,
+                var: proxy_current_var,
                 source,
             }
         })?;
@@ -159,7 +219,7 @@ impl Settings {
         let proxy_error_var = if proxy_previous.is_some() {
             Self::PREVIOUS_PROXY_BEARER_VAR
         } else {
-            Self::PROXY_BEARER_VAR
+            proxy_current_var
         };
         let evaluator_current = optional(&lookup, Self::EVALUATOR_BEARER_VAR)?;
         let evaluator_previous = optional(&lookup, Self::PREVIOUS_EVALUATOR_BEARER_VAR)?;
@@ -189,7 +249,7 @@ impl Settings {
         // value.
         let gateway_values = [Some(current.as_str()), previous.as_deref()];
         for (proxy_value, var) in [
-            (Some(proxy_current.as_str()), Self::PROXY_BEARER_VAR),
+            (Some(proxy_current.as_str()), proxy_current_var),
             (proxy_previous.as_deref(), Self::PREVIOUS_PROXY_BEARER_VAR),
         ] {
             let Some(proxy_value) = proxy_value else {
@@ -257,24 +317,58 @@ impl Settings {
             _ => unreachable!("partial evaluator settings were refused above"),
         };
 
-        let raw_jwks = required(&lookup, Self::JWKS_VAR)?;
-        let jwks_url = Url::parse(&raw_jwks).map_err(|_| SettingsError::Unusable {
-            var: Self::JWKS_VAR,
-        })?;
-        let identity = IdentitySettings {
-            jwks_url,
-            issuer: required(&lookup, Self::ISSUER_VAR)?,
-        };
-        identity
-            .validate()
-            .map_err(|source| SettingsError::Invalid {
-                var: if matches!(source, IngressError::IssuerBlank) {
-                    Self::ISSUER_VAR
-                } else {
-                    Self::JWKS_VAR
-                },
-                source,
+        let identity = if standalone {
+            let principal =
+                optional(&lookup, Self::PRINCIPAL_VAR)?.unwrap_or_else(|| "local".to_owned());
+            let principal =
+                PrincipalId::parse(&principal).map_err(|_| SettingsError::Unusable {
+                    var: Self::PRINCIPAL_VAR,
+                })?;
+            let operator = optional(&lookup, Self::OPERATOR_NAME_VAR)?
+                .unwrap_or_else(|| "operator".to_owned());
+            if operator.contains(':') || PrincipalId::parse(&operator).is_err() {
+                return Err(SettingsError::Unusable {
+                    var: Self::OPERATOR_NAME_VAR,
+                });
+            }
+            for (name, var) in [
+                (principal.as_str(), Self::PRINCIPAL_VAR),
+                (operator.as_str(), Self::OPERATOR_NAME_VAR),
+            ] {
+                if bearers.accepts(name.as_bytes())
+                    || proxy_bearers.accepts(name.as_bytes())
+                    || evaluator
+                        .as_ref()
+                        .is_some_and(|settings| settings.bearers.accepts(name.as_bytes()))
+                {
+                    return Err(SettingsError::Unusable { var });
+                }
+            }
+            Authentication::Standalone {
+                principal,
+                operator,
+            }
+        } else {
+            let raw_jwks = required(&lookup, Self::JWKS_VAR)?;
+            let jwks_url = Url::parse(&raw_jwks).map_err(|_| SettingsError::Unusable {
+                var: Self::JWKS_VAR,
             })?;
+            let identity = IdentitySettings {
+                jwks_url,
+                issuer: required(&lookup, Self::ISSUER_VAR)?,
+            };
+            identity
+                .validate()
+                .map_err(|source| SettingsError::Invalid {
+                    var: if matches!(source, IngressError::IssuerBlank) {
+                        Self::ISSUER_VAR
+                    } else {
+                        Self::JWKS_VAR
+                    },
+                    source,
+                })?;
+            Authentication::Gateway(identity)
+        };
 
         Ok(Self {
             registry,
@@ -459,6 +553,56 @@ mod tests {
     const BEARER: &str = "0123456789abcdef0123456789abcdef";
     const PROXY_BEARER: &str = "89abcdef0123456789abcdef01234567";
 
+    fn standalone() -> HashMap<&'static str, String> {
+        HashMap::from([
+            (Settings::AUTH_MODE_VAR, "standalone".to_owned()),
+            (Settings::REGISTRY_VAR, "registry.json".to_owned()),
+            (Settings::STANDALONE_BEARER_VAR, BEARER.to_owned()),
+            (Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned()),
+        ])
+    }
+
+    #[test]
+    fn standalone_starts_without_a_gateway_and_has_fixed_names() {
+        let vars = standalone();
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(
+            matches!(settings.identity, Authentication::Standalone { principal, operator }
+            if principal.as_str() == "local" && operator == "operator")
+        );
+        assert!(settings.bearers.accepts(BEARER.as_bytes()));
+        assert!(!settings.proxy_bearers.accepts(BEARER.as_bytes()));
+    }
+
+    #[test]
+    fn standalone_configuration_is_explicit_and_credentials_are_separate() {
+        for missing in [
+            Settings::AUTH_MODE_VAR,
+            Settings::STANDALONE_BEARER_VAR,
+            Settings::OPERATOR_PASSWORD_VAR,
+        ] {
+            let mut vars = standalone();
+            vars.remove(missing);
+            assert!(Settings::from_lookup(read(&vars)).is_err());
+        }
+        for (var, value) in [
+            (Settings::AUTH_MODE_VAR, "automatic"),
+            (Settings::BEARER_VAR, BEARER),
+            (Settings::JWKS_VAR, "http://gateway.invalid/keys"),
+            (Settings::OPERATOR_PASSWORD_VAR, BEARER),
+            (Settings::OPERATOR_NAME_VAR, "name:with:colon"),
+            (Settings::PRINCIPAL_VAR, BEARER),
+            (Settings::OPERATOR_NAME_VAR, PROXY_BEARER),
+        ] {
+            let mut vars = standalone();
+            vars.insert(var, value.to_owned());
+            assert!(
+                Settings::from_lookup(read(&vars)).is_err(),
+                "accepted invalid {var}"
+            );
+        }
+    }
+
     fn complete() -> HashMap<&'static str, String> {
         HashMap::from([
             (
@@ -490,7 +634,9 @@ mod tests {
             PathBuf::from("/etc/mcp-ssh/registry.json")
         );
         assert!(settings.bearers.accepts(BEARER.as_bytes()));
-        assert_eq!(settings.identity.issuer, "https://mcp.cacahuate.org");
+        assert!(
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://mcp.cacahuate.org")
+        );
     }
 
     /// The service authenticates its only caller and decides what that caller
@@ -736,7 +882,9 @@ mod tests {
             "https://loki.example/".to_owned(),
         );
         let settings = Settings::from_lookup(read(&vars)).unwrap();
-        assert_eq!(settings.identity.jwks_url.scheme(), "https");
+        assert!(
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.jwks_url.scheme() == "https")
+        );
         assert_eq!(settings.notify.unwrap().scheme(), "https");
         assert_eq!(settings.audit_query.unwrap().scheme(), "https");
     }
@@ -763,7 +911,9 @@ mod tests {
             "  https://mcp.cacahuate.org  ".to_owned(),
         );
         let settings = Settings::from_lookup(read(&vars)).unwrap();
-        assert_eq!(settings.identity.issuer, "https://mcp.cacahuate.org");
+        assert!(
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://mcp.cacahuate.org")
+        );
     }
 
     #[test]

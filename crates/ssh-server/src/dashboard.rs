@@ -7,10 +7,9 @@
 //!
 //! # Who is allowed in
 //!
-//! Two facts, the same shape as the MCP surface's, and for a sharper reason.
-//! The reverse proxy presents its own shared credential, and the operator's
-//! name comes from the header the proxy's authenticator sets after a single
-//! sign-on round trip.
+//! Gateway deployments use a reverse proxy credential and the operator name
+//! established by that proxy. Standalone deployments use HTTP Basic login
+//! with a separately configured operator name and password.
 //!
 //! The credential is *not* the gateway's. The gateway is how the agent whose
 //! command was held reaches this service, and container networks do not
@@ -28,6 +27,7 @@ use axum::middleware::Next;
 use axum::response::{Html, IntoResponse as _, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Router};
+use base64::Engine as _;
 use serde::Deserialize;
 use ssh_core::Scope;
 use ssh_core::approval::{
@@ -87,34 +87,64 @@ impl Operator {
 #[derive(Clone)]
 pub struct Proxy {
     bearers: Arc<SharedBearer>,
+    local_operator: Option<String>,
 }
 
 impl Proxy {
     #[must_use]
     pub const fn new(bearers: Arc<SharedBearer>) -> Self {
-        Self { bearers }
+        Self {
+            bearers,
+            local_operator: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn standalone(password: Arc<SharedBearer>, operator: String) -> Self {
+        Self {
+            bearers: password,
+            local_operator: Some(operator),
+        }
     }
 }
 
-/// Admits a request only if it came through the proxy and names an operator.
+/// Authenticates the operator through the configured proxy or standalone login.
 pub async fn require_operator(
     State(proxy): State<Proxy>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(presented) = bearer(request.headers()) else {
-        return refused();
+    let who = if let Some(operator) = &proxy.local_operator {
+        if !local_credentials_match(request.headers(), operator, &proxy.bearers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [
+                    (
+                        header::WWW_AUTHENTICATE,
+                        "Basic realm=\"mcp-ssh operator\", charset=\"UTF-8\"",
+                    ),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                Html("<p>Sign in with the configured operator name and password.</p>"),
+            )
+                .into_response();
+        }
+        operator.clone()
+    } else {
+        let Some(presented) = bearer(request.headers()) else {
+            return refused();
+        };
+        if !proxy.bearers.accepts(presented.as_bytes()) {
+            return refused();
+        }
+        let Some(who) = single_header(request.headers(), OPERATOR_HEADER) else {
+            return refused();
+        };
+        if who.trim().is_empty() {
+            return refused();
+        }
+        who.to_owned()
     };
-    if !proxy.bearers.accepts(presented.as_bytes()) {
-        return refused();
-    }
-    let Some(who) = single_header(request.headers(), OPERATOR_HEADER) else {
-        return refused();
-    };
-    if who.trim().is_empty() {
-        return refused();
-    }
-    let who = who.to_owned();
     request.extensions_mut().insert(Operator(who));
     let mut response = next.run(request).await;
     // A framed approvals page defeats the same-origin submission guard from
@@ -132,6 +162,29 @@ pub async fn require_operator(
         axum::http::HeaderValue::from_static("DENY"),
     );
     response
+}
+
+fn local_credentials_match(headers: &HeaderMap, operator: &str, password: &SharedBearer) -> bool {
+    let Some(raw) = single_header(headers, header::AUTHORIZATION.as_str()) else {
+        return false;
+    };
+    let Some((scheme, encoded)) = raw.split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("basic") || encoded.len() > 4096 {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let (name, remainder) = decoded.split_at(separator);
+    let Some((_, presented)) = remainder.split_first() else {
+        return false;
+    };
+    name == operator.as_bytes() && password.accepts(presented)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -2165,6 +2218,10 @@ mod tests {
     /// Just enough of an app to exercise admission: the layer, and a route that
     /// reports who got through it.
     fn guarded() -> Router {
+        guarded_by(proxy())
+    }
+
+    fn guarded_by(proxy: Proxy) -> Router {
         Router::new()
             .route(
                 "/approvals",
@@ -2175,9 +2232,64 @@ mod tests {
                 ),
             )
             .layer(axum::middleware::from_fn_with_state(
-                proxy(),
+                proxy,
                 require_operator,
             ))
+    }
+
+    #[tokio::test]
+    async fn standalone_approval_requires_its_own_password_and_fixed_operator() {
+        let app = guarded_by(Proxy::standalone(
+            Arc::new(SharedBearer::new(PROXY_BEARER.to_owned(), None).unwrap()),
+            "owner".to_owned(),
+        ));
+        let credential =
+            base64::engine::general_purpose::STANDARD.encode(format!("owner:{PROXY_BEARER}"));
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/approvals")
+                    .header(header::AUTHORIZATION, format!("Basic {credential}"))
+                    .header(OPERATOR_HEADER, "someone-else")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"owner");
+
+        for authorization in [
+            "Basic malformed!".to_owned(),
+            format!("Bearer {PROXY_BEARER}"),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("owner:wrong")
+            ),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("other:{PROXY_BEARER}"))
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/approvals")
+                        .header(header::AUTHORIZATION, authorization)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
     }
 
     /// A refused audit record is the one decision failure where the answer
