@@ -12,9 +12,10 @@ container checks, and automated review for the code being released. A job that
 never obtains a runner has not passed. Reconcile overlapping pull requests and
 run the checks on the combined result before selecting it.
 
-Run the documented Quickstart from a clean checkout using public build sources
-and disposable targets. Verify both a permitted operation and an operation
-released through human approval. Check teardown as well as startup. Document
+A runnable Quickstart must be present before publication. Follow it from a
+clean checkout using public build sources and disposable targets. Verify both
+a permitted operation and an operation released through human approval. Check
+teardown as well as startup. Document
 the platform and client actually tested; do not infer support for other CPU
 architectures or MCP clients from compilation alone.
 
@@ -50,7 +51,7 @@ after creating the publication repository.
 
 Update the README's preparation status and make sure its links and clone
 instructions resolve for a reader without lab access. Keep optional private
-integrations clearly separate from the supported Quickstart. File-transfer
+integrations clearly separate from the initial supported setup. File-transfer
 integration remains deferred; do not advertise it as a supported initial flow.
 
 ## Distribute a tested artifact
