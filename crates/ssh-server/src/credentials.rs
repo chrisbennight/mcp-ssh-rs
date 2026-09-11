@@ -1,7 +1,7 @@
 //! Where the running service gets the keys it authenticates to targets with.
 //!
-//! The values arrive as environment variables, injected at deploy time by the
-//! fleet's secret manager and never written to disk or into this repository.
+//! The values arrive as environment variables, injected by the deployment.
+//! This adapter reads them once at startup and does not write them to disk.
 //! This module's whole job is to turn the name the registry uses for a
 //! credential into the variable that holds it, and to be unable to do anything
 //! else with it.
@@ -54,11 +54,6 @@ impl EnvCredentials {
         Self { held }
     }
 
-    /// The variable name a credential reference is read from.
-    ///
-    /// Upper-cased with hyphens folded to underscores, so a reference like
-    /// `dns1-readonly` is held in `MCP_SSH_CREDENTIAL_DNS1_READONLY`.
-    ///
     /// The variable name a credential reference is read from.
     ///
     /// Upper-cased with everything a variable name cannot carry folded to an

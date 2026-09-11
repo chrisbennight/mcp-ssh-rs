@@ -9,7 +9,7 @@
 //! # Identity is not an argument
 //!
 //! No tool takes a principal. The caller does not get to say who it is: the
-//! principal arrives from the gateway, verified, and is handed to [`dispatch`]
+//! principal arrives from HTTP authentication and is handed to [`dispatch`]
 //! separately from the arguments. A tool schema that accepted one would make
 //! impersonation a matter of typing.
 //!
@@ -39,7 +39,7 @@ use ssh_core::run::RunId;
 use ssh_core::session::{Purpose, SessionId};
 use ssh_core::{HostId, RoleId, Scope};
 
-use crate::mcp::GatewayPrincipal;
+use crate::mcp::AuthenticatedPrincipal;
 
 pub const HOSTS: &str = "ssh_hosts";
 pub const OPEN_SESSION: &str = "ssh_open_session";
@@ -444,16 +444,15 @@ fn schema_for<T: JsonSchema>() -> JsonObject {
 
 /// Routes one tool call at the bastion.
 ///
-/// The principal is a parameter, not an argument: it comes from the gateway's
-/// verified identity and never from the request body.
+/// The principal comes from HTTP authentication, never from the request body.
 pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
     bastion: &Bastion<C, S>,
     notifier: &dyn crate::notify::Notifier,
     dashboard: Option<&url::Url>,
-    acting_for: &GatewayPrincipal,
+    acting_for: &AuthenticatedPrincipal,
     params: CallToolRequestParams,
 ) -> Result<CallToolResult, McpError> {
-    // Taken as the gateway's word rather than as a principal, so nothing
+    // Taken as an authenticated identity rather than a bare principal, so nothing
     // outside this crate can call this on behalf of somebody it merely named.
     let principal = acting_for.get();
     let arguments = params.arguments.unwrap_or_default();

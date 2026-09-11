@@ -1,7 +1,10 @@
 //! Who is allowed to reach the service, and who they are acting for.
 //!
-//! The gateway is the only front door. Two separate facts have to hold before a
-//! request reaches a tool:
+//! Gateway mode verifies a service credential and a signed principal assertion.
+//! Standalone mode maps its configured bearer to a fixed local principal.
+//! See the design's front-door contract for the deployment boundaries.
+//!
+//! In gateway mode, two separate facts have to hold before a request reaches a tool:
 //!
 //! - **The caller is the gateway.** A shared bearer establishes that, and it
 //!   rotates, so replacing it does not require a synchronised restart.
@@ -33,7 +36,7 @@ use subtle::ConstantTimeEq as _;
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
-use crate::mcp::GatewayPrincipal;
+use crate::mcp::AuthenticatedPrincipal;
 
 /// Header the gateway puts its signed identity assertion in.
 const IDENTITY_HEADER: &str = "x-mcp-identity";
@@ -166,10 +169,9 @@ pub struct IdentitySettings {
 impl IdentitySettings {
     /// Refuses settings this image cannot use before a verifier is built.
     pub fn validate(&self) -> Result<(), IngressError> {
-        // The gateway is a sibling container on an internal network and this
-        // image deliberately carries no TLS backend.
-        if self.jwks_url.scheme() != "http" {
-            return Err(IngressError::JwksNotPlainHttp);
+        // HTTP is for a protected internal hop; HTTPS verifies the remote peer.
+        if !matches!(self.jwks_url.scheme(), "http" | "https") {
+            return Err(IngressError::JwksNotHttp);
         }
         if self.jwks_url.host().is_none()
             || !self.jwks_url.username().is_empty()
@@ -223,6 +225,7 @@ impl IdentityVerifier {
             // The gateway is reached directly. A proxy discovered from the
             // environment would send key fetches somewhere else entirely.
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|_| IngressError::HttpClient)?;
@@ -494,22 +497,18 @@ fn unix_now() -> Result<u64, IdentityError> {
 /// The service cannot start with the ingress it was given.
 #[derive(Debug, thiserror::Error)]
 pub enum IngressError {
-    #[error("the gateway bearer must be at least {minimum} bytes")]
+    #[error("the credential must be at least {minimum} bytes")]
     BearerTooShort { minimum: usize },
-    #[error("the gateway bearer must be made only of visible ASCII, as a header can carry")]
+    #[error("the credential must contain only visible ASCII")]
     BearerNotHeaderSafe,
-    #[error("the current and previous gateway bearers must differ")]
+    #[error("the current and previous credentials must differ")]
     BearersIdentical,
-    #[error(
-        "the gateway and the dashboard proxy must hold different credentials; the surfaces they admit are separated by that difference"
-    )]
+    #[error("MCP, operator, and evaluator surfaces must use different credentials")]
     BearersSharedAcrossSurfaces,
     #[error("the identity issuer must not be blank")]
     IssuerBlank,
-    #[error(
-        "the identity key set must be plain http; this image carries no TLS backend, because the gateway is a sibling on the internal network"
-    )]
-    JwksNotPlainHttp,
+    #[error("the identity key set must use http or https")]
+    JwksNotHttp,
     #[error("the identity key set URL must have a host and no credentials, query, or fragment")]
     JwksUrlUnusable,
     #[error("the identity key fetcher could not be built")]
@@ -531,37 +530,47 @@ pub enum IdentityError {
 #[derive(Clone)]
 pub struct Ingress {
     bearers: Arc<SharedBearer>,
-    verifier: Arc<IdentityVerifier>,
+    identity: IdentitySource,
+}
+
+#[derive(Clone)]
+enum IdentitySource {
+    Gateway(Arc<IdentityVerifier>),
+    Standalone(PrincipalId),
 }
 
 impl Ingress {
     #[must_use]
     pub const fn new(bearers: Arc<SharedBearer>, verifier: Arc<IdentityVerifier>) -> Self {
-        Self { bearers, verifier }
+        Self {
+            bearers,
+            identity: IdentitySource::Gateway(verifier),
+        }
+    }
+
+    #[must_use]
+    pub const fn standalone(bearers: Arc<SharedBearer>, principal: PrincipalId) -> Self {
+        Self {
+            bearers,
+            identity: IdentitySource::Standalone(principal),
+        }
     }
 }
 
-/// Admits a request only if it came from the gateway and names a principal.
+/// Authenticates the MCP caller using the explicitly configured identity mode.
 ///
 /// On success the principal is placed in the request's extensions, which is
 /// where the MCP surface reads it from. Nothing downstream accepts a principal
 /// from any other source, so a request that gets past this layer without one
 /// is refused rather than served as nobody.
-pub async fn require_gateway(
+pub async fn require_mcp(
     State(ingress): State<Ingress>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    // No browser reaches this service — the gateway is its only caller, and it
-    // is not one. Refusing every request that carries an `Origin` at all is
-    // both simpler than an allowlist and strictly stronger: it closes DNS
-    // rebinding without maintaining a list of names to keep in step.
+    // MCP clients use a non-browser HTTP transport in both supported modes.
     if request.headers().contains_key(header::ORIGIN) {
-        // Refused the same way as everything else that is not the gateway. A
-        // browser is one more thing this service is not talking to, and an
-        // answer saying which check failed tells a prober which part of its
-        // request to change. The operator gets the distinction in the log,
-        // where every other refusal puts it too.
+        // Keep the response generic; the operator gets the reason in the log.
         tracing::warn!("refused a request carrying Origin; no browser is a legitimate caller");
         return unauthorized();
     }
@@ -578,25 +587,30 @@ pub async fn require_gateway(
         tracing::warn!("refused a request presenting a bearer that is not configured");
         return unauthorized();
     }
-    let Some(assertion) = single_header(request.headers(), IDENTITY_HEADER) else {
-        tracing::warn!(
-            header = IDENTITY_HEADER,
-            "refused a request with no single identity assertion"
-        );
-        return unauthorized();
-    };
-    let principal = match ingress.verifier.verify(assertion).await {
-        Ok(principal) => principal,
-        Err(why) => {
-            // Logged, not returned: the operator needs to tell a rotation
-            // mistake from an unreachable gateway, and the caller does not.
-            tracing::warn!(%why, "refused a request whose identity did not verify");
-            return unauthorized();
+    let principal = match &ingress.identity {
+        IdentitySource::Standalone(principal) => {
+            if request.headers().contains_key(IDENTITY_HEADER) {
+                return unauthorized();
+            }
+            principal.clone()
+        }
+        IdentitySource::Gateway(verifier) => {
+            let Some(assertion) = single_header(request.headers(), IDENTITY_HEADER) else {
+                tracing::warn!("refused a request with no single identity assertion");
+                return unauthorized();
+            };
+            match verifier.verify(assertion).await {
+                Ok(principal) => principal,
+                Err(why) => {
+                    tracing::warn!(%why, "refused a request whose identity did not verify");
+                    return unauthorized();
+                }
+            }
         }
     };
     request
         .extensions_mut()
-        .insert(GatewayPrincipal::new(principal));
+        .insert(AuthenticatedPrincipal::new(principal));
     next.run(request).await
 }
 
@@ -628,10 +642,7 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn unauthorized() -> Response {
-    let mut response = refuse(
-        StatusCode::UNAUTHORIZED,
-        "this service is reachable only through the gateway",
-    );
+    let mut response = refuse(StatusCode::UNAUTHORIZED, "MCP authentication is required");
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         header::HeaderValue::from_static("Bearer"),
@@ -803,7 +814,7 @@ mod tests {
 
     /// Echoes back the principal the layer admitted, so a test can tell "the
     /// request was served" from "the request was served as the right caller".
-    async fn admitted(principal: Option<axum::Extension<GatewayPrincipal>>) -> String {
+    async fn admitted(principal: Option<axum::Extension<AuthenticatedPrincipal>>) -> String {
         principal.map_or_else(
             || "nobody".to_owned(),
             |axum::Extension(principal)| principal.get().as_str().to_owned(),
@@ -815,7 +826,7 @@ mod tests {
             .route("/", get(admitted))
             .layer(axum::middleware::from_fn_with_state(
                 ingress.clone(),
-                require_gateway,
+                require_mcp,
             ))
             .with_state(())
     }
@@ -863,6 +874,37 @@ mod tests {
             status,
             headers,
             body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_bearer_maps_only_to_the_configured_principal() {
+        let ingress = Ingress::standalone(
+            Arc::new(SharedBearer::new(BEARER.to_owned(), None).unwrap()),
+            PrincipalId::parse("personal-client").unwrap(),
+        );
+        let authorized = vec![("authorization", format!("Bearer {BEARER}"))];
+        let answer = call(&ingress, authorized.clone()).await;
+        assert_eq!(answer.status, StatusCode::OK);
+        assert_eq!(answer.body, "personal-client");
+        for headers in [
+            vec![],
+            vec![("authorization", "Bearer wrong".to_owned())],
+            vec![
+                ("authorization", format!("Bearer {BEARER}")),
+                ("authorization", format!("Bearer {BEARER}")),
+            ],
+            [
+                authorized.clone(),
+                vec![(IDENTITY_HEADER, "forged-principal".to_owned())],
+            ]
+            .concat(),
+            [authorized, vec![("origin", "http://localhost".to_owned())]].concat(),
+        ] {
+            assert_eq!(
+                call(&ingress, headers).await.status,
+                StatusCode::UNAUTHORIZED
+            );
         }
     }
 
@@ -1265,8 +1307,8 @@ mod tests {
             issuer: ISSUER.to_owned(),
         };
         assert!(matches!(
-            IdentityVerifier::new(settings("https://gateway.invalid/jwks.json")),
-            Err(IngressError::JwksNotPlainHttp)
+            IdentityVerifier::new(settings("ftp://gateway.invalid/jwks.json")),
+            Err(IngressError::JwksNotHttp)
         ));
         // Both halves of userinfo, because a URL carrying a password and no
         // user name is still a URL with a credential in it.

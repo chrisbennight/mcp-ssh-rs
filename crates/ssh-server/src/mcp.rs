@@ -2,32 +2,16 @@
 //!
 //! # Identity
 //!
-//! This service authenticates no clients of its own. It sits behind the fleet's
-//! MCP gateway, which is the only front door, and the gateway supplies the
-//! principal on whose behalf a request is made.
+//! The HTTP ingress establishes a principal using the configured authentication
+//! mode. This module reads that principal from request extensions before listing
+//! or dispatching tools. Tool arguments cannot supply it.
 //!
-//! That is only safe because reachability is a **precondition**: identity
-//! arriving on any path other than the gateway is merely asserted, so the
-//! deployment has to make every other path unreachable. The design carries that
-//! as a precondition rather than a feature, because a service cannot enforce
-//! its own necessity.
+//! `get_info` has no error return, so HTTP authentication covers the handshake
+//! and protocol liveness traffic as well. The unauthenticated `/healthz` probe
+//! is a separate route.
 //!
-//! What this module does enforce is that a principal is *present* for every
-//! request that does anything or says what this service can do: calling a tool
-//! and listing the tools alike, because telling a caller the gateway did not
-//! vouch for what it could try next is not a harmless answer.
-//!
-//! The handshake is not one of those, and could not be if it wanted to be:
-//! `get_info` returns server information rather than a result, so it has no way
-//! to refuse. What it carries — a name, a version, and how to use tools nobody
-//! will be allowed to call — is what any client learns by reaching the port at
-//! all, and reaching the port is the precondition above. The same goes for the
-//! protocol's own liveness traffic, which carries nothing.
-//!
-//! The type carries the rest rather than a convention:
-//! [`dispatch`](crate::tools::dispatch) takes a
-//! [`GatewayPrincipal`], which only this crate can construct, so a caller's own
-//! account of who it is cannot be passed off as the gateway's.
+//! [`dispatch`](crate::tools::dispatch) takes an [`AuthenticatedPrincipal`], which only
+//! this crate can construct after admission.
 
 use std::sync::Arc;
 
@@ -48,8 +32,8 @@ use crate::notify::Notifier;
 use crate::tools;
 
 const INSTRUCTIONS: &str = "\
-Mediated SSH on the hosts this service is configured for. You never hold a \
-credential and never choose a host address: name a host and a role from \
+Mediated SSH on the hosts this service is configured for. You never hold an \
+SSH credential and never choose a host address: name a host and a role from \
 ssh_hosts, say what the work is for, and every command is authorized \
 individually against policy.
 
@@ -60,19 +44,18 @@ refused, or may need a human to approve it; a refusal is an answer and \
 retrying it unchanged will not help. Ask for the smallest scope the work \
 needs \u{2014} a larger one does not make approval more likely.";
 
-/// The principal a request acts for, as the gateway supplied it.
+/// The principal established by HTTP authentication.
 ///
 /// A distinct type so it cannot be confused with a principal a caller named,
 /// and constructible only inside this crate: the ingress layer makes one after
-/// checking the gateway's identity, and nothing outside can make one at all.
+/// checking the configured identity source, and nothing outside can make one at all.
 /// A `PrincipalId` says who somebody is; this says who vouched for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GatewayPrincipal(PrincipalId);
+pub struct AuthenticatedPrincipal(PrincipalId);
 
-impl GatewayPrincipal {
-    /// Made by the ingress layer, after it has checked that the caller is the
-    /// gateway and verified the assertion naming this principal. Crate-private
-    /// so that stays the only way one exists.
+impl AuthenticatedPrincipal {
+    /// Made by the ingress layer after authenticating the configured identity
+    /// source. Crate-private so callers cannot supply their own principal.
     #[must_use]
     pub(crate) const fn new(principal: PrincipalId) -> Self {
         Self(principal)
@@ -168,7 +151,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
 ///
 /// Takes what it reads rather than the whole request, so the refusal can be
 /// asked for directly.
-fn acting_for(extensions: &Extensions) -> Result<&GatewayPrincipal, McpError> {
+fn acting_for(extensions: &Extensions) -> Result<&AuthenticatedPrincipal, McpError> {
     // The ingress layer attaches the principal to the HTTP request. The
     // transport does not surface that request's extensions here directly; it
     // carries the whole `http::request::Parts` as a single extension, and the
@@ -176,13 +159,8 @@ fn acting_for(extensions: &Extensions) -> Result<&GatewayPrincipal, McpError> {
     // it on the wire, only the tests that construct a context by hand once did.
     extensions
         .get::<axum::http::request::Parts>()
-        .and_then(|parts| parts.extensions.get::<GatewayPrincipal>())
-        .ok_or_else(|| {
-            McpError::invalid_request(
-                "no caller identity; this service is reachable only through the gateway",
-                None,
-            )
-        })
+        .and_then(|parts| parts.extensions.get::<AuthenticatedPrincipal>())
+        .ok_or_else(|| McpError::invalid_request("no authenticated caller identity", None))
 }
 
 #[cfg(test)]
@@ -201,7 +179,7 @@ mod tests {
         assert!(INSTRUCTIONS.contains("not trusted user intent"));
         assert!(INSTRUCTIONS.contains("refus"));
         assert!(
-            INSTRUCTIONS.contains("never hold a credential"),
+            INSTRUCTIONS.contains("never hold an SSH credential"),
             "an agent should not go looking for one"
         );
     }
@@ -212,7 +190,7 @@ mod tests {
     #[test]
     fn a_gateway_principal_is_a_distinct_type() {
         let principal = PrincipalId::parse("alice").unwrap();
-        let wrapped = GatewayPrincipal::new(principal.clone());
+        let wrapped = AuthenticatedPrincipal::new(principal.clone());
         assert_eq!(wrapped.get(), &principal);
     }
 
@@ -220,7 +198,7 @@ mod tests {
     /// it: the HTTP request's `Parts` carried as one extension, with the
     /// principal the ingress attached living inside those parts. Constructing it
     /// any other way would test a shape that never arrives on the wire.
-    fn context_extensions(principal: Option<GatewayPrincipal>) -> Extensions {
+    fn context_extensions(principal: Option<AuthenticatedPrincipal>) -> Extensions {
         let mut request = axum::http::Request::new(());
         if let Some(principal) = principal {
             request.extensions_mut().insert(principal);
@@ -248,7 +226,7 @@ mod tests {
         );
 
         let alice = PrincipalId::parse("alice").unwrap();
-        let vouched = context_extensions(Some(GatewayPrincipal::new(alice.clone())));
+        let vouched = context_extensions(Some(AuthenticatedPrincipal::new(alice.clone())));
         assert_eq!(
             acting_for(&vouched).expect("a vouched-for request").get(),
             &alice
