@@ -21,17 +21,23 @@ down first" — prose specifications are unvalidated and drift.
 
 ## Workflow
 
-- Never work directly in the main checkout. Fetch `origin/main`, create a
-  dedicated branch and git worktree, and work there.
-- Use Gitea at `gitea.cacahuate.org` through the Gitea MCP or `tea`; do not
-  use `gh`.
+- Never work directly in the main checkout. Fetch `main` from the GitHub
+  remote, create a dedicated branch and an ignored `.worktrees/` worktree,
+  and work there. Check the remote URL; older checkouts may still use Gitea
+  as `origin`.
+- Use the GitHub MCP for repository, pull-request, and Actions operations.
+  Use local Git for checkouts, commits, and pushes.
 - Do not commit, push, open, or merge a PR without explicit user
   authorization. A direct invocation of the `pr-and-monitor` skill supplies
   that authorization for its complete loop.
-- Before opening or updating a PR, run the installed `pre-pr-review` skill.
-- Every PR must use `.gitea/PULL_REQUEST_TEMPLATE.md`.
+- Before opening or updating a PR, review the candidate diff for security,
+  validation, and documentation drift. Use `pre-pr-review` when available;
+  contributors do not need private skills to submit a change.
+- Every PR must use `.github/PULL_REQUEST_TEMPLATE.md`.
 - A PR may merge only when required CI is green and AERB has no unresolved
   findings.
+
+See [Contributing](CONTRIBUTING.md) for the development and CI workflow.
 
 ## Security constraints
 

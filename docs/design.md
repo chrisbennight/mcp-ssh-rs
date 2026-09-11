@@ -38,8 +38,9 @@ likely to be eroded by well-meaning changes.
    credential sets and selects among them. It does not create accounts, manage
    `sudoers`, or rotate keys.
 4. **Not a secrets store.** Secret values are referenced, not held.
-5. **Does not replace the CI/Komodo deploy path.** Work that belongs in git
-   and Komodo must not be smuggled through an agent SSH session.
+5. **Does not replace the deployment process.** Work that belongs in version
+   control and a deployment pipeline must not be smuggled through an agent SSH
+   session.
 6. **SSH only.** No RDP, VNC, database, or Kubernetes targets.
 7. **No port forwarding or tunneling.** It is recording-opaque and would make
    the service an arbitrary network pivot — the capability being removed from
