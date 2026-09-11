@@ -35,6 +35,8 @@ What the service actually guarantees against each of these is defined in
 
 ## Documentation
 
+- [Outbound connections](docs/outbound-connections.md) — HTTPS, certificate
+  trust, and optional integration endpoints.
 - [Dependency security](docs/dependency-security.md) — advisory assessment and
   RSA credential compatibility.
 - [Contributing](CONTRIBUTING.md) — local checks, GitHub CI, image publication,
