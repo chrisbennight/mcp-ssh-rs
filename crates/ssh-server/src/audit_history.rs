@@ -167,8 +167,40 @@ impl ReadsAudit for Unavailable {
     }
 }
 
+/// Exact label matches selecting the deployment's audit stream.
+#[derive(Clone, Debug)]
+pub struct Labels(String);
+
+impl Labels {
+    pub fn parse(raw: &str) -> Result<Self, ReadError> {
+        if raw.len() > 16384 {
+            return Err(ReadError::InvalidLabels);
+        }
+        let labels: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(raw).map_err(|_| ReadError::InvalidLabels)?;
+        if labels.is_empty() || labels.len() > 16 || labels.values().all(String::is_empty) {
+            return Err(ReadError::InvalidLabels);
+        }
+        let mut matches = Vec::new();
+        for (name, value) in labels {
+            let mut chars = name.bytes();
+            if !chars
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                || !chars.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || value.len() > 1024
+            {
+                return Err(ReadError::InvalidLabels);
+            }
+            matches.push(format!("{name}={}", logql_string(&value)));
+        }
+        Ok(Self(format!("{{{}}}", matches.join(","))))
+    }
+}
+
 /// A bounded reader for Loki's internal query API.
 pub struct Loki {
+    labels: Labels,
     endpoint: Url,
     client: reqwest::Client,
     // A worst-case page can contain tens of MiB of retained output. Serialize
@@ -177,7 +209,7 @@ pub struct Loki {
 }
 
 impl Loki {
-    pub fn new(base: Url) -> Result<Self, ReadError> {
+    pub fn new(base: Url, labels: Labels) -> Result<Self, ReadError> {
         let endpoint = base
             .join("loki/api/v1/query_range")
             .map_err(|_| ReadError::InvalidEndpoint)?;
@@ -188,6 +220,7 @@ impl Loki {
             .build()
             .map_err(|_| ReadError::InvalidEndpoint)?;
         Ok(Self {
+            labels,
             endpoint,
             client,
             one_query: Arc::new(Semaphore::new(1)),
@@ -336,7 +369,7 @@ impl Loki {
         {
             let mut pairs = endpoint.query_pairs_mut();
             pairs
-                .append_pair("query", &logql)
+                .append_pair("query", &format!("{}{}", self.labels.0, logql))
                 .append_pair("direction", "backward")
                 .append_pair("limit", &limit.to_string())
                 // Explicit bounds keep the operator's original look-back
@@ -822,7 +855,7 @@ fn logql(query: &Query) -> String {
 }
 
 fn audit_logql() -> String {
-    "{container=\"mcp-ssh\",stream=\"stdout\"} |= \"\\\"event\\\":{\"".to_owned()
+    " |= \"\\\"event\\\":{\"".to_owned()
 }
 
 fn transcript_decisions_logql(session: &SessionId) -> String {
@@ -925,6 +958,8 @@ pub enum ReadError {
     NotConfigured,
     #[error("the durable audit endpoint is invalid")]
     InvalidEndpoint,
+    #[error("audit labels must be a bounded JSON object of valid label names and string values")]
+    InvalidLabels,
     #[error("the durable audit source is unavailable")]
     Unavailable,
     #[error("the durable audit source returned an unexpected response")]
@@ -949,6 +984,21 @@ mod tests {
     use axum::routing::get;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn deployment_labels_are_exact_matches_with_quoted_values() {
+        let raw = serde_json::json!({"app": "ssh\"} | json", "stream": "audit"}).to_string();
+        let labels = Labels::parse(&raw).unwrap();
+        assert_eq!(labels.0, "{app=\"ssh\\\"} | json\",stream=\"audit\"}");
+        for invalid in [
+            "{}",
+            r#"{"bad-name":"ssh"}"#,
+            r#"{"app":4}"#,
+            r#"{"app":""}"#,
+        ] {
+            assert!(Labels::parse(invalid).is_err());
+        }
+    }
 
     fn line(sequence: u64) -> String {
         format!(
@@ -1021,7 +1071,11 @@ mod tests {
                 },
             ),
         );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         let page = reader
             .read(&Query {
                 session: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -1132,7 +1186,11 @@ mod tests {
                 }
             }),
         );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         let page = reader
             .read_transcript(&TranscriptQuery {
                 before: Some(100),
@@ -1194,7 +1252,11 @@ mod tests {
                 },
             ),
         );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         let entry = reader
             .read_output(&OutputQuery {
                 start: 1,
@@ -1238,7 +1300,11 @@ mod tests {
                 },
             ),
         );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         let page = reader
             .read(&Query {
                 before: Some(older_end),
@@ -1257,7 +1323,11 @@ mod tests {
             "/loki/api/v1/query_range",
             get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
         );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             reader.read(&Query::default()).await.unwrap_err(),
             ReadError::Unavailable
@@ -1280,7 +1350,11 @@ mod tests {
                     }))
                 }),
             );
-        let reader = Loki::new(server(app).await).unwrap();
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             reader.read(&Query::default()).await.unwrap_err(),
             ReadError::Unavailable
@@ -1308,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluated_context_is_valid_and_legacy_evidence_remains_readable() {
+    fn evaluation_context_is_optional_and_validated_when_present() {
         let artifact = serde_json::json!({
             "evaluation_id": "eval-1",
             "decision_digest": "d".repeat(64),

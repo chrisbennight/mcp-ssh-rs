@@ -142,6 +142,8 @@ def service(binary, fixture, roots, jwks_url, endpoint, token, image):
         "MCP_SSH_IDENTITY_ISSUER": "https://gateway.example",
         "MCP_SSH_NOTIFY_URL": endpoint + "/notify",
         "MCP_SSH_AUDIT_QUERY_URL": endpoint + "/",
+        "MCP_SSH_AUDIT_LABELS": '{"service":"ssh"}',
+        "MCP_SSH_OPERATOR_HEADER": "x-test-operator",
         "MCP_SSH_DASHBOARD_URL": f"http://localhost:{port}/dashboard/approvals",
         "SSL_CERT_FILE": str(roots), "SSL_CERT_DIR": str(fixture / "empty-roots"),
     }
@@ -281,7 +283,7 @@ def check(binary, image):
                         assert posted == (case in ["trusted", "redirect"]), (case, "notification TLS")
                         status, body = request(base + "/dashboard/audit", {
                             "Authorization": "Bearer " + configured["MCP_SSH_PROXY_BEARER_CURRENT"],
-                            "x-authentik-username": "operator"})
+                            "x-test-operator": "operator"})
                         assert status == 200
                         assert (b"Loki available" in body) == (case == "trusted"), (case, "audit TLS")
                         assert not destination.requests, "outbound client followed a redirect"

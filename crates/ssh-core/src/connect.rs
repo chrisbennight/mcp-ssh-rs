@@ -264,10 +264,7 @@ impl Connection {
     /// before running anything and dials again rather than treating a lost
     /// transport as a lost grant.
     ///
-    /// Sitting idle is no longer one of those ways: a session may pause longer
-    /// than a transport would tolerate silence, so the connection asks its
-    /// target whether it is still there rather than waiting to be dropped for
-    /// having said nothing.
+    /// Keepalive requests preserve idle connections across session pauses.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()

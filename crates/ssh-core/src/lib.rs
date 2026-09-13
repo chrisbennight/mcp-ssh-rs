@@ -197,8 +197,8 @@ mod tests {
     fn accepts_realistic_names() {
         assert_eq!(HostId::parse("dns1").unwrap().as_str(), "dns1");
         assert_eq!(
-            HostId::parse("parents-server.dacasa.org").unwrap().as_str(),
-            "parents-server.dacasa.org"
+            HostId::parse("ssh.example.invalid").unwrap().as_str(),
+            "ssh.example.invalid"
         );
         assert_eq!(RoleId::parse("read_only").unwrap().as_str(), "read_only");
     }

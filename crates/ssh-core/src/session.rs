@@ -787,9 +787,7 @@ mod tests {
         let session = open(&store, "alice");
         store.clock.advance(LIFETIME.idle);
 
-        // Collection runs — via an unrelated caller opening a session — before
-        // the owner comes back. This is the sequence that used to lose the
-        // context.
+        // Collection by another caller must preserve the owner's expiry context.
         open(&store, "bob");
 
         let err = store
