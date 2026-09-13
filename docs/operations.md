@@ -6,17 +6,51 @@ Review the [design preconditions](design.md#non-goals-and-preconditions) before 
 hosts. Multiple independent tenants, multiple active replicas, OAuth login,
 and file-transfer integration are outside the initial supported setup.
 
+## Transport and output destinations
+
+`MCP_SSH_TRANSPORT=http` (the default) serves stateless MCP Streamable HTTP.
+Expose HTTPS through an operator-managed TLS proxy with a protected connection
+to the service. The service's listener itself speaks HTTP; it does not issue or
+manage certificates. No gateway is required for this standalone deployment.
+
+`MCP_SSH_TRANSPORT=stdio` uses newline-delimited MCP on stdin and stdout. The
+launcher grants account access and owns the process; `MCP_SSH_PRINCIPAL` provides
+its audit identity and defaults to `local`. Do not configure an MCP bearer or
+gateway identity mode for stdio. Tool arguments cannot change this identity.
+The process exits when its input closes, after bounded outcome recording.
+
+Select outputs independently:
+
+| Variable | Values and default |
+| --- | --- |
+| `MCP_SSH_AUDIT_SINK` | `stdout`, `stderr`, or `file:<path>`. HTTP defaults to stdout; stdio requires an explicit file. |
+| `MCP_SSH_LOG_SINK` | `stdout`, `stderr`, or `file:<path>`. Defaults to stderr. Stdio refuses stdout. |
+
+The service rejects shared audit and diagnostic destinations, including file
+aliases, and opens required outputs before accepting requests. Files append;
+new files use private permissions on Unix. The operator owns directory creation,
+rotation, storage capacity, and retention. A successful flush is not a disk
+synchronization or collector acknowledgement. `RUST_LOG` affects diagnostics
+only. Keep destinations separate when redirecting process file descriptors too.
+
+Stdio does not open an HTTP listener unless an operator surface or evaluator
+is configured. Optional human review uses the same separately authenticated
+HTTP operator surface; configure its reachable dashboard URL and TLS proxy
+when remote access is needed. `--healthcheck` is for deployments with an HTTP
+listener, not a stdio-only process.
+
 ## Choose authentication explicitly
 
-Set `MCP_SSH_AUTH_MODE=standalone` for a personal deployment. Supply:
+Standalone authentication is the default for HTTP. Set
+`MCP_SSH_AUTH_MODE=standalone` explicitly if desired. Supply:
 
 | Variable | Meaning |
 | --- | --- |
 | `MCP_SSH_BEARER` | A generated MCP token of at least 32 visible ASCII bytes. |
 | `MCP_SSH_PRINCIPAL` | The fixed MCP identity; defaults to `local`. |
-| `MCP_SSH_OPERATOR_PASSWORD` | A different generated password, 32–1024 visible ASCII bytes. |
+| `MCP_SSH_OPERATOR_PASSWORD` | Optional operator surface: a different generated password, 32–1024 visible ASCII bytes. Required when local review is enabled. |
 | `MCP_SSH_OPERATOR_NAME` | Browser login name and approval identity; defaults to `operator`. |
-| `MCP_SSH_DASHBOARD_URL` | The approval page URL clients should present to the operator. |
+| `MCP_SSH_DASHBOARD_URL` | The approval page URL clients should present to the operator. Required when local review is enabled. |
 
 Names are labels, not secrets. Do not use a credential value as an identity.
 The service rejects a name equal to either configured standalone credential.
@@ -25,10 +59,10 @@ loopback for a local setup. Use authenticated TLS termination for remote access,
 with a protected hop to the service. Restrict access to container environments
 and the host's Docker socket because they expose deployment credentials.
 
-`MCP_SSH_AUTH_MODE=gateway` retains the existing integration and is the default
-when the mode variable is absent. It requires
-`MCP_SSH_GATEWAY_BEARER_CURRENT`, `MCP_SSH_PROXY_BEARER_CURRENT`,
-`MCP_SSH_IDENTITY_JWKS_URL`, and `MCP_SSH_IDENTITY_ISSUER`. The gateway supplies
+`MCP_SSH_AUTH_MODE=gateway` explicitly enables signed gateway identity. It requires
+`MCP_SSH_GATEWAY_BEARER_CURRENT`, `MCP_SSH_IDENTITY_JWKS_URL`, and
+`MCP_SSH_IDENTITY_ISSUER`. Configure `MCP_SSH_PROXY_BEARER_CURRENT` only when
+using the separately authenticated operator surface. The gateway supplies
 an EdDSA-signed `x-mcp-identity` assertion for audience `mcp-ssh-rs` and its
 service bearer. The authenticated dashboard proxy supplies its separate bearer
 and `x-authentik-username`, stripping caller-supplied identity headers first.
@@ -117,8 +151,8 @@ come from `settings::bounds`; they are not environment settings.
 
 ## Logs and optional integrations
 
-Collect the service's JSON standard output into a log store with appropriate
-access control and retention. Command arguments, identity labels, and output
+Collect the configured JSON audit destination with appropriate access control
+and retention. Command arguments, identity labels, and output
 can contain sensitive operational data. The process-local chain is not durable
 storage or a restart-spanning history. See the [recording design](design.md#audit-and-evaluation).
 

@@ -28,6 +28,20 @@ sent over a network require TLS or an equivalently protected connection. A
 standalone credential shared by clients gives them one identity and shared
 session ownership and quotas; it does not isolate independent tenants.
 
+## Transport and process authority
+
+Stdio and stateless HTTP share the same SSH core. The stdio launcher grants
+access and owns a fixed process identity. HTTP establishes identity on every
+request through the selected authentication mode; missing credentials never
+fall back to launch authority. HTTPS termination and certificate management
+belong to the operator's TLS proxy.
+
+Stdio reserves stdout for MCP and requires a file audit sink. Diagnostic logs
+and required audit records use separately configured destinations. Conflicting
+or unavailable required outputs prevent startup. Optional operator and evaluator
+surfaces are absent unless explicitly configured; enabling local review requires
+an independently authenticated, reachable operator surface.
+
 ## Account authorization
 
 The administrator assigns each configured account an access class. Discovery

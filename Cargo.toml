@@ -27,6 +27,7 @@ rmcp = { version = "=2.2.0", default-features = false, features = [
     # The transport the gateway speaks to upstreams. Enabled here rather than in
     # the surface crate so the version and its features stay one decision.
     "transport-streamable-http-server",
+    "transport-io",
 ] }
 # Rustls uses the AWS-LC provider already used for RSA authentication.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

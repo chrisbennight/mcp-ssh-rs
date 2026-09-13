@@ -29,19 +29,24 @@ fn main() -> anyhow::Result<()> {
         return runtime.block_on(healthcheck(&config));
     }
 
+    let settings = ssh_server::settings::Settings::from_env().context("reading settings")?;
+    let outputs = settings
+        .process
+        .open_outputs()
+        .context("opening output sinks")?;
     tracing_subscriber::fmt()
         .json()
-        // Audit entries are the only stdout producer. Diagnostics remain
-        // independently useful on stderr without being able to split an audit
-        // entry into an unparsable line.
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(outputs.diagnostics))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
-    runtime.block_on(ssh_server::serve(&config))
+    let result = runtime.block_on(ssh_server::serve(&config, settings, outputs.audit));
+    // Tokio's stdin reader can remain blocked after a signal-driven shutdown.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 /// Asks the local instance whether it is serving.
