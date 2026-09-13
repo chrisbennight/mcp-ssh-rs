@@ -68,3 +68,60 @@ pub(crate) enum Payload {
     Download(Arc<dyn DownloadSink>),
     Upload(PreparedUpload),
 }
+
+/// A bounded failure category safe to return without server or filesystem error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Failure {
+    NotFound,
+    PermissionDenied,
+    TooLarge,
+    SymbolicLink,
+    SftpUnavailable,
+    RemoteIo,
+    PublicationUnavailable,
+    TimedOut,
+}
+
+impl Failure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::TooLarge => "too_large",
+            Self::SymbolicLink => "symbolic_link",
+            Self::SftpUnavailable => "sftp_unavailable",
+            Self::RemoteIo => "remote_io",
+            Self::PublicationUnavailable => "publication_unavailable",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => "The remote file or directory was not found.",
+            Self::PermissionDenied => "The remote account was denied file access.",
+            Self::TooLarge => "The file exceeds the configured transfer size limit.",
+            Self::SymbolicLink => "The remote path resolves through a symbolic link.",
+            Self::SftpUnavailable => "The remote SFTP service is unavailable.",
+            Self::RemoteIo => "The remote file operation failed.",
+            Self::PublicationUnavailable => {
+                "The download could not be published to local output storage."
+            }
+            Self::TimedOut => "The transfer exceeded its time limit.",
+        }
+    }
+}
+
+impl From<FileError> for Failure {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::NotFound => Self::NotFound,
+            FileError::PermissionDenied => Self::PermissionDenied,
+            FileError::TooLarge { .. } => Self::TooLarge,
+            FileError::ResolvesElsewhere { .. } => Self::SymbolicLink,
+            FileError::Unavailable { .. } => Self::SftpUnavailable,
+            FileError::Failed { .. } => Self::RemoteIo,
+        }
+    }
+}

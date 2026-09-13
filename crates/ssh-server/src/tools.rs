@@ -284,6 +284,13 @@ pub enum ExecResult {
     /// This is reported rather than guessed at because both guesses are wrong
     /// in ways a caller cannot see.
     Unknown { run: String, why: String },
+    /// Transfer failed with a bounded cause; uncertain remote writes must not be replayed.
+    TransferFailed {
+        run: String,
+        cause: String,
+        remote_write_may_be_partial: bool,
+        why: String,
+    },
     /// It has not run, and will not until a human agrees.
     ///
     /// There is nothing to poll: no run was started. Ask again with the same
@@ -1040,6 +1047,24 @@ fn reported(
     // no exit status and empty output is what a command that ran and printed
     // nothing looks like too.
     match state {
+        RunState::TransferFailed {
+            cause,
+            remote_write_may_be_partial,
+        } => {
+            return ExecResult::TransferFailed {
+                run: run.as_str().to_owned(),
+                cause: cause.code().to_owned(),
+                remote_write_may_be_partial,
+                why: if remote_write_may_be_partial {
+                    format!(
+                        "{} A remote write may be partial; do not automatically retry.",
+                        cause.message()
+                    )
+                } else {
+                    cause.message().to_owned()
+                },
+            };
+        }
         // The target answered the request negatively: it did not happen, and
         // sending it elsewhere is safe.
         RunState::Refused => {
@@ -1076,9 +1101,11 @@ fn reported(
         run: run.as_str().to_owned(),
         exit: match state {
             RunState::Exited { code } => Some(code),
-            RunState::Running | RunState::Ended | RunState::Refused | RunState::Indeterminate => {
-                None
-            }
+            RunState::Running
+            | RunState::Ended
+            | RunState::Refused
+            | RunState::Indeterminate
+            | RunState::TransferFailed { .. } => None,
         },
         stdout: StreamOut::released(stdout),
         stderr: StreamOut::released(stderr),
@@ -1387,6 +1414,38 @@ mod tests {
     /// command that never started, if the surface is careless enough to report
     /// them the same way — and the caller acting on that runs the work twice or
     /// not at all.
+    #[test]
+    fn transfer_failure_reports_cause_and_partial_write_without_policy_text() {
+        use ssh_core::run::RunState;
+        use ssh_core::transfer::Failure;
+        let run = RunId::parse(MINTED_RUN).unwrap();
+        for partial in [false, true] {
+            let result = reported(
+                &run,
+                RunState::TransferFailed {
+                    cause: Failure::PublicationUnavailable,
+                    remote_write_may_be_partial: partial,
+                },
+                &produced(""),
+                &produced(""),
+                "polled".to_owned(),
+            );
+            let ExecResult::TransferFailed {
+                cause,
+                remote_write_may_be_partial,
+                why,
+                ..
+            } = result
+            else {
+                panic!("transfer failure was hidden");
+            };
+            assert_eq!(cause, "publication_unavailable");
+            assert_eq!(remote_write_may_be_partial, partial);
+            assert!(why.contains("local output storage"));
+            assert_eq!(why.contains("do not automatically retry"), partial);
+        }
+    }
+
     #[test]
     fn ran_did_not_start_and_nobody_knows_are_three_answers() {
         use ssh_core::run::RunState;

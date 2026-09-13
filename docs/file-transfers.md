@@ -102,3 +102,9 @@ absent or storage capacity is exhausted, the result explicitly reports that
 output is unavailable; it does not substitute a large text or base64 response.
 Do not repeat a consequential command solely to recover unavailable output.
 These references are temporary delivery, not durable artifact storage.
+
+Transfer failures return `transfer_failed` with a bounded cause such as
+`not_found`, `too_large`, or `publication_unavailable`. The same cause remains
+available when polling. `remote_write_may_be_partial` distinguishes a failed
+download from an upload whose target may already have changed; investigate
+such writes before retrying. Raw storage and SFTP error text is not returned.
