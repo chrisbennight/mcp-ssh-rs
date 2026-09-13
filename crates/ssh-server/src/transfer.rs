@@ -1,718 +1,705 @@
-//! Moving bytes without putting them in a tool result.
-//!
-//! A command's output and a file's contents are regularly large enough that
-//! returning them inline burns an agent's context for no benefit, and sometimes
-//! sensitive enough that they should not pass through the model at all. Both
-//! are the same problem: the *reference* belongs in the answer and the bytes
-//! belong on a separate channel.
-//!
-//! So content is staged here, the tool result carries a reference to it, and
-//! the caller's intermediary fetches it over HTTP with a credential minted for
-//! that one transfer.
-//!
-//! # What holds this together
-//!
-//! - **The credential is not the gateway's.** It is minted per transfer, sent
-//!   in its own header rather than the one the service boundary already uses,
-//!   and never in a URL — a URL ends up in proxy logs.
-//! - **One download.** Serving spends the authorization. A reference that has
-//!   been fetched is not a standing capability to fetch it again.
-//! - **Only the principal that produced it.** Staged content belongs to the
-//!   session that produced it; another principal asking about the same
-//!   reference gets the answer it would get for one that never existed.
-//! - **Everything is in memory and bounded.** Nothing staged reaches disk,
-//!   nothing outlives its short life, and one principal cannot make the service
-//!   hold an unbounded amount.
+//! Bounded byte storage and the upstream Waygate file-transfer protocol.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-
-use serde::Serialize;
+use axum::{
+    Router,
+    body::{Body, Bytes},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use ssh_core::PrincipalId;
-use ssh_core::clock::{Clock, Millis};
+use ssh_core::{PrincipalId, clock::Clock, files::MAX_TRANSFER_BYTES, transfer::DownloadSink};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq as _;
 
-/// Where a staged reference is fetched from.
-pub const DOWNLOAD_PREFIX: &str = "/files/download/";
-
-/// Header the transfer credential travels in.
-///
-/// Its own header, not `Authorization`: that one already means "this is the
-/// gateway", and a per-transfer credential arriving in it would be two
-/// different authorities spelled the same way.
-pub const TRANSFER_CREDENTIAL_HEADER: &str = "x-mcp-transfer-credential";
-
-/// Scheme of a reference this service issues.
+pub const AUTHORIZE_UPLOAD: &str = "files/authorizeUpload";
+pub const AUTHORIZE_DOWNLOAD: &str = "files/authorizeDownload";
 const URI_PREFIX: &str = "mcp-file://mcp-ssh/";
+const HEADER: &str = "x-mcp-transfer-credential";
+const TTL: u64 = 300_000;
+const MAX_ITEMS: usize = 16;
+const OWNER_ITEMS: usize = 4;
 
-/// Bytes of randomness behind an identifier or a credential.
-const TOKEN_BYTES: usize = 32;
-
-/// How long staged content waits to be fetched.
-const LIFETIME: Millis = 5 * 60 * 1_000;
-
-/// Most items one principal may have staged at once.
-///
-/// Staged content is held in memory, so this is what stops a caller from
-/// running commands purely to make the service hold their output.
-const PER_PRINCIPAL: usize = 8;
-
-/// Most bytes one principal may have staged at once.
-///
-/// Counting items bounds nothing on its own: eight references can be eight
-/// bytes or eight gigabytes, and it is the bytes this service holds. Both
-/// limits are here because they refuse different things — one a caller that
-/// stages constantly, the other a caller that stages once and hugely.
-const BYTES_PER_PRINCIPAL: usize = 64 * 1024 * 1024;
-
-/// Most bytes any single staged item may be.
-///
-/// One short of the round figure deliberately. Sizes are published rounded up
-/// to the next multiple of [`SIZE_GRANULARITY`], so a maximum sitting exactly
-/// on a multiple would be the only accepted length rounding to the figure above
-/// it — and a published size only one length can produce names that length
-/// exactly, which is the disclosure the rounding exists to prevent.
-const BYTES_PER_ITEM: usize = 16 * 1024 * 1024 - 1;
-
-/// Longest name or media type a staged item may carry.
-///
-/// Retained alongside the content, so unbounded either way is unbounded
-/// memory: a caller staging one byte under a name of ten megabytes has staged
-/// ten megabytes.
-const METADATA_MAX: usize = 1024;
-
-/// Sizes are published rounded up to a multiple of this.
-///
-/// This channel exists partly to carry content that must not reach a model,
-/// and an exact length is a fact about that content: for a low-entropy secret
-/// it narrows the guess. A caller needs to know whether it is fetching
-/// something small or something enormous, which a rounded figure answers just
-/// as well.
-const SIZE_GRANULARITY: u64 = 4096;
-
-/// A reference in place of the bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Reference {
-    /// Opaque, single-use, and resolved out of band. Never content.
-    pub uri: String,
-    pub name: String,
-    pub mime_type: String,
-    /// About how large the content is, rounded up.
-    ///
-    /// Deliberately not exact. What a caller needs is whether this is worth
-    /// fetching; what an exact figure additionally provides is the length of
-    /// whatever was staged, which for a secret is a fact about the secret.
-    pub size: u64,
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct FileDigest {
+    pub algorithm: String,
+    pub value: String,
 }
 
-/// Where and how to fetch a reference, once.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct Reference {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<FileDigest>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UploadParams {
+    #[serde(rename = "_meta")]
+    pub meta: Option<serde_json::Value>,
+    pub name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<u64>,
+    pub digest: Option<FileDigest>,
+}
+
+#[derive(Serialize)]
 pub struct Descriptor {
+    pub transport: &'static str,
     pub method: &'static str,
     pub url: String,
-    /// Carries the transfer credential, which is the only authority on that URL.
+    // Deliberately no Debug implementation: headers contain a byte-transfer credential.
     pub headers: HashMap<String, String>,
 }
 
-/// Redacted, because the headers carry the credential.
-///
-/// This is an ordinary return value: it goes into results, and anything that
-/// prints one while working out why a transfer failed would otherwise print
-/// the authority to perform it. A derived `Debug` would do exactly that, so
-/// there is not one.
-impl std::fmt::Debug for Descriptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Descriptor")
-            .field("method", &self.method)
-            .field("url", &self.url)
-            .field("headers", &self.headers.keys().collect::<Vec<_>>())
-            .finish()
-    }
+#[derive(Serialize)]
+pub struct UploadResult {
+    pub file: Reference,
+    pub upload: Descriptor,
+}
+#[derive(Serialize)]
+pub struct DownloadResult {
+    pub file: Reference,
+    pub download: Descriptor,
+    pub sensitivity: &'static str,
 }
 
-/// One piece of staged content.
-struct Staged {
-    /// A boxed slice rather than a `Vec`, so what is retained is what was
-    /// counted. A vector's allocation can be far larger than its length, and
-    /// then the quota charges for the length while the store holds the
-    /// allocation — an account that is only as honest as its callers.
-    bytes: Box<[u8]>,
-    name: String,
-    mime_type: String,
-    /// Who produced it. Only they may authorize fetching it.
+struct Ticketed {
+    id: String,
+    bytes: Option<Arc<[u8]>>,
+}
+
+struct Ticket {
+    id: String,
+    credential: [u8; 32],
+}
+enum Content {
+    Pending,
+    Receiving,
+    Ready(Arc<[u8]>),
+}
+struct Item {
+    local_file: Option<crate::local_files::OwnedFile>,
     owner: PrincipalId,
-    staged_at: Millis,
-    /// The live authorization, if one has been issued.
+    created: u64,
+    reference: Reference,
+    content: Content,
+    upload: bool,
     ticket: Option<Ticket>,
 }
 
-/// One authorized fetch.
-///
-/// Re-authorizing replaces it, so at most one credential is live per staged
-/// item and an older one cannot outlast a newer authorization.
-struct Ticket {
-    /// Appears in the URL, and therefore in logs, so it is independent of the
-    /// staged identifier: knowing what was logged must not reveal what to ask
-    /// the store for.
-    id: String,
-    /// The credential's digest. Holding the value would put a working
-    /// credential in memory for as long as the item is staged, when all this
-    /// needs to do is recognise the one it issued.
-    credential: [u8; 32],
-}
-
-/// Content staged for out-of-band delivery.
-pub struct Transfers<C: Clock> {
-    clock: C,
+/// Every reserved item is charged at the full byte ceiling, including in-flight uploads and downloads.
+pub struct Transfers {
+    clock: Arc<dyn Clock>,
     origin: String,
-    staged: Mutex<HashMap<String, Staged>>,
+    local: Option<crate::local_files::LocalFiles>,
+    items: Mutex<HashMap<String, Item>>,
 }
 
-impl<C: Clock> Transfers<C> {
-    /// `origin` is the address a caller's intermediary will dial, scheme and
-    /// authority only.
-    #[must_use]
-    pub fn new(clock: C, origin: String) -> Self {
-        Self {
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum TransferError {
+    #[error("file reference is unavailable")]
+    Unknown,
+    #[error("file transfer capacity is exhausted; release or let earlier references expire")]
+    Capacity,
+    #[error("file size or metadata exceeds its configured limit")]
+    Limit,
+    #[error("file size or SHA-256 digest does not match the declared content")]
+    Integrity,
+    #[error(
+        "file transfer origin must be an HTTP(S) origin without credentials, path, query, or fragment"
+    )]
+    Origin,
+}
+
+impl Transfers {
+    pub fn new(clock: Arc<dyn Clock>, origin: &str) -> Result<Self, TransferError> {
+        let url = url::Url::parse(origin).map_err(|_| TransferError::Origin)?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(TransferError::Origin);
+        }
+        Ok(Self {
             clock,
-            origin: origin.trim_end_matches('/').to_owned(),
-            staged: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Holds content and returns the reference that stands in for it.
-    pub fn stage(
-        &self,
-        owner: &PrincipalId,
-        name: &str,
-        mime_type: &str,
-        bytes: Vec<u8>,
-    ) -> Result<Reference, TransferError> {
-        if bytes.len() > BYTES_PER_ITEM {
-            return Err(TransferError::TooLarge {
-                max: BYTES_PER_ITEM,
-            });
-        }
-        if name.len() > METADATA_MAX || mime_type.len() > METADATA_MAX {
-            return Err(TransferError::MetadataTooLong { max: METADATA_MAX });
-        }
-        let size = about(bytes.len());
-        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
-        let now = self.clock.now();
-        staged.retain(|_, held| !held.expired(now));
-
-        let mine = staged.values().filter(|held| held.owner == *owner);
-        // Everything retained counts, not only the content: the store holds a
-        // name and a media type for the item's whole life too.
-        let (held, bytes_held) = mine.fold((0_usize, 0_usize), |(count, total), held| {
-            (count.saturating_add(1), total.saturating_add(held.weight()))
-        });
-        if held >= PER_PRINCIPAL {
-            return Err(TransferError::TooMuchStaged { max: PER_PRINCIPAL });
-        }
-        let arriving = bytes
-            .len()
-            .saturating_add(name.len())
-            .saturating_add(mime_type.len());
-        if bytes_held.saturating_add(arriving) > BYTES_PER_PRINCIPAL {
-            return Err(TransferError::TooManyBytesStaged {
-                max: BYTES_PER_PRINCIPAL,
-            });
-        }
-
-        let id = token();
-        let reference = Reference {
-            uri: format!("{URI_PREFIX}{id}"),
-            name: name.to_owned(),
-            mime_type: mime_type.to_owned(),
-            size,
-        };
-        staged.insert(
-            id,
-            Staged {
-                // Shrinks to exactly what was charged for.
-                bytes: bytes.into_boxed_slice(),
-                name: name.to_owned(),
-                mime_type: mime_type.to_owned(),
-                owner: owner.clone(),
-                staged_at: now,
-                ticket: None,
-            },
-        );
-        Ok(reference)
-    }
-
-    /// Mints the one fetch a reference gets.
-    ///
-    /// A caller that authorizes twice replaces the first authorization rather
-    /// than holding two: the point is one fetch, not one at a time.
-    pub fn authorize(&self, owner: &PrincipalId, uri: &str) -> Result<Descriptor, TransferError> {
-        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
-        let now = self.clock.now();
-        staged.retain(|_, held| !held.expired(now));
-
-        let key = uri.strip_prefix(URI_PREFIX).ok_or(TransferError::Unknown)?;
-        let held = staged.get_mut(key).ok_or(TransferError::Unknown)?;
-        // The same answer as for a reference that never existed. Telling a
-        // caller that somebody else's content exists is the disclosure this
-        // whole module is trying to avoid.
-        if held.owner != *owner {
-            return Err(TransferError::Unknown);
-        }
-
-        let id = token();
-        let credential = token();
-        held.ticket = Some(Ticket {
-            id: id.clone(),
-            credential: digest(&credential),
-        });
-        Ok(Descriptor {
-            method: "GET",
-            url: format!("{}{DOWNLOAD_PREFIX}{id}", self.origin),
-            headers: HashMap::from([(TRANSFER_CREDENTIAL_HEADER.to_owned(), credential)]),
+            origin: url.as_str().trim_end_matches('/').to_owned(),
+            local: None,
+            items: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Hands over the content, once.
-    ///
-    /// Takes the staged item with it: a reference that has been fetched is not
-    /// a standing capability to fetch it again.
-    pub fn serve(&self, id: &str, presented: &str) -> Option<(String, String, Vec<u8>)> {
-        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
-        let now = self.clock.now();
-        staged.retain(|_, held| !held.expired(now));
+    pub fn local(clock: Arc<dyn Clock>, root: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            clock,
+            origin: String::new(),
+            local: Some(crate::local_files::LocalFiles::new(root)?),
+            items: Mutex::new(HashMap::new()),
+        })
+    }
+    pub const fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
 
-        let key = staged
-            .iter()
-            .find(|(_, held)| held.ticket.as_ref().is_some_and(|ticket| ticket.id == id))
-            .map(|(key, _)| key.clone())?;
-        let held = staged.get(&key)?;
-        let ticket = held.ticket.as_ref()?;
-        // Constant time: a comparison that stops at the first differing byte
-        // leaks the credential a byte at a time to anything that can time it.
-        if !bool::from(digest(presented).ct_eq(&ticket.credential)) {
-            return None;
+    fn reserve(
+        &self,
+        owner: &PrincipalId,
+        params: UploadParams,
+        upload: bool,
+    ) -> Result<String, TransferError> {
+        if params
+            .size
+            .is_some_and(|size| size > MAX_TRANSFER_BYTES as u64)
+            || params.name.as_ref().is_some_and(|name| name.len() > 255)
+            || params
+                .mime_type
+                .as_ref()
+                .is_some_and(|mime| mime.len() > 255)
+        {
+            return Err(TransferError::Limit);
         }
-        let taken = staged.remove(&key)?;
-        Some((taken.name, taken.mime_type, taken.bytes.into_vec()))
-    }
-
-    /// Drops content nobody fetched.
-    pub fn sweep(&self) {
-        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(digest) = &params.digest
+            && (digest.algorithm != "sha-256"
+                || URL_SAFE_NO_PAD
+                    .decode(&digest.value)
+                    .map_err(|_| TransferError::Integrity)?
+                    .len()
+                    != 32)
+        {
+            return Err(TransferError::Integrity);
+        }
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         let now = self.clock.now();
-        staged.retain(|_, held| !held.expired(now));
+        items.retain(|_, item| {
+            now.saturating_sub(item.created) < TTL
+                || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1)
+        });
+        if items.len() >= MAX_ITEMS
+            || items.values().filter(|item| item.owner == *owner).count() >= OWNER_ITEMS
+        {
+            return Err(TransferError::Capacity);
+        }
+        let id = token();
+        items.insert(
+            id.clone(),
+            Item {
+                local_file: None,
+                owner: owner.clone(),
+                created: now,
+                upload,
+                ticket: None,
+                content: Content::Pending,
+                reference: Reference {
+                    uri: match &self.local {
+                        Some(local) => local.uri(&id).map_err(|_| TransferError::Limit)?,
+                        None => format!("{URI_PREFIX}{id}"),
+                    },
+                    name: params.name,
+                    mime_type: params.mime_type,
+                    size: params.size,
+                    digest: params.digest,
+                },
+            },
+        );
+        Ok(id)
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.staged.lock().unwrap_or_else(|e| e.into_inner()).len()
+    pub fn authorize_upload(
+        &self,
+        owner: &PrincipalId,
+        params: UploadParams,
+    ) -> Result<UploadResult, TransferError> {
+        if self.local.is_some() {
+            return Err(TransferError::Unknown);
+        }
+        let id = self.reserve(owner, params, true)?;
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let item = items.get_mut(&id).ok_or(TransferError::Unknown)?;
+        let upload = self.issue(item, "PUT");
+        Ok(UploadResult {
+            file: item.reference.clone(),
+            upload,
+        })
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn authorize_download(
+        &self,
+        owner: &PrincipalId,
+        uri: &str,
+    ) -> Result<DownloadResult, TransferError> {
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let item = self.owned(&mut items, owner, uri)?;
+        if !matches!(item.content, Content::Ready(_)) {
+            return Err(TransferError::Unknown);
+        }
+        let download = self.issue(item, "GET");
+        Ok(DownloadResult {
+            file: item.reference.clone(),
+            download,
+            sensitivity: "secret",
+        })
+    }
+
+    fn issue(&self, item: &mut Item, method: &'static str) -> Descriptor {
+        let id = token();
+        let credential = token();
+        item.ticket = Some(Ticket {
+            id: id.clone(),
+            credential: hash(credential.as_bytes()),
+        });
+        Descriptor {
+            transport: "http",
+            method,
+            url: format!("{}/files/bytes/{id}", self.origin),
+            headers: HashMap::from([(HEADER.to_owned(), credential)]),
+        }
+    }
+
+    fn owned<'a>(
+        &self,
+        items: &'a mut HashMap<String, Item>,
+        owner: &PrincipalId,
+        uri: &str,
+    ) -> Result<&'a mut Item, TransferError> {
+        let id = uri.strip_prefix(URI_PREFIX).ok_or(TransferError::Unknown)?;
+        let item = items.get_mut(id).ok_or(TransferError::Unknown)?;
+        if item.owner != *owner || self.clock.now().saturating_sub(item.created) >= TTL {
+            return Err(TransferError::Unknown);
+        }
+        Ok(item)
+    }
+
+    pub fn input(
+        &self,
+        owner: &PrincipalId,
+        uri: &str,
+    ) -> Result<ssh_core::transfer::PreparedUpload, TransferError> {
+        if let Some(local) = &self.local {
+            return local.read(uri).map_err(|_| TransferError::Unknown);
+        }
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let item = self.owned(&mut items, owner, uri)?;
+        let Content::Ready(bytes) = &item.content else {
+            return Err(TransferError::Unknown);
+        };
+        ssh_core::transfer::PreparedUpload::from_shared(uri.to_owned(), Arc::clone(bytes))
+            .map_err(|_| TransferError::Limit)
+    }
+
+    pub fn destination(
+        self: &Arc<Self>,
+        owner: &PrincipalId,
+        name: Option<String>,
+    ) -> Result<Arc<dyn DownloadSink>, TransferError> {
+        let id = self.reserve(
+            owner,
+            UploadParams {
+                name,
+                ..UploadParams::default()
+            },
+            false,
+        )?;
+        Ok(Arc::new(Destination {
+            store: Arc::clone(self),
+            id,
+        }))
+    }
+
+    fn publish(
+        &self,
+        id: &str,
+        bytes: Vec<u8>,
+        receiving: bool,
+    ) -> Result<ssh_core::action::FileIdentity, TransferError> {
+        if bytes.len() > MAX_TRANSFER_BYTES {
+            return Err(TransferError::Limit);
+        }
+        let digest = FileDigest {
+            algorithm: "sha-256".to_owned(),
+            value: URL_SAFE_NO_PAD.encode(hash(&bytes)),
+        };
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let item = items.get_mut(id).ok_or(TransferError::Unknown)?;
+        let expected_state = if receiving {
+            matches!(item.content, Content::Receiving)
+        } else {
+            matches!(item.content, Content::Pending) && !item.upload
+        };
+        if !expected_state || self.clock.now().saturating_sub(item.created) >= TTL {
+            return Err(TransferError::Unknown);
+        }
+        if item
+            .reference
+            .size
+            .is_some_and(|size| size != bytes.len() as u64)
+            || item
+                .reference
+                .digest
+                .as_ref()
+                .is_some_and(|expected| expected != &digest)
+        {
+            return Err(TransferError::Integrity);
+        }
+        let identity = ssh_core::transfer::identity(item.reference.uri.clone(), &bytes);
+        item.reference.size = Some(bytes.len() as u64);
+        item.reference.digest = Some(digest);
+        if let Some(local) = &self.local {
+            item.local_file = Some(
+                local
+                    .publish(id, &bytes)
+                    .map_err(|_| TransferError::Limit)?,
+            );
+        }
+        item.content = Content::Ready(bytes.into());
+        Ok(identity)
+    }
+
+    fn take_ticket(
+        &self,
+        id: &str,
+        credential: &str,
+        upload: bool,
+    ) -> Result<Ticketed, TransferError> {
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let (key, item) = items
+            .iter_mut()
+            .find(|(_, item)| item.ticket.as_ref().is_some_and(|ticket| ticket.id == id))
+            .ok_or(TransferError::Unknown)?;
+        let ticket = item.ticket.as_ref().ok_or(TransferError::Unknown)?;
+        if self.clock.now().saturating_sub(item.created) >= TTL
+            || !bool::from(hash(credential.as_bytes()).ct_eq(&ticket.credential))
+        {
+            return Err(TransferError::Unknown);
+        }
+        let bytes = match &item.content {
+            Content::Pending if upload && item.upload => None,
+            Content::Ready(bytes) if !upload => Some(Arc::clone(bytes)),
+            _ => return Err(TransferError::Unknown),
+        };
+        item.ticket = None;
+        if upload {
+            item.content = Content::Receiving;
+        }
+        Ok(Ticketed {
+            id: key.clone(),
+            bytes,
+        })
+    }
+
+    fn abandon(&self, id: &str) {
+        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        if items
+            .get(id)
+            .is_some_and(|item| !matches!(item.content, Content::Ready(_)))
+        {
+            items.remove(id);
+        }
+    }
+
+    pub fn sweep(&self) {
+        let now = self.clock.now();
+        self.items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|_, item| now.saturating_sub(item.created) < TTL || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1));
     }
 }
 
-impl Staged {
-    /// What holding this costs, which is everything held rather than only the
-    /// content: a name is retained for as long as the bytes are.
-    fn weight(&self) -> usize {
-        self.bytes
-            .len()
-            .saturating_add(self.name.len())
-            .saturating_add(self.mime_type.len())
+struct Destination {
+    store: Arc<Transfers>,
+    id: String,
+}
+impl DownloadSink for Destination {
+    fn publish(&self, bytes: Vec<u8>) -> Result<ssh_core::action::FileIdentity, String> {
+        self.store
+            .publish(&self.id, bytes, false)
+            .map_err(|error| error.to_string())
     }
-    fn expired(&self, now: Millis) -> bool {
-        now.saturating_sub(self.staged_at) >= LIFETIME
+}
+impl Drop for Destination {
+    fn drop(&mut self) {
+        self.store.abandon(&self.id);
+    }
+}
+struct Receiving {
+    store: Arc<Transfers>,
+    id: String,
+}
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        self.store.abandon(&self.id);
     }
 }
 
-/// Randomness from a CSPRNG, in lowercase hex.
+pub fn routes(store: Arc<Transfers>) -> Router {
+    if store.is_local() {
+        return Router::new();
+    }
+    Router::new()
+        .route("/files/bytes/{id}", get(download).put(upload))
+        .with_state(store)
+}
+
+async fn download(
+    State(store): State<Arc<Transfers>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(credential) = headers.get(HEADER).and_then(|value| value.to_str().ok()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match store.take_ticket(&id, credential, false) {
+        Ok(Ticketed {
+            bytes: Some(bytes), ..
+        }) => (
+            [
+                ("content-type", "application/octet-stream"),
+                ("cache-control", "no-store"),
+            ],
+            Body::from(Bytes::from_owner(bytes)),
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn upload(
+    State(store): State<Arc<Transfers>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> StatusCode {
+    let Some(credential) = headers.get(HEADER).and_then(|value| value.to_str().ok()) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let Ok(Ticketed { id, .. }) = store.take_ticket(&id, credential, true) else {
+        return StatusCode::NOT_FOUND;
+    };
+    let receiving = Receiving { store, id };
+    let Ok(Ok(bytes)) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(body, MAX_TRANSFER_BYTES),
+    )
+    .await
+    else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match receiving.store.publish(&receiving.id, bytes.to_vec(), true) {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
 fn token() -> String {
-    let mut bytes = [0_u8; TOKEN_BYTES];
+    let mut bytes = [0_u8; 32];
     rand::fill(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    URL_SAFE_NO_PAD.encode(bytes)
 }
-
-fn digest(value: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    hasher.finalize().into()
-}
-
-#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum TransferError {
-    /// No such reference, or not yours. Deliberately one answer.
-    #[error("no such reference")]
-    Unknown,
-    #[error("this principal already has {max} items staged")]
-    TooMuchStaged { max: usize },
-    #[error("this principal already holds the {max} bytes it may have staged")]
-    TooManyBytesStaged { max: usize },
-    #[error("a single staged item may be at most {max} bytes")]
-    TooLarge { max: usize },
-    #[error("a staged item's name and media type may each be at most {max} bytes")]
-    MetadataTooLong { max: usize },
-}
-
-/// A size rounded up past itself, so publishing it never states the length.
-///
-/// The *next* multiple rather than the nearest, because a length already on a
-/// boundary — nothing at all, or exactly one granule — would otherwise be
-/// published exactly, and those are lengths worth knowing about a secret.
-fn about(bytes: usize) -> u64 {
-    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-    bytes
-        .checked_div(SIZE_GRANULARITY)
-        .and_then(|granules| granules.checked_add(1))
-        .and_then(|granules| granules.checked_mul(SIZE_GRANULARITY))
-        .unwrap_or(u64::MAX)
+fn hash(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use axum::http::Request;
     use ssh_core::clock::TestClock;
+    use tower::ServiceExt as _;
 
-    fn transfers() -> Transfers<TestClock> {
-        Transfers::new(TestClock::at(1_000), "https://ssh.example".to_owned())
-    }
-
-    fn principal(name: &str) -> PrincipalId {
+    fn owner(name: &str) -> PrincipalId {
         PrincipalId::parse(name).unwrap()
     }
-
-    fn credential(descriptor: &Descriptor) -> String {
-        descriptor
-            .headers
-            .get(TRANSFER_CREDENTIAL_HEADER)
-            .expect("the descriptor carries the credential")
-            .clone()
+    fn plane() -> Arc<Transfers> {
+        Arc::new(Transfers::new(Arc::new(TestClock::at(1000)), "https://ssh.example").unwrap())
+    }
+    fn request(descriptor: &Descriptor, body: Body) -> Request<Body> {
+        let url = url::Url::parse(&descriptor.url).unwrap();
+        Request::builder()
+            .method(descriptor.method)
+            .uri(url.path())
+            .header(HEADER, descriptor.headers.get(HEADER).unwrap())
+            .body(body)
+            .unwrap()
     }
 
-    fn id_of(descriptor: &Descriptor) -> String {
-        descriptor
-            .url
-            .rsplit('/')
-            .next()
-            .expect("the url ends in an identifier")
-            .to_owned()
-    }
-
-    /// The round trip the module exists for: the bytes never appear in what the
-    /// caller was handed, and they arrive intact on the other channel.
-    #[test]
-    fn content_travels_by_reference_and_arrives_intact() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let content = b"root:x:0:0:root:/root:/bin/bash\n".to_vec();
-
-        let reference = transfers
-            .stage(&agent, "passwd", "text/plain", content.clone())
+    #[tokio::test]
+    async fn bytes_cross_the_http_adapter_with_integrity_and_single_use_tickets() {
+        let store = plane();
+        let caller = owner("caller");
+        let bytes = vec![0, 255, 254, 1, 10];
+        let upload = store
+            .authorize_upload(
+                &caller,
+                UploadParams {
+                    size: Some(bytes.len() as u64),
+                    digest: Some(FileDigest {
+                        algorithm: "sha-256".to_owned(),
+                        value: URL_SAFE_NO_PAD.encode(hash(&bytes)),
+                    }),
+                    ..UploadParams::default()
+                },
+            )
             .unwrap();
-        assert!(reference.uri.starts_with(URI_PREFIX));
-        // Rounded, not exact: this channel carries content that must not reach
-        // a model, and a length is a fact about that content.
-        assert_eq!(reference.size, SIZE_GRANULARITY);
-        assert_ne!(
-            reference.size,
-            u64::try_from(content.len()).unwrap(),
-            "the reference published the exact length of what was staged"
-        );
-        // What stands in for the content says nothing about it.
-        let rendered = serde_json::to_string(&reference).unwrap();
-        assert!(
-            !rendered.contains("root:x:0:0"),
-            "the reference carried content"
-        );
-
-        let descriptor = transfers.authorize(&agent, &reference.uri).unwrap();
-        assert_eq!(descriptor.method, "GET");
-        assert!(
-            descriptor
-                .url
-                .starts_with("https://ssh.example/files/download/")
-        );
-        // The credential is in a header of its own, never in the URL.
-        assert!(!descriptor.url.contains(&credential(&descriptor)));
-
-        let (name, mime, bytes) = transfers
-            .serve(&id_of(&descriptor), &credential(&descriptor))
-            .expect("the authorized fetch was refused");
-        assert_eq!(name, "passwd");
-        assert_eq!(mime, "text/plain");
-        assert_eq!(bytes, content);
-    }
-
-    /// One fetch. A reference that has been collected is not a capability to
-    /// collect it again, and nothing is left holding the content afterwards.
-    #[test]
-    fn a_reference_is_spent_by_the_fetch_it_authorized() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let reference = transfers
-            .stage(&agent, "out", "text/plain", b"once".to_vec())
-            .unwrap();
-        let descriptor = transfers.authorize(&agent, &reference.uri).unwrap();
-
-        assert!(
-            transfers
-                .serve(&id_of(&descriptor), &credential(&descriptor))
-                .is_some()
-        );
-        assert!(
-            transfers
-                .serve(&id_of(&descriptor), &credential(&descriptor))
-                .is_none(),
-            "the same authorization served twice"
-        );
-        assert!(transfers.is_empty(), "content outlived its fetch");
-    }
-
-    /// The credential is the whole authority on that URL, so presenting the
-    /// wrong one - or none - has to fail, and knowing the identifier must not
-    /// be enough on its own.
-    #[test]
-    fn the_url_alone_does_not_fetch_anything() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let reference = transfers
-            .stage(&agent, "out", "text/plain", b"secret".to_vec())
-            .unwrap();
-        let descriptor = transfers.authorize(&agent, &reference.uri).unwrap();
-        let id = id_of(&descriptor);
-
-        for wrong in ["", "not-the-credential", &"0".repeat(64)] {
-            assert!(
-                transfers.serve(&id, wrong).is_none(),
-                "served with {wrong:?}"
-            );
-        }
-        // And the real one still works afterwards: a wrong guess does not
-        // consume the authorization.
-        assert!(transfers.serve(&id, &credential(&descriptor)).is_some());
-    }
-
-    /// Staged content belongs to whoever produced it. Another principal asking
-    /// about the reference gets what it would get for one that never existed -
-    /// the two must be indistinguishable, or the error enumerates other
-    /// callers' work.
-    #[test]
-    fn another_principal_cannot_reach_or_discover_staged_content() {
-        let transfers = transfers();
-        let owner = principal("agent-clawde");
-        let other = principal("agent-someone-else");
-        let reference = transfers
-            .stage(&owner, "out", "text/plain", b"theirs".to_vec())
-            .unwrap();
-
-        let refused = transfers.authorize(&other, &reference.uri).unwrap_err();
-        let missing = transfers
-            .authorize(&other, &format!("{URI_PREFIX}{}", "0".repeat(64)))
-            .unwrap_err();
-        assert_eq!(refused, missing);
-        assert_eq!(refused, TransferError::Unknown);
-    }
-
-    /// Re-authorizing replaces the live authorization. Two working credentials
-    /// for one item would make "one fetch" mean "one at a time".
-    #[test]
-    fn authorizing_again_retires_the_previous_credential() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let reference = transfers
-            .stage(&agent, "out", "text/plain", b"once".to_vec())
-            .unwrap();
-
-        let first = transfers.authorize(&agent, &reference.uri).unwrap();
-        let second = transfers.authorize(&agent, &reference.uri).unwrap();
-
-        assert!(
-            transfers
-                .serve(&id_of(&first), &credential(&first))
-                .is_none(),
-            "the retired authorization still worked"
-        );
-        assert!(
-            transfers
-                .serve(&id_of(&second), &credential(&second))
-                .is_some()
-        );
-    }
-
-    /// Content nobody fetches is not held for ever, and an expired reference
-    /// answers like one that never existed.
-    #[test]
-    fn content_nobody_collects_does_not_accumulate() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let reference = transfers
-            .stage(&agent, "out", "text/plain", b"forgotten".to_vec())
-            .unwrap();
-
-        transfers.clock.advance(LIFETIME);
-        transfers.sweep();
-        assert!(transfers.is_empty());
+        assert_eq!(upload.upload.transport, "http");
+        assert!(store.input(&caller, &upload.file.uri).is_err());
         assert_eq!(
-            transfers.authorize(&agent, &reference.uri).unwrap_err(),
-            TransferError::Unknown
+            routes(Arc::clone(&store))
+                .oneshot(request(&upload.upload, Body::from(bytes.clone())))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
         );
-    }
-
-    /// Staged content is held in memory, so a caller that could stage without
-    /// limit could make the service hold whatever it liked.
-    /// Counting items bounds nothing on its own: eight references can be eight
-    /// bytes or eight gigabytes, and what this service holds is the bytes. A
-    /// caller that stages once and hugely is the case the item count misses
-    /// entirely.
-    #[test]
-    fn one_principal_cannot_stage_unbounded_bytes() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-
-        let too_big = transfers
-            .stage(
-                &agent,
-                "huge",
-                "application/octet-stream",
-                vec![0; BYTES_PER_ITEM + 1],
-            )
-            .expect_err("a single item past the per-item bound was staged");
-        assert!(
-            matches!(too_big, TransferError::TooLarge { .. }),
-            "unexpected error: {too_big:?}"
+        assert_eq!(
+            routes(Arc::clone(&store))
+                .oneshot(request(&upload.upload, Body::empty()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
         );
-
-        // Under the per-item bound each time, over the principal's total.
-        let chunk = BYTES_PER_ITEM;
-        for which in 0..3 {
-            transfers
-                .stage(
-                    &agent,
-                    &format!("chunk-{which}"),
-                    "application/octet-stream",
-                    vec![0; chunk],
-                )
-                .expect("within the principal's total");
-        }
-        let over = transfers
-            .stage(
-                &agent,
-                "one-more",
-                "application/octet-stream",
-                vec![0; chunk],
-            )
-            .expect_err("a principal staged past its total");
-        assert!(
-            matches!(over, TransferError::TooManyBytesStaged { .. }),
-            "unexpected error: {over:?}"
+        assert!(store.input(&owner("other"), &upload.file.uri).is_err());
+        assert_eq!(
+            store
+                .input(&caller, &upload.file.uri)
+                .unwrap()
+                .identity()
+                .bytes,
+            bytes.len() as u64
         );
-
-        // Metadata is retained too, so it is bounded and it counts: staging one
-        // byte under a name of ten megabytes has staged ten megabytes.
-        let named = transfers
-            .stage(
-                &principal("agent-verbose"),
-                &"n".repeat(METADATA_MAX + 1),
-                "text/plain",
-                vec![0; 1],
-            )
-            .expect_err("an unbounded name was retained");
-        assert!(
-            matches!(named, TransferError::MetadataTooLong { .. }),
-            "unexpected error: {named:?}"
-        );
-
-        // Somebody else's total is their own.
-        transfers
-            .stage(
-                &principal("agent-other"),
-                "theirs",
-                "text/plain",
-                vec![0; 1],
-            )
-            .expect("another principal has its own allowance");
-    }
-
-    /// A descriptor is an ordinary return value carrying a live credential.
-    /// Anything printing one while working out why a transfer failed would
-    /// otherwise print the authority to perform it.
-    #[test]
-    fn printing_a_descriptor_does_not_print_its_credential() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        let reference = transfers
-            .stage(&agent, "passwd", "text/plain", b"root:x:0:0".to_vec())
+        let download = store.authorize_download(&caller, &upload.file.uri).unwrap();
+        assert_eq!(download.sensitivity, "secret");
+        assert_eq!(download.file.size, Some(bytes.len() as u64));
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&download.download, Body::empty()))
+            .await
             .unwrap();
-        let descriptor = transfers.authorize(&agent, &reference.uri).unwrap();
-
-        let credential = descriptor
-            .headers
-            .get(TRANSFER_CREDENTIAL_HEADER)
-            .expect("the descriptor carries the credential")
-            .clone();
-        let printed = format!("{descriptor:?}");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes.as_slice()
+        );
+        assert_eq!(
+            routes(Arc::clone(&store))
+                .oneshot(request(&download.download, Body::empty()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         assert!(
-            !printed.contains(&credential),
-            "printing a descriptor printed its credential: {printed}"
-        );
-        // Still worth printing: it says where it points and what it carries.
-        assert!(printed.contains(TRANSFER_CREDENTIAL_HEADER) && printed.contains(&descriptor.url));
-    }
-
-    /// A rounded size that lands on a boundary is the exact size, and the
-    /// lengths landing there — nothing at all, exactly one granule — are worth
-    /// knowing about a secret. The top of the range is the same disclosure
-    /// wearing a different hat: a figure only one accepted length can produce
-    /// names that length just as exactly as publishing it would.
-    #[test]
-    fn a_published_size_is_never_the_length_itself() {
-        let granule = usize::try_from(SIZE_GRANULARITY).unwrap();
-        for length in [0, 1, granule, granule + 1, BYTES_PER_ITEM] {
-            let published = about(length);
-            assert!(
-                published > u64::try_from(length).unwrap(),
-                "{length} bytes published as {published}"
-            );
-        }
-        assert_eq!(
-            about(BYTES_PER_ITEM),
-            about(BYTES_PER_ITEM - 1),
-            "the largest item a caller may stage is alone in what it publishes"
+            store.authorize_download(&caller, &upload.file.uri).is_ok(),
+            "an interrupted fetch can obtain a new ticket for the same immutable file"
         );
     }
 
-    #[test]
-    fn one_principal_cannot_stage_without_limit() {
-        let transfers = transfers();
-        let agent = principal("agent-clawde");
-        for _ in 0..PER_PRINCIPAL {
-            transfers
-                .stage(&agent, "out", "text/plain", b"x".to_vec())
-                .unwrap();
-        }
-        assert_eq!(
-            transfers
-                .stage(&agent, "out", "text/plain", b"x".to_vec())
-                .unwrap_err(),
-            TransferError::TooMuchStaged { max: PER_PRINCIPAL }
-        );
-
-        // Another principal is unaffected: the bound is per principal, so one
-        // caller cannot deny the channel to everyone else.
-        transfers
-            .stage(
-                &principal("agent-other"),
-                "out",
-                "text/plain",
-                b"x".to_vec(),
+    #[tokio::test]
+    async fn corrupt_uploads_never_become_tool_inputs() {
+        let store = plane();
+        let caller = owner("caller");
+        let upload = store
+            .authorize_upload(
+                &caller,
+                UploadParams {
+                    size: Some(4),
+                    ..UploadParams::default()
+                },
             )
             .unwrap();
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&upload.upload, Body::from("bad")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(store.input(&caller, &upload.file.uri).is_err());
+        assert!(
+            store.items.lock().unwrap().is_empty(),
+            "failed upload releases its reservation"
+        );
+        let upload = store
+            .authorize_upload(
+                &caller,
+                UploadParams {
+                    digest: Some(FileDigest {
+                        algorithm: "sha-256".to_owned(),
+                        value: URL_SAFE_NO_PAD.encode(hash(b"good")),
+                    }),
+                    ..UploadParams::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            routes(Arc::clone(&store))
+                .oneshot(request(&upload.upload, Body::from("evil")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(store.input(&caller, &upload.file.uri).is_err());
+    }
+
+    #[test]
+    fn pending_transfers_reserve_capacity_and_cancelled_downloads_release_it() {
+        let store = plane();
+        let caller = owner("caller");
+        let sinks: Vec<_> = (0..OWNER_ITEMS)
+            .map(|_| store.destination(&caller, None).unwrap())
+            .collect();
+        assert!(matches!(
+            store.destination(&caller, None),
+            Err(TransferError::Capacity)
+        ));
+        drop(sinks);
+        assert!(store.items.lock().unwrap().is_empty());
+        for group in 0..4 {
+            let caller = owner(&format!("caller-{group}"));
+            for _ in 0..OWNER_ITEMS {
+                store
+                    .authorize_upload(&caller, UploadParams::default())
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            store.authorize_upload(&owner("another"), UploadParams::default()),
+            Err(TransferError::Capacity)
+        ));
+    }
+
+    #[test]
+    fn expired_files_in_use_still_count_against_memory_capacity() {
+        let clock = Arc::new(TestClock::at(1000));
+        let store = Arc::new(Transfers::new(clock.clone(), "https://ssh.example").unwrap());
+        let caller = owner("caller");
+        let sink = store.destination(&caller, None).unwrap();
+        let file = sink.publish(vec![1, 2, 3]).unwrap();
+        let input = store.input(&caller, &file.uri).unwrap();
+        clock.advance(TTL);
+        store.sweep();
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        assert!(store.input(&caller, &file.uri).is_err());
+        drop(input);
+        store.sweep();
+        assert!(store.items.lock().unwrap().is_empty());
     }
 }

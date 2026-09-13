@@ -474,6 +474,7 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     "agent_intent",
                     "argv",
                     "program",
+                    "operation",
                     "access_class",
                     "purpose",
                     "verdict",
@@ -485,6 +486,10 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             if required_string(object, "program")? != command.program() {
                 return Err(());
             }
+            one_of(
+                required_string(object, "operation")?,
+                &["execute", "download", "upload"],
+            )?;
             access_class(required_string(object, "access_class")?)?;
             Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
             one_of(
@@ -534,8 +539,23 @@ fn validate_event(event: &Value) -> Result<(), ()> {
         "completed" => {
             exact_keys(
                 object,
-                &["event", "run", "decided", "state", "stdout", "stderr"],
+                if object.contains_key("file") {
+                    &[
+                        "event", "run", "decided", "state", "stdout", "stderr", "file",
+                    ]
+                } else {
+                    &["event", "run", "decided", "state", "stdout", "stderr"]
+                },
             )?;
+            if let Some(file) = object.get("file") {
+                let file = file.as_object().ok_or(())?;
+                exact_keys(file, &["uri", "bytes", "sha256"])?;
+                non_blank_string(required_string(file, "uri")?)?;
+                required_u64(file, "bytes")?;
+                if !lower_hex_digest(required_string(file, "sha256")?) {
+                    return Err(());
+                }
+            }
             RunId::parse(required_string(object, "run")?).map_err(|_| ())?;
             required_u64(object, "decided")?;
             non_blank_string(required_string(object, "state")?)?;
@@ -550,12 +570,17 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     &[
                         "event",
                         "artifact",
+                        "operation",
                         "decided",
                         "argv",
                         "agent_intent",
                         "purpose",
                         "access_class",
                     ],
+                )?;
+                one_of(
+                    required_string(object, "operation")?,
+                    &["execute", "download", "upload"],
                 )?;
                 required_u64(object, "decided")?;
                 Command::new(string_array(object, "argv")?).map_err(|_| ())?;
@@ -1043,7 +1068,7 @@ mod tests {
                                 event_line(
                                     10,
                                     serde_json::json!({
-                                        "event": "decided",
+                                        "event": "decided", "operation": "execute",
                                         "agent_intent": "inspect dns health",
                                         "argv": ["systemctl", "status", "unbound"],
                                         "program": "systemctl",
@@ -1288,6 +1313,7 @@ mod tests {
         let mut entry = valid_entry(10, 1);
         entry.event = serde_json::json!({
             "event": "evaluated",
+            "operation": "execute",
             "artifact": artifact.clone(),
             "decided": 7,
             "argv": ["systemctl", "status", "unbound"],
@@ -1307,7 +1333,7 @@ mod tests {
             .chain(std::iter::repeat_n("argument", 256))
             .collect::<Vec<_>>();
         let event = serde_json::json!({
-            "event": "decided",
+            "event": "decided", "operation": "execute",
             "agent_intent": "inspect the target",
             "argv": argv,
             "program": "tool",

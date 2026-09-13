@@ -83,6 +83,15 @@ pub enum Executed {
     },
 }
 
+enum Admission {
+    Ready {
+        decision: Decision,
+        receipt: Box<Receipt>,
+        approved_by: Option<Approver>,
+    },
+    Held(Executed),
+}
+
 /// What the service will not exceed.
 ///
 /// Gathered rather than passed one by one, because they are one decision: how
@@ -344,7 +353,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         self.exec_intended(principal, session, intent, argv).await
     }
 
-    /// Runs a command in a session, if it is allowed to.
+    /// Execute a command after the shared account, review, and audit boundary.
     pub async fn exec_intended(
         &self,
         principal: &PrincipalId,
@@ -352,175 +361,183 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         agent_intent: CommandIntent,
         argv: Vec<String>,
     ) -> Result<Executed, MediationError> {
-        // Nothing new once the service is stopping. Refusing here rather than
-        // at the door is what makes "no command starts after the wait begins"
-        // true: a request accepted before the stop is still being handled, and
-        // this is where it would otherwise start work nobody will be around to
-        // record.
+        let (session, admission) =
+            self.authorize_action(principal, session, agent_intent, || {
+                Command::new(argv).map(crate::action::Action::execute)
+            })?;
+        match admission {
+            Admission::Held(executed) => Ok(executed),
+            Admission::Ready {
+                decision,
+                receipt,
+                approved_by,
+            } => {
+                let outcome = self.run_it(&session, *receipt).await?;
+                Ok(Executed::Ran {
+                    decision,
+                    outcome: Box::new(self.account_for(outcome)?),
+                    approved_by,
+                })
+            }
+        }
+    }
+
+    /// Account ownership is checked before validation, review, or recording.
+    fn authorize_action(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        agent_intent: CommandIntent,
+        action: impl FnOnce() -> Result<crate::action::Action, CommandError>,
+    ) -> Result<(Session, Admission), MediationError> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(MediationError::Stopping);
         }
-        // Ownership first. Everything after this point acts on behalf of the
-        // principal, and doing any of it before the claim is checked would let
-        // one caller drive work against another's session.
         let session = self.sessions.use_session(session, principal)?;
-
-        let command = Command::new(argv)?;
-        // The decision carries both of its inputs from here on, so nothing
-        // downstream can pair this verdict with another command or session.
-        let decision = self.engine.decide(&session, command.clone());
-
-        // Recorded before the branch below, so a refusal and a command awaiting
-        // approval are as accountable as one that ran. What was attempted is
-        // usually the more interesting half of an incident.
-        //
-        // Recording consumes the decision and hands it back: one answer from
-        // the decision point is one recorded intent and at most one receipt,
-        // and this still has to answer with what was decided.
+        let action = action()?;
+        let decision = self.engine.decide_action(&session, action.clone());
         let intended = self.ledger.record_intent(decision, agent_intent)?;
-
-        match intended.decision().verdict() {
+        let admission = match intended.decision().verdict() {
             Verdict::Deny => {
                 let (decision, _) = intended.into_parts();
-                Ok(Executed::Refused {
+                Admission::Held(Executed::Refused {
                     decision,
                     refused_by: None,
                 })
             }
+            Verdict::Permit => {
+                let (decision, receipt) = intended.into_parts();
+                Admission::Ready {
+                    decision,
+                    receipt: Box::new(receipt.ok_or(MediationError::NoReceipt)?),
+                    approved_by: None,
+                }
+            }
             Verdict::NeedsApproval => {
-                // Asking and collecting an answer are the same act: an agent
-                // retries the command, and the retry either goes through, still
-                // waits, or is answered by a refusal. So it is one question to
-                // the store, answered under one hold — asked separately, an
-                // answer arriving in between belongs to neither and the retry
-                // queues a second request for a command already decided.
-                //
-                // The agreement is found by the command rather than by an
-                // identifier, so an agent that kept nothing can still collect
-                // its answer, and one that kept something has nothing it can
-                // present instead of asking. A command somebody has already
-                // refused is answered with that refusal rather than put in
-                // front of them again.
-                //
-                // The whole recorded deliberation goes to the store, rather
-                // than the parts of it a request needs: a request that names
-                // its own deliberation is the thing an agreement is later
-                // checked against, and picking the parts out here is how they
-                // could come to name something else.
                 let standing = self.approvals.ask(&intended)?;
-                // Taken before the match so that waiting and lapsing can share
-                // one arm: what they have in common is a request in front of a
-                // person, and only the words differ at the end of it.
                 let lapsed_from = match &standing {
                     Standing::Lapsed { by, .. } => Some(by.clone()),
                     _ => None,
                 };
                 match standing {
                     Standing::Ready(grant) => {
-                        // The agreement is written before anything runs, and it
-                        // is what authorizes the run: the decision held the
-                        // command and minted no receipt, so this entry is the
-                        // one that allowed it. Same ordering as every other
-                        // execution — recorded first, and running needs the
-                        // receipt.
                         let (receipt, approver) = self.ledger.record_approval(&intended, *grant)?;
-                        let outcome = self.run_it(&session, receipt).await?;
                         let (decision, _) = intended.into_parts();
-                        Ok(Executed::Ran {
+                        Admission::Ready {
                             decision,
-                            outcome: Box::new(self.account_for(outcome)?),
+                            receipt: Box::new(receipt),
                             approved_by: Some(approver),
-                        })
+                        }
                     }
-                    // Both leave a request in front of a person, so both are
-                    // answerable by a standing agreement. They differ only in
-                    // what the caller is told when no such agreement exists,
-                    // and splitting the paths is how a lapsed agreement would
-                    // come to bypass one.
                     Standing::Waiting(asked) | Standing::Lapsed { asked, .. } => {
-                        // A standing agreement for the session answers in the
-                        // operator's name, through the same acts a click
-                        // performs: the answer is applied and recorded, and
-                        // the agreement redeemed for this exact command,
-                        // single-use like every other. What stands is who
-                        // answers; nothing skips the record.
                         let request = asked.asked().id.clone();
+                        // Selection, recording, and redemption remain serialized
+                        // with withdrawal of the session agreement.
                         let grant = self.approvals.use_standing(
                             &session.id,
                             |standing| -> Result<_, MediationError> {
-                                // Keep selection, recording, and redemption
-                                // serialized with withdrawal. Once this
-                                // returns a grant, the standing agreement has
-                                // already answered this exact command; a
-                                // withdrawal can only govern later requests.
                                 self.apply_answer(&request, standing, true)?;
-                                Ok(self.approvals.redeem(
+                                Ok(self.approvals.redeem_action(
                                     &request,
                                     principal,
-                                    &command,
+                                    &action,
                                     intended.agent_intent(),
                                 )?)
                             },
                         );
                         if let Some(grant) = grant {
-                            let grant = grant?;
                             let (receipt, approver) =
-                                self.ledger.record_approval(&intended, grant)?;
-                            let outcome = self.run_it(&session, receipt).await?;
+                                self.ledger.record_approval(&intended, grant?)?;
                             let (decision, _) = intended.into_parts();
-                            return Ok(Executed::Ran {
+                            Admission::Ready {
                                 decision,
-                                outcome: Box::new(self.account_for(outcome)?),
+                                receipt: Box::new(receipt),
                                 approved_by: Some(approver),
-                            });
-                        }
-                        let (decision, _) = intended.into_parts();
-                        // Nothing runs on a lapsed agreement: the window it was
-                        // redeemable in is what it meant, and outliving that is
-                        // the same as never having been given. All that is new
-                        // is that the caller is told so.
-                        match lapsed_from {
-                            Some(by) => Ok(Executed::ApprovalLapsed {
-                                decision,
-                                asked,
-                                lapsed_from: by,
-                            }),
-                            None => Ok(Executed::AwaitingApproval { decision, asked }),
+                            }
+                        } else {
+                            let (decision, _) = intended.into_parts();
+                            Admission::Held(match lapsed_from {
+                                Some(by) => Executed::ApprovalLapsed {
+                                    decision,
+                                    asked,
+                                    lapsed_from: by,
+                                },
+                                None => Executed::AwaitingApproval { decision, asked },
+                            })
                         }
                     }
                     Standing::Refused { by } => {
                         let (decision, _) = intended.into_parts();
-                        Ok(Executed::Refused {
+                        Admission::Held(Executed::Refused {
                             decision,
                             refused_by: Some(by),
                         })
                     }
                 }
             }
-            Verdict::Permit => {
-                // A permit always carries a receipt, and the type says so:
-                // there is no path from `Verdict::Permit` to a missing one.
-                let (decision, receipt) = intended.into_parts();
-                let receipt = receipt.ok_or(MediationError::NoReceipt)?;
-                let outcome = self.run_it(&session, receipt).await?;
+        };
+        Ok((session, admission))
+    }
+
+    /// Downloads bytes through the same account, human review, and audit boundary as execution.
+    pub async fn download_intended(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        agent_intent: CommandIntent,
+        path: crate::files::RemotePath,
+        sink: Arc<dyn crate::transfer::DownloadSink>,
+    ) -> Result<Executed, MediationError> {
+        let (session, admission) =
+            self.authorize_action(principal, session, agent_intent, || {
+                crate::action::Action::download(path)
+            })?;
+        self.transfer_admitted(session, admission, crate::transfer::Payload::Download(sink))
+            .await
+    }
+
+    /// The approval binds immutable content identity and the explicit replacement choice.
+    pub async fn upload_intended(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        agent_intent: CommandIntent,
+        path: crate::files::RemotePath,
+        input: crate::transfer::PreparedUpload,
+        overwrite: bool,
+    ) -> Result<Executed, MediationError> {
+        let (session, admission) =
+            self.authorize_action(principal, session, agent_intent, || {
+                crate::action::Action::upload(path, input.identity().clone(), overwrite)
+            })?;
+        self.transfer_admitted(session, admission, crate::transfer::Payload::Upload(input))
+            .await
+    }
+
+    async fn transfer_admitted(
+        &self,
+        session: Session,
+        admission: Admission,
+        payload: crate::transfer::Payload,
+    ) -> Result<Executed, MediationError> {
+        match admission {
+            Admission::Held(executed) => Ok(executed),
+            Admission::Ready {
+                decision,
+                receipt,
+                approved_by,
+            } => {
+                let connection = self.connection_for(&session).await?;
+                let outcome = self.runs.transfer(connection, *receipt, payload).await?;
                 Ok(Executed::Ran {
                     decision,
                     outcome: Box::new(self.account_for(outcome)?),
-                    approved_by: None,
+                    approved_by,
                 })
             }
         }
     }
 
-    /// Runs an authorized command on its session's connection.
-    ///
-    /// The handle is taken and the lock released before running. Holding it
-    /// across the await would serialise every session behind whichever command
-    /// happens to be running.
-    ///
-    /// Reached from both branches that run something, so a command a human
-    /// agreed to goes down the same path as one policy permitted outright:
-    /// approval decides *whether*, and changes nothing about how.
     async fn run_it(&self, session: &Session, receipt: Receipt) -> Result<Outcome, MediationError> {
         let connection = self.connection_for(session).await?;
         Ok(self.runs.run(&connection, receipt).await?)
@@ -1466,6 +1483,70 @@ mod tests {
             },
             records_to,
         )
+    }
+
+    #[tokio::test]
+    async fn file_operations_require_session_ownership_and_configured_review() {
+        struct MustNotPublish;
+        impl crate::transfer::DownloadSink for MustNotPublish {
+            fn publish(&self, _: Vec<u8>) -> Result<crate::action::FileIdentity, String> {
+                panic!("unapproved file effect")
+            }
+        }
+        let bastion = bastion().await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let path = crate::files::RemotePath::parse("/tmp/report").unwrap();
+        let intent = CommandIntent::parse("inspect the report").unwrap();
+        let foreign = PrincipalId::parse("someone-else").unwrap();
+        assert!(
+            bastion
+                .download_intended(
+                    &foreign,
+                    &session.id,
+                    intent.clone(),
+                    path.clone(),
+                    Arc::new(MustNotPublish)
+                )
+                .await
+                .is_err()
+        );
+        assert!(bastion.waiting_for_approval().is_empty());
+        assert!(matches!(
+            bastion
+                .download_intended(
+                    &alice(),
+                    &session.id,
+                    intent.clone(),
+                    path.clone(),
+                    Arc::new(MustNotPublish)
+                )
+                .await
+                .unwrap(),
+            Executed::AwaitingApproval { .. }
+        ));
+        for uri in ["mcp-file://upload/first", "mcp-file://upload/remapped"] {
+            let input = crate::transfer::PreparedUpload::new(uri.to_owned(), vec![0, 255]).unwrap();
+            assert!(matches!(
+                bastion
+                    .upload_intended(
+                        &alice(),
+                        &session.id,
+                        intent.clone(),
+                        path.clone(),
+                        input,
+                        false
+                    )
+                    .await
+                    .unwrap(),
+                Executed::AwaitingApproval { .. }
+            ));
+        }
+        assert_eq!(
+            bastion.waiting_for_approval().len(),
+            2,
+            "temporary URI remapping must join the same content approval"
+        );
+        assert!(bastion.runs.outstanding().is_empty());
     }
 
     fn alice() -> PrincipalId {

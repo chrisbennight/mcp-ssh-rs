@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Extensions, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResult, CustomRequest, CustomResult, Extensions, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
@@ -79,6 +79,7 @@ pub struct SshMcp<C: Clock, S: CredentialSource> {
     notifier: Arc<dyn Notifier>,
     dashboard: Option<Url>,
     launch_principal: Option<AuthenticatedPrincipal>,
+    transfers: Option<Arc<crate::transfer::Transfers>>,
 }
 
 impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
@@ -93,12 +94,21 @@ impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
             notifier,
             dashboard,
             launch_principal: None,
+            transfers: None,
         }
     }
 
     /// The launcher owns the stdio process and its configured account access.
     pub(crate) fn with_launch_principal(mut self, principal: PrincipalId) -> Self {
         self.launch_principal = Some(AuthenticatedPrincipal::new(principal));
+        self
+    }
+
+    pub(crate) fn with_transfers(
+        mut self,
+        transfers: Option<Arc<crate::transfer::Transfers>>,
+    ) -> Self {
+        self.transfers = transfers;
         self
     }
 
@@ -120,6 +130,7 @@ impl<C: Clock, S: CredentialSource> Clone for SshMcp<C, S> {
             notifier: Arc::clone(&self.notifier),
             dashboard: self.dashboard.clone(),
             launch_principal: self.launch_principal.clone(),
+            transfers: self.transfers.clone(),
         }
     }
 }
@@ -141,7 +152,56 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
         // gateway did not vouch for would tell something that should not have
         // reached this service what it could try next.
         self.principal(&context.extensions)?;
-        Ok(tools::catalog())
+        Ok(tools::catalog_with_files(self.transfers.as_deref()))
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, McpError> {
+        let principal = self.principal(&context.extensions)?.get();
+        let store = self
+            .transfers
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_request("file transfer is not configured", None))?;
+        let params = request.params.unwrap_or_else(|| serde_json::json!({}));
+        let value = match request.method.as_str() {
+            crate::transfer::AUTHORIZE_UPLOAD => {
+                let params = serde_json::from_value(params)
+                    .map_err(|_| McpError::invalid_params("invalid upload options", None))?;
+                serde_json::to_value(
+                    store
+                        .authorize_upload(principal, params)
+                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+                )
+            }
+            crate::transfer::AUTHORIZE_DOWNLOAD => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct DownloadParams {
+                    uri: String,
+                    #[serde(rename = "_meta")]
+                    _meta: Option<serde_json::Value>,
+                }
+                let params: DownloadParams = serde_json::from_value(params)
+                    .map_err(|_| McpError::invalid_params("invalid download options", None))?;
+                serde_json::to_value(
+                    store
+                        .authorize_download(principal, &params.uri)
+                        .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+                )
+            }
+            _ => {
+                return Err(McpError::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    "unknown method",
+                    None,
+                ));
+            }
+        }
+        .map_err(|_| McpError::internal_error("could not encode file authorization", None))?;
+        Ok(CustomResult::new(value))
     }
 
     async fn call_tool(
@@ -150,7 +210,8 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let principal = self.principal(&context.extensions)?.clone();
-        tools::dispatch(
+        tools::dispatch_with_files(
+            self.transfers.as_ref(),
             &self.bastion,
             self.notifier.as_ref(),
             self.dashboard.as_ref(),
@@ -274,7 +335,14 @@ mod tests {
             crate::settings::bounds(),
         ));
         let handler = SshMcp::new(bastion, Arc::new(crate::notify::Silence), None)
-            .with_launch_principal(PrincipalId::parse("launcher").unwrap());
+            .with_launch_principal(PrincipalId::parse("launcher").unwrap())
+            .with_transfers(Some(Arc::new(
+                crate::transfer::Transfers::new(
+                    Arc::new(ssh_core::clock::TestClock::at(0)),
+                    "https://ssh.example",
+                )
+                .unwrap(),
+            )));
         let (client, server) = tokio::io::duplex(65536);
         let task = tokio::spawn(async move {
             handler
@@ -290,6 +358,10 @@ mod tests {
         for (request, expect_error) in [
             (
                 serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"test", "version":"test"}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0", "id":5, "method":"files/authorizeUpload", "params":{"size":0}}),
                 false,
             ),
             (
@@ -318,7 +390,7 @@ mod tests {
             .unwrap();
             let response: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(response.get("id").unwrap(), request.get("id").unwrap());
-            assert_eq!(response.get("error").is_some(), expect_error, "{response}");
+            assert_eq!(response.get("error").is_some(), expect_error);
             if request.get("id").and_then(serde_json::Value::as_u64) == Some(1) {
                 writer
                     .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")

@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod action;
 pub mod approval;
 pub mod audit;
 pub mod clock;
@@ -17,6 +18,7 @@ pub mod registry;
 pub mod run;
 pub mod secret;
 pub mod session;
+pub mod transfer;
 
 /// Administrator-declared account permissions, enforced by the target OS.
 /// This label does not classify commands or grant access by itself.

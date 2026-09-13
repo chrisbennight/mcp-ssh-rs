@@ -47,6 +47,8 @@ pub struct EvaluatorSettings {
 /// embed a credential in its path, the way webhook services commonly issue
 /// them, so only its presence is shown.
 pub struct Settings {
+    pub file_origin: Option<Url>,
+    pub file_root: Option<PathBuf>,
     pub process: crate::process::ProcessOptions,
     /// Where the host and role registry is read from.
     pub registry: PathBuf,
@@ -137,6 +139,8 @@ impl Settings {
     pub const JWKS_VAR: &'static str = "MCP_SSH_IDENTITY_JWKS_URL";
     pub const ISSUER_VAR: &'static str = "MCP_SSH_IDENTITY_ISSUER";
     pub const TRUSTED_HOSTS_VAR: &'static str = "MCP_SSH_TRUSTED_HOSTS";
+    pub const FILE_ROOT_VAR: &'static str = "MCP_SSH_FILE_ROOT";
+    pub const FILE_ORIGIN_VAR: &'static str = "MCP_SSH_FILE_ORIGIN";
     pub const REVIEW_VAR: &'static str = "MCP_SSH_REVIEW";
 
     pub fn from_env() -> Result<Self, SettingsError> {
@@ -374,7 +378,15 @@ impl Settings {
                 }
             }
         };
+        let file_root = optional(&lookup, Self::FILE_ROOT_VAR)?.map(PathBuf::from);
+        if file_root.is_some() && (!stdio || optional(&lookup, Self::FILE_ORIGIN_VAR)?.is_some()) {
+            return Err(SettingsError::Unusable {
+                var: Self::FILE_ROOT_VAR,
+            });
+        }
         Ok(Self {
+            file_root,
+            file_origin: optional_url(&lookup, Self::FILE_ORIGIN_VAR, &["http", "https"])?,
             process,
             registry,
             bearers,

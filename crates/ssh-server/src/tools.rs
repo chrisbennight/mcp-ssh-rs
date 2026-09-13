@@ -164,6 +164,15 @@ pub struct SessionOpened {
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "kept", rename_all = "snake_case")]
 pub enum StreamOut {
+    Reference {
+        file: crate::transfer::Reference,
+        truncated: bool,
+        bytes: u64,
+    },
+    Unavailable {
+        bytes: u64,
+        why: String,
+    },
     /// What the target produced, up to what is retained.
     Text {
         text: String,
@@ -176,7 +185,10 @@ pub enum StreamOut {
     ///
     /// Asking again will not produce it. Whatever the command was reaching for
     /// is not something this service hands to a caller.
-    Withheld { bytes: u64, matched: String },
+    Withheld {
+        bytes: u64,
+        matched: String,
+    },
     /// Still arriving. How much so far, and nothing else yet.
     ///
     /// Whether a stream is credential-shaped is decided from all of it, and a
@@ -185,7 +197,9 @@ pub enum StreamOut {
     /// the lines before it have already been handed over. Bytes given to an
     /// agent cannot be taken back, so none are given until the stream is
     /// complete and what it is has been settled.
-    Pending { bytes: u64 },
+    Pending {
+        bytes: u64,
+    },
 }
 
 impl StreamOut {
@@ -208,6 +222,10 @@ impl StreamOut {
                 bytes: stream.bytes,
                 matched: matched.to_owned(),
             },
+            None if stream.text.len() > 4096 => Self::Unavailable {
+                bytes: stream.bytes,
+                why: "bulk output requires a configured file transfer channel".to_owned(),
+            },
             None => Self::Text {
                 text: stream.text.clone(),
                 truncated: stream.truncated,
@@ -226,6 +244,8 @@ pub enum ExecResult {
     /// Only a command the target took and finished with is reported this way,
     /// so `ran` can be read as meaning what it says.
     Ran {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<crate::transfer::Reference>,
         run: String,
         /// Absent when the command ended without the target reporting one.
         exit: Option<u32>,
@@ -469,7 +489,82 @@ fn schema_for<T: JsonSchema>() -> JsonObject {
 /// Routes one tool call at the bastion.
 ///
 /// The principal comes from HTTP authentication, never from the request body.
-pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadArgs {
+    pub host: String,
+    pub role: String,
+    pub access_class: AccessClassArg,
+    pub session: String,
+    /// Agent-supplied reason for accessing this file.
+    pub intent: String,
+    /// Absolute path on the SSH target.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UploadArgs {
+    pub host: String,
+    pub role: String,
+    pub access_class: AccessClassArg,
+    pub session: String,
+    /// Agent-supplied reason for placing this file.
+    pub intent: String,
+    /// Absolute destination path on the SSH target.
+    pub path: String,
+    /// File URI uploaded outside model context. Inline content is not accepted.
+    #[schemars(extend("x-mcp-file" = {"transferModes": ["upload"], "maxSize": 16777216}))]
+    pub source: String,
+    /// Explicitly permit replacement of an existing file. Interrupted writes may be partial.
+    pub overwrite: bool,
+}
+
+pub fn catalog_with_files(files: Option<&crate::transfer::Transfers>) -> ListToolsResult {
+    let mut catalog = catalog();
+    if files.is_some() {
+        catalog.tools.push(tool::<DownloadArgs, ExecResult>(
+            "ssh_download", "Read a bounded binary file from the SSH target and return a file reference. Bytes stay outside model context. Uses the session account and configured human review.",
+            ToolAnnotations::new().read_only(false).destructive(false).idempotent(false).open_world(true),
+        ));
+        catalog.tools.push(tool::<UploadArgs, ExecResult>(
+            "ssh_upload", "Place an uploaded file reference on the SSH target. No inline or base64 content. Set overwrite explicitly. Unknown outcomes require investigation before retrying.",
+            ToolAnnotations::new().read_only(false).destructive(true).idempotent(false).open_world(true),
+        ));
+    }
+    if files.is_some_and(crate::transfer::Transfers::is_local) {
+        for tool in &mut catalog.tools {
+            if tool.name == "ssh_upload"
+                && let Some(source) = Arc::make_mut(&mut tool.input_schema)
+                    .get_mut("properties")
+                    .and_then(|properties| properties.get_mut("source"))
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                source.remove("x-mcp-file");
+                source.insert(
+                    "description".to_owned(),
+                    serde_json::json!(
+                        "file:// URI within the launcher's configured shared directory"
+                    ),
+                );
+            }
+        }
+    }
+    catalog
+}
+
+pub async fn dispatch<C: Clock + 'static, S: CredentialSource + 'static>(
+    bastion: &Bastion<C, S>,
+    notifier: &dyn crate::notify::Notifier,
+    dashboard: Option<&url::Url>,
+    acting_for: &AuthenticatedPrincipal,
+    params: CallToolRequestParams,
+) -> Result<CallToolResult, McpError> {
+    dispatch_with_files(None, bastion, notifier, dashboard, acting_for, params).await
+}
+
+pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
+    files: Option<&Arc<crate::transfer::Transfers>>,
     bastion: &Bastion<C, S>,
     notifier: &dyn crate::notify::Notifier,
     dashboard: Option<&url::Url>,
@@ -481,6 +576,69 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
     let principal = acting_for.get();
     let arguments = params.arguments.unwrap_or_default();
     match params.name.as_ref() {
+        "ssh_download" => {
+            let args: DownloadArgs = parse(arguments)?;
+            let session = session_named(&args.session)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
+            let path = ssh_core::files::RemotePath::parse(&args.path).map_err(bad_request)?;
+            let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
+            let store = files.ok_or_else(|| {
+                McpError::invalid_request("file transfer is not configured", None)
+            })?;
+            let sink = store.destination(principal, None).map_err(bad_request)?;
+            match bastion
+                .download_intended(principal, &session, intent, path, sink)
+                .await
+            {
+                Ok(executed) => {
+                    announce(notifier, dashboard, &executed);
+                    ok(&exec_result_with_files(
+                        executed, dashboard, files, principal,
+                    ))
+                }
+                Err(error) => without_an_outcome(&error),
+            }
+        }
+        "ssh_upload" => {
+            let args: UploadArgs = parse(arguments)?;
+            let session = session_named(&args.session)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
+            let path = ssh_core::files::RemotePath::parse(&args.path).map_err(bad_request)?;
+            let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
+            let store = files.ok_or_else(|| {
+                McpError::invalid_request("file transfer is not configured", None)
+            })?;
+            let input = store.input(principal, &args.source).map_err(bad_request)?;
+            match bastion
+                .upload_intended(principal, &session, intent, path, input, args.overwrite)
+                .await
+            {
+                Ok(executed) => {
+                    announce(notifier, dashboard, &executed);
+                    ok(&exec_result_with_files(
+                        executed, dashboard, files, principal,
+                    ))
+                }
+                Err(error) => without_an_outcome(&error),
+            }
+        }
+
         HOSTS => {
             // Read even though it declares nothing, so that a caller sending
             // fields this tool does not have is told rather than ignored. Every
@@ -554,7 +712,9 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
             {
                 Ok(executed) => {
                     announce(notifier, dashboard, &executed);
-                    ok(&exec_result(executed, dashboard))
+                    ok(&exec_result_with_files(
+                        executed, dashboard, files, principal,
+                    ))
                 }
                 Err(error) => without_an_outcome(&error),
             }
@@ -579,7 +739,12 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
                 )
                 .await
             {
-                Ok(outcome) => ok(&ran(&outcome, "polled".to_owned())),
+                Ok(outcome) => ok(&ran_with_files(
+                    &outcome,
+                    "polled".to_owned(),
+                    files,
+                    principal,
+                )),
                 Err(error) => without_an_outcome(&error),
             }
         }
@@ -644,6 +809,83 @@ fn announce_ask(
         return;
     };
     notifier.waiting(crate::notify::Note::about(asked.asked(), dashboard));
+}
+
+fn exec_result_with_files(
+    executed: Executed,
+    dashboard: Option<&url::Url>,
+    files: Option<&Arc<crate::transfer::Transfers>>,
+    principal: &ssh_core::PrincipalId,
+) -> ExecResult {
+    match executed {
+        Executed::Ran {
+            decision,
+            outcome,
+            approved_by,
+        } => {
+            let why = match &approved_by {
+                Some(who) => held_and(&self::approved_by(who)),
+                None => decision.explanation().to_owned(),
+            };
+            ran_with_files(&outcome, why, files, principal)
+        }
+        held => exec_result(held, dashboard),
+    }
+}
+
+fn ran_with_files(
+    outcome: &ssh_core::run::Outcome,
+    why: String,
+    files: Option<&Arc<crate::transfer::Transfers>>,
+    principal: &ssh_core::PrincipalId,
+) -> ExecResult {
+    let mut result = ran(outcome, why);
+    if let ExecResult::Ran { stdout, stderr, .. } = &mut result {
+        *stdout = stream_with_files(outcome.stdout(), outcome.stdout_bytes(), files, principal);
+        *stderr = stream_with_files(outcome.stderr(), outcome.stderr_bytes(), files, principal);
+    }
+    result
+}
+
+fn stream_with_files(
+    stream: &ssh_core::run::Stream,
+    bytes: &[u8],
+    files: Option<&Arc<crate::transfer::Transfers>>,
+    principal: &ssh_core::PrincipalId,
+) -> StreamOut {
+    if stream.matched.is_none() && bytes.len() <= 4096 && std::str::from_utf8(bytes).is_ok() {
+        return StreamOut::released(stream);
+    }
+    let Some(store) = files else {
+        return StreamOut::Unavailable {
+            bytes: stream.bytes,
+            why: "binary, bulk, or sensitive output requires a configured file transfer channel"
+                .to_owned(),
+        };
+    };
+    let published = store.destination(principal, None).and_then(|sink| {
+        sink.publish(bytes.to_vec())
+            .map_err(|_| crate::transfer::TransferError::Capacity)
+    });
+    match published {
+        Ok(file) => StreamOut::Reference {
+            file: crate::transfer::Reference {
+                uri: file.uri,
+                size: Some(file.bytes),
+                name: None,
+                mime_type: None,
+                digest: None,
+            },
+            truncated: stream.truncated,
+            bytes: stream.bytes,
+        },
+        Err(error) => StreamOut::Unavailable {
+            bytes: stream.bytes,
+            why: format!(
+                "output could not be retained: {error}; do not repeat the command to recover it"
+            ),
+        },
+    }
 }
 
 fn exec_result(executed: Executed, dashboard: Option<&url::Url>) -> ExecResult {
@@ -761,13 +1003,23 @@ fn said_no(approver: &ssh_core::approval::Approver) -> String {
 }
 
 fn ran(outcome: &ssh_core::run::Outcome, why: String) -> ExecResult {
-    reported(
+    let mut result = reported(
         outcome.run(),
         outcome.state(),
         outcome.stdout(),
         outcome.stderr(),
         why,
-    )
+    );
+    if let ExecResult::Ran { file, .. } = &mut result {
+        *file = outcome.file().map(|identity| crate::transfer::Reference {
+            uri: identity.uri.clone(),
+            size: Some(identity.bytes),
+            name: None,
+            mime_type: None,
+            digest: None,
+        });
+    }
+    result
 }
 
 /// What a caller is told about a run, from what the run says about itself.
@@ -820,6 +1072,7 @@ fn reported(
         RunState::Ended | RunState::Exited { .. } => {}
     }
     ExecResult::Ran {
+        file: None,
         run: run.as_str().to_owned(),
         exit: match state {
             RunState::Exited { code } => Some(code),
@@ -1366,6 +1619,67 @@ mod tests {
     /// so the second call does not answer like the first. A client told this is
     /// idempotent would treat a lost response as safe to re-request, and get an
     /// unknown-run error where the output used to be.
+    #[test]
+    fn bulk_and_binary_output_are_references_to_the_retained_bytes() {
+        let store = Arc::new(
+            crate::transfer::Transfers::new(
+                Arc::new(ssh_core::clock::TestClock::at(0)),
+                "https://ssh.example",
+            )
+            .unwrap(),
+        );
+        let principal = ssh_core::PrincipalId::parse("caller").unwrap();
+        let bytes = vec![255_u8; 5000];
+        let stream = ssh_core::run::Stream {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes: bytes.len() as u64,
+            matched: None,
+            truncated: true,
+        };
+        let StreamOut::Reference {
+            file,
+            truncated,
+            bytes: seen,
+        } = stream_with_files(&stream, &bytes, Some(&store), &principal)
+        else {
+            panic!("bulk bytes were not referenced");
+        };
+        assert!(truncated);
+        assert_eq!(seen, bytes.len() as u64);
+        assert_eq!(file.size, Some(bytes.len() as u64));
+        assert_eq!(
+            store
+                .input(&principal, &file.uri)
+                .unwrap()
+                .identity()
+                .sha256,
+            ssh_core::transfer::identity(String::new(), &bytes).sha256
+        );
+        assert!(matches!(
+            stream_with_files(&stream, &bytes, None, &principal),
+            StreamOut::Unavailable { .. }
+        ));
+        let catalog = catalog_with_files(Some(&store));
+        let upload = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "ssh_upload")
+            .unwrap();
+        assert_eq!(
+            upload
+                .input_schema
+                .get("properties")
+                .unwrap()
+                .get("source")
+                .unwrap()
+                .get("x-mcp-file")
+                .unwrap()
+                .get("transferModes")
+                .unwrap(),
+            &serde_json::json!(["upload"])
+        );
+    }
+
     #[test]
     fn polling_is_annotated_as_delivering_once() {
         let poll = catalog()

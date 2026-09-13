@@ -221,6 +221,7 @@ fn refused() -> Response {
 /// how a principal or an account class is spelled, and escaping applies to plain strings
 /// whatever those types become.
 pub struct Pending {
+    pub operation: String,
     pub id: String,
     pub session: String,
     pub principal: String,
@@ -240,6 +241,7 @@ pub struct Pending {
 impl From<Asked> for Pending {
     fn from(asked: Asked) -> Self {
         Self {
+            operation: asked.operation.as_str().to_owned(),
             id: asked.id.as_str().to_owned(),
             session: asked.session.as_str().to_owned(),
             principal: asked.principal.as_str().to_owned(),
@@ -2474,7 +2476,7 @@ mod tests {
                         host: "dns1".to_owned(),
                         role: "readonly".to_owned(),
                         event: serde_json::json!({
-                            "event": "decided",
+                            "event": "decided", "operation": "execute",
                             "argv": ["systemctl", "status", "unbound"],
                             "agent_intent": "inspect dns health",
                             "access_class": "read_only",
@@ -2692,7 +2694,7 @@ mod tests {
                         entry(
                             20,
                             serde_json::json!({
-                                "event": "decided",
+                                "event": "decided", "operation": "execute",
                                 "argv": ["uname", "-a"],
                                 "agent_intent": "inspect kernel",
                                 "purpose": "diagnose dns",
@@ -2763,7 +2765,7 @@ mod tests {
                         entry(
                             10,
                             serde_json::json!({
-                                "event": "decided",
+                                "event": "decided", "operation": "execute",
                                 "argv": ["systemctl", "status", "unbound"],
                                 "agent_intent": "inspect dns health",
                                 "purpose": "diagnose dns",

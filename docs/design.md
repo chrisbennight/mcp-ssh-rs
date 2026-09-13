@@ -137,10 +137,26 @@ and ordinary account metadata are distinct from credential values.
 Target output is data the account can access. Recognized secret material is
 withheld from model-visible output, but recognition is incomplete and is not a
 containment guarantee. The account's actual permissions bound what can be read.
-Bulk output, files, and secret placement belong in authorized reference-based
-transfer paths rather than large MCP text or base64 bodies. Transfer references
-must preserve ownership, bounds, expiry, cleanup, and truthful size and digest
-metadata without exposing a reusable service credential.
+Bulk output, files, and secret placement use authorized file references.
+Small valid UTF-8 command output may be inline; larger, binary, or recognized
+sensitive output requires a configured byte channel. No large-text or base64
+fallback exists. The HTTP adapter uses upload/download authorization methods,
+`FileValue` metadata, and separate one-use byte credentials. Stdio can instead
+resolve local file URIs within a launch-configured shared directory.
+
+Transfers share session ownership, configured account review, pre-effect audit,
+and run tracking with commands. Typed operation identity separates command and
+file approvals. Upload review binds content digest and size, remote destination,
+replacement choice, and stated intent; temporary gateway URI remapping does
+not change that identity. Target account permissions remain the containment
+boundary. SFTP path checks do not prevent a malicious target from racing its
+own filesystem. Interrupted remote writes may be partial and are not replayed.
+
+Storage reserves bounded capacity before transfers, validates complete uploads
+before use, and expires references. Exact file size and digest metadata are
+ordinary protected metadata, not credential values. Local outputs publish after
+complete writes and clean up generated files. See [file transfers](file-transfers.md)
+for the operational contract and retention limits.
 
 Generic transports, review, audit, and transfer adapters belong in this
 project. Host inventories, gateway entitlement policy, secret mappings,

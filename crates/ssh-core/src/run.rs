@@ -209,9 +209,26 @@ pub struct Outcome {
     /// output, and the interleaving order is not reproducible anyway.
     stdout: Stream,
     stderr: Stream,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<crate::action::FileIdentity>,
+    #[serde(skip)]
+    stdout_bytes: Vec<u8>,
+    #[serde(skip)]
+    stderr_bytes: Vec<u8>,
 }
 
 impl Outcome {
+    pub fn stdout_bytes(&self) -> &[u8] {
+        &self.stdout_bytes
+    }
+    pub fn stderr_bytes(&self) -> &[u8] {
+        &self.stderr_bytes
+    }
+
+    pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
+        self.file.as_ref()
+    }
+
     #[must_use]
     pub const fn run(&self) -> &RunId {
         &self.run
@@ -260,7 +277,10 @@ impl Outcome {
             run,
             authorization,
             state,
+            stdout_bytes: stdout.text.as_bytes().to_vec(),
+            stderr_bytes: Vec::new(),
             stdout,
+            file: None,
             stderr: Stream {
                 text: String::new(),
                 truncated: false,
@@ -358,6 +378,7 @@ struct Live {
 }
 
 struct Record {
+    file: Option<crate::action::FileIdentity>,
     stdout: Collected,
     stderr: Collected,
     state: RunState,
@@ -475,34 +496,122 @@ impl Runs {
         connection: &Connection,
         recorded: Receipt,
     ) -> Result<Outcome, RunError> {
+        if recorded.action().kind() != crate::action::ActionKind::Execute {
+            return Err(RunError::WrongOperation);
+        }
         let started = Instant::now();
         let id = self.start(connection, recorded).await?;
         let left = self.limits.wait.saturating_sub(started.elapsed());
         self.wait(&id, left).await
     }
 
-    /// Starts a command, giving up if the target does not accept it in time.
-    ///
-    /// Not public. `run` is the only way in: a second entry point that started
-    /// a command and handed back an identifier would be the separate
-    /// asynchronous path this design rejects, with its own wait semantics and
-    /// its own shape of outcome.
-    ///
-    /// The receipt is proof that this command was written to the record before
-    /// it ran, and there is no way to obtain one except by writing that record.
-    /// An execution nobody can account for is worse than one that did not
-    /// happen, so the requirement lives in the signature rather than in a rule
-    /// somebody has to remember at each call site.
-    ///
-    /// It also names the target it was written against. A connection is dialled
-    /// separately from the record being written, so that is the one part of an
-    /// authorization this cannot take *from* the receipt and has to check
-    /// against it: otherwise a permission granted for one host or role would
-    /// run on whichever connection happened to be passed in.
-    ///
-    /// The budget is applied to each await here rather than by dropping this
-    /// whole call, so cancelling the caller cannot strand a registered record
-    /// with nothing to settle it.
+    /// Registers an audited transfer before any remote file effect. The task survives caller cancellation.
+    pub(crate) async fn transfer(
+        &self,
+        connection: Arc<Connection>,
+        recorded: Receipt,
+        payload: crate::transfer::Payload,
+    ) -> Result<Outcome, RunError> {
+        use crate::action::Operation;
+        use crate::transfer::Payload;
+        if recorded.host() != connection.host() || recorded.role() != connection.role() {
+            return Err(RunError::WrongTarget {
+                recorded: recorded.sequence(),
+                host: connection.host().to_string(),
+                role: connection.role().to_string(),
+            });
+        }
+        match (recorded.action().operation(), &payload) {
+            (Operation::Download { .. }, Payload::Download(_)) => {}
+            (Operation::Upload { source, .. }, Payload::Upload(input))
+                if source.bytes == input.identity().bytes
+                    && source.sha256 == input.identity().sha256 => {}
+            _ => return Err(RunError::WrongOperation),
+        }
+        let operation = recorded.action().operation().clone();
+        let id = self.mint();
+        let live = Arc::new(Live {
+            record: Mutex::new(Record {
+                file: None,
+                stdout: Collected::new(self.limits.output_bytes),
+                stderr: Collected::new(self.limits.output_bytes),
+                state: RunState::Running,
+            }),
+            authorization: recorded.authorization().clone(),
+            settled: Notify::new(),
+        });
+        {
+            let mut records = self
+                .records
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if self.stopping.load(Ordering::SeqCst) {
+                return Err(RunError::Stopping);
+            }
+            records.insert(id.0.clone(), Arc::clone(&live));
+            self.reading
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.0.clone());
+        }
+        let reading = Reading {
+            reading: Arc::clone(&self.reading),
+            id: id.0.clone(),
+        };
+        let watcher = self.watcher.clone();
+        let settled_id = id.clone();
+        tokio::spawn(async move {
+            let _reading = reading;
+            let work = async {
+                match (operation, payload) {
+                    (Operation::Download { path }, Payload::Download(sink)) => {
+                        let bytes = crate::files::download(&connection, &path)
+                            .await
+                            .map_err(|_| ())?;
+                        sink.publish(bytes).map_err(|_| ())
+                    }
+                    (
+                        Operation::Upload {
+                            path,
+                            source: _,
+                            overwrite,
+                        },
+                        Payload::Upload(input),
+                    ) => {
+                        crate::files::upload(&connection, &path, input.bytes(), overwrite)
+                            .await
+                            .map_err(|_| ())?;
+                        Ok(input.identity().clone())
+                    }
+                    _ => Err(()),
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(120), work).await;
+            {
+                let mut record = live
+                    .record
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match result {
+                    Ok(Ok(file)) => {
+                        record.file = Some(file);
+                        record.state = RunState::Exited { code: 0 };
+                    }
+                    _ => {
+                        record.state = RunState::Indeterminate;
+                        record.stderr.push(b"Transfer did not complete successfully. A remote write may be partial; do not automatically retry.");
+                    }
+                }
+            }
+            live.settled.notify_waiters();
+            if let Some(watcher) = watcher {
+                watcher.settled(snapshot_of(&settled_id, &live));
+            }
+        });
+        self.wait(&id, self.limits.wait).await
+    }
+
+    /// The receipt fixes the command and target; registration precedes the exec request.
     async fn start(&self, connection: &Connection, recorded: Receipt) -> Result<RunId, RunError> {
         if recorded.host() != connection.host() || recorded.role() != connection.role() {
             return Err(RunError::WrongTarget {
@@ -546,6 +655,7 @@ impl Runs {
         let id = self.mint();
         let live = Arc::new(Live {
             record: Mutex::new(Record {
+                file: None,
                 stdout: Collected::new(self.limits.output_bytes),
                 stderr: Collected::new(self.limits.output_bytes),
                 state: RunState::Running,
@@ -871,11 +981,16 @@ fn snapshot_of(id: &RunId, live: &Live) -> Outcome {
         state: record.state,
         stdout: record.stdout.snapshot(),
         stderr: record.stderr.snapshot(),
+        file: record.file.clone(),
+        stdout_bytes: record.stdout.kept.clone(),
+        stderr_bytes: record.stderr.kept.clone(),
     }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RunError {
+    #[error("the recorded operation does not authorize command execution")]
+    WrongOperation,
     #[error("the service is stopping and is not starting new work")]
     Stopping,
     #[error("no run named {run}")]

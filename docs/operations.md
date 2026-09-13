@@ -3,8 +3,8 @@
 The initial supported setup is one administrative domain using Linux containers
 and POSIX-shell SSH targets. Start with the [disposable tutorial](quickstart.md).
 Review the [design preconditions](design.md#non-goals-and-preconditions) before attaching real
-hosts. Multiple independent tenants, multiple active replicas, OAuth login,
-and file-transfer integration are outside the initial supported setup.
+hosts. Multiple independent tenants, multiple active replicas, and OAuth login
+are outside the initial supported setup.
 
 ## Transport and output destinations
 
@@ -33,11 +33,18 @@ rotation, storage capacity, and retention. A successful flush is not a disk
 synchronization or collector acknowledgement. `RUST_LOG` affects diagnostics
 only. Keep destinations separate when redirecting process file descriptors too.
 
-Stdio does not open an HTTP listener unless an operator surface or evaluator
-is configured. Optional human review uses the same separately authenticated
+Stdio does not open an HTTP listener unless an operator surface, evaluator,
+or HTTP file origin is configured. Optional human review uses the same separately authenticated
 HTTP operator surface; configure its reachable dashboard URL and TLS proxy
 when remote access is needed. `--healthcheck` is for deployments with an HTTP
 listener, not a stdio-only process.
+
+## File transfer
+
+Configure `MCP_SSH_FILE_ORIGIN` for the HTTP byte channel, or
+`MCP_SSH_FILE_ROOT` for local stdio file references. See
+[file transfers](file-transfers.md) for tool arguments, gateway integration,
+storage bounds, and interrupted-write recovery.
 
 ## Choose authentication explicitly
 

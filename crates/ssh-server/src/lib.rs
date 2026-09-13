@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod dashboard;
 pub mod evaluation;
 pub mod ingress;
+mod local_files;
 pub mod mcp;
 pub mod notify;
 pub mod process;
@@ -36,6 +37,7 @@ use crate::mcp::SshMcp;
 use crate::settings::{Authentication, EvaluatorSettings, Settings};
 
 pub struct OptionalSurfaces {
+    pub transfers: Option<Arc<crate::transfer::Transfers>>,
     pub evaluator: Option<EvaluatorSettings>,
     pub audit_reader: Arc<dyn crate::audit_history::ReadsAudit>,
 }
@@ -102,7 +104,8 @@ where
     C: ssh_core::clock::Clock + 'static,
     S: ssh_core::connect::CredentialSource + 'static,
 {
-    let handler = SshMcp::new(Arc::clone(&bastion), notifier, dashboard);
+    let handler = SshMcp::new(Arc::clone(&bastion), notifier, dashboard)
+        .with_transfers(optional.transfers.clone());
     let mcp = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -139,6 +142,11 @@ where
     Router::new()
         .route(HEALTH_PATH, get(health))
         .merge(mcp_routes)
+        .merge(
+            optional
+                .transfers
+                .map_or_else(Router::new, crate::transfer::routes),
+        )
         // Separate operator authentication keeps MCP access from conferring
         // permission to approve a held command.
         .merge(proxy.into().map_or_else(Router::new, |proxy| {
@@ -254,9 +262,33 @@ pub async fn serve(
         ),
         None => Arc::new(crate::audit_history::Unavailable),
     };
+    let transfers = settings
+        .file_origin
+        .as_ref()
+        .map(|origin| {
+            Ok::<_, anyhow::Error>(Arc::new(
+                crate::transfer::Transfers::new(
+                    Arc::new(SystemClock::new().context("reading the boot clock")?),
+                    origin.as_str(),
+                )
+                .context("configuring file transfer")?,
+            ))
+        })
+        .transpose()?;
+    let transfers = match settings.file_root.as_ref() {
+        Some(root) => Some(Arc::new(
+            crate::transfer::Transfers::local(
+                Arc::new(SystemClock::new().context("reading the boot clock")?),
+                root,
+            )
+            .context("configuring local file references")?,
+        )),
+        None => transfers,
+    };
     let needs_http = settings.process.transport == Transport::Http
         || proxy.is_some()
-        || settings.evaluator.is_some();
+        || settings.evaluator.is_some()
+        || transfers.as_ref().is_some_and(|store| !store.is_local());
     let listener = if needs_http {
         Some(tokio::net::TcpListener::bind(config.listen).await?)
     } else {
@@ -270,7 +302,8 @@ pub async fn serve(
             Arc::clone(&notifier),
             settings.dashboard.clone(),
         )
-        .with_launch_principal(principal);
+        .with_launch_principal(principal)
+        .with_transfers(transfers.clone());
         let mut draining = draining.clone();
         serving.spawn(async move {
             let running = tokio::select! {
@@ -298,6 +331,7 @@ pub async fn serve(
             notifier,
             settings.dashboard,
             OptionalSurfaces {
+                transfers: transfers.clone(),
                 evaluator: settings.evaluator,
                 audit_reader,
             },
@@ -316,10 +350,14 @@ pub async fn serve(
     tracing::info!(transport = ?settings.process.transport, "serving");
     let housekeeping = tokio::spawn({
         let bastion = Arc::clone(&bastion);
+        let transfers = transfers.clone();
         async move {
             loop {
                 tokio::time::sleep(RECLAIM_EVERY).await;
                 bastion.reclaim().await;
+                if let Some(transfers) = &transfers {
+                    transfers.sweep();
+                }
             }
         }
     });
@@ -581,6 +619,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
             },
@@ -604,6 +643,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
             },
@@ -834,6 +874,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
             },
