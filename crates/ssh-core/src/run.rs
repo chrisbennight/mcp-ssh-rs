@@ -168,6 +168,11 @@ pub enum RunState {
     /// changed the target — the worse of the two, which is why silence is not
     /// quietly folded into either.
     Indeterminate,
+    /// The transfer failed; a remote write may already have changed its target.
+    TransferFailed {
+        cause: crate::transfer::Failure,
+        remote_write_may_be_partial: bool,
+    },
 }
 
 impl RunState {
@@ -184,6 +189,7 @@ impl RunState {
             Self::Exited { .. } | Self::Ended => "ran",
             Self::Refused => "did not run",
             Self::Indeterminate => "may or may not have run",
+            Self::TransferFailed { .. } => "failed to transfer",
         }
     }
 }
@@ -513,7 +519,7 @@ impl Runs {
         payload: crate::transfer::Payload,
     ) -> Result<Outcome, RunError> {
         use crate::action::Operation;
-        use crate::transfer::Payload;
+        use crate::transfer::{Failure, Payload};
         if recorded.host() != connection.host() || recorded.role() != connection.role() {
             return Err(RunError::WrongTarget {
                 recorded: recorded.sequence(),
@@ -529,6 +535,7 @@ impl Runs {
             _ => return Err(RunError::WrongOperation),
         }
         let operation = recorded.action().operation().clone();
+        let is_upload = matches!(operation, Operation::Upload { .. });
         let id = self.mint();
         let live = Arc::new(Live {
             record: Mutex::new(Record {
@@ -567,8 +574,9 @@ impl Runs {
                     (Operation::Download { path }, Payload::Download(sink)) => {
                         let bytes = crate::files::download(&connection, &path)
                             .await
-                            .map_err(|_| ())?;
-                        sink.publish(bytes).map_err(|_| ())
+                            .map_err(Failure::from)?;
+                        sink.publish(bytes)
+                            .map_err(|_| Failure::PublicationUnavailable)
                     }
                     (
                         Operation::Upload {
@@ -580,10 +588,10 @@ impl Runs {
                     ) => {
                         crate::files::upload(&connection, &path, input.bytes(), overwrite)
                             .await
-                            .map_err(|_| ())?;
+                            .map_err(Failure::from)?;
                         Ok(input.identity().clone())
                     }
-                    _ => Err(()),
+                    _ => unreachable!("transfer payload was validated before registration"),
                 }
             };
             let result = tokio::time::timeout(Duration::from_secs(120), work).await;
@@ -597,9 +605,22 @@ impl Runs {
                         record.file = Some(file);
                         record.state = RunState::Exited { code: 0 };
                     }
-                    _ => {
-                        record.state = RunState::Indeterminate;
-                        record.stderr.push(b"Transfer did not complete successfully. A remote write may be partial; do not automatically retry.");
+                    failure => {
+                        let cause = match failure {
+                            Ok(Err(cause)) => cause,
+                            Err(_) => Failure::TimedOut,
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        record.state = RunState::TransferFailed {
+                            cause,
+                            remote_write_may_be_partial: is_upload,
+                        };
+                        record.stderr.push(cause.message().as_bytes());
+                        if is_upload {
+                            record.stderr.push(
+                                b" A remote write may be partial; do not automatically retry.",
+                            );
+                        }
                     }
                 }
             }

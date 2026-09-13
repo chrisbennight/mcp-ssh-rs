@@ -430,6 +430,12 @@ fn said(source: &russh_sftp::client::error::Error, code: StatusCode) -> bool {
 /// are carried because "permission denied" and "no such file" are different
 /// facts an operator needs. Nothing here reads the file to say more.
 fn failed(path: &RemotePath, source: &russh_sftp::client::error::Error) -> FileError {
+    if said(source, StatusCode::NoSuchFile) {
+        return FileError::NotFound;
+    }
+    if said(source, StatusCode::PermissionDenied) {
+        return FileError::PermissionDenied;
+    }
     FileError::Failed {
         path: path.as_str().to_owned(),
         detail: source.to_string(),
@@ -438,6 +444,10 @@ fn failed(path: &RemotePath, source: &russh_sftp::client::error::Error) -> FileE
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileError {
+    #[error("the remote file or directory was not found")]
+    NotFound,
+    #[error("the remote account was denied file access")]
+    PermissionDenied,
     #[error("SFTP is unavailable: {detail}")]
     Unavailable { detail: String },
     #[error("{path} could not be operated on: {detail}")]
@@ -777,6 +787,90 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn transfer_failures_preserve_remote_and_publication_causes() {
+        use crate::audit::Ledger;
+        use crate::clock::TestClock;
+        use crate::policy::{Engine, ReviewMode};
+        use crate::run::{Limits, RunState, Runs};
+        use crate::session::{Lifetime, Purpose, SessionStore};
+        use crate::transfer::{DownloadSink, Failure, Payload};
+
+        struct Unavailable;
+        impl DownloadSink for Unavailable {
+            fn publish(&self, _: Vec<u8>) -> Result<crate::action::FileIdentity, String> {
+                Err("private storage detail must not escape".to_owned())
+            }
+        }
+        let root = scratch();
+        std::fs::write(root.join("present"), b"bytes").unwrap();
+        let large = std::fs::File::create(root.join("large")).unwrap();
+        large.set_len(MAX_TRANSFER_BYTES as u64 + 1).unwrap();
+        let connection = Arc::new(served(&root).await);
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 10000,
+                max: 60000,
+                grace: 5000,
+            },
+            1,
+        )
+        .open(
+            crate::PrincipalId::parse("alice").unwrap(),
+            HostId::parse("testhost").unwrap(),
+            RoleId::parse("readonly").unwrap(),
+            Purpose::parse("verify file failures").unwrap(),
+            crate::AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        let runs = Runs::new(Limits::default());
+        for (remote, cause) in [
+            ("/missing", Failure::NotFound),
+            ("/large", Failure::TooLarge),
+            ("/present", Failure::PublicationUnavailable),
+        ] {
+            let action = crate::action::Action::download(path(remote)).unwrap();
+            let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
+            let receipt = ledger
+                .record_intent(
+                    decision,
+                    crate::command::CommandIntent::parse("verify file failures").unwrap(),
+                )
+                .unwrap()
+                .into_parts()
+                .1
+                .unwrap();
+            let mut outcome = runs
+                .transfer(
+                    connection.clone(),
+                    receipt,
+                    Payload::Download(Arc::new(Unavailable)),
+                )
+                .await
+                .unwrap();
+            if outcome.still_running() {
+                outcome = runs
+                    .wait(outcome.run(), Duration::from_secs(10))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                outcome.state(),
+                RunState::TransferFailed {
+                    cause,
+                    remote_write_may_be_partial: false
+                }
+            );
+            assert!(outcome.file().is_none());
+            assert!(!outcome.stderr().text.contains("private storage"));
+            let later = runs.wait(outcome.run(), Duration::ZERO).await.unwrap();
+            assert_eq!(later.state(), outcome.state());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
