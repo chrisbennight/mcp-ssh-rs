@@ -79,13 +79,8 @@ pub struct Settings {
     /// held answers name no page: a link that goes nowhere looks like the way
     /// to answer, and is not.
     pub dashboard: Option<Url>,
-    /// Where a deployment's replacement policy is read from, if it wrote one.
-    ///
-    /// Absent means the shipped policy. Present, the file's text replaces the
-    /// replaceable policy wholesale - the ceiling rules are prepended to it
-    /// either way, so a replacement narrows or widens what is allowed within
-    /// them and can never delete them.
-    pub policy: Option<PathBuf>,
+    /// Optional local human review, independent of upstream account authorization.
+    pub review: ssh_core::policy::ReviewMode,
     /// The Host authorities the gateway reaches the MCP surface by, added to
     /// the transport's loopback-only default so a request naming one is not
     /// turned away as a rebinding attempt.
@@ -112,7 +107,7 @@ impl std::fmt::Debug for Settings {
             .field("notify_configured", &self.notify.is_some())
             .field("dashboard", &self.dashboard)
             .field("trusted_hosts", &self.trusted_hosts)
-            .field("policy", &self.policy)
+            .field("review", &self.review)
             .finish()
     }
 }
@@ -137,7 +132,7 @@ impl Settings {
     pub const JWKS_VAR: &'static str = "MCP_SSH_IDENTITY_JWKS_URL";
     pub const ISSUER_VAR: &'static str = "MCP_SSH_IDENTITY_ISSUER";
     pub const TRUSTED_HOSTS_VAR: &'static str = "MCP_SSH_TRUSTED_HOSTS";
-    pub const POLICY_VAR: &'static str = "MCP_SSH_POLICY_PATH";
+    pub const REVIEW_VAR: &'static str = "MCP_SSH_REVIEW";
 
     pub fn from_env() -> Result<Self, SettingsError> {
         Self::from_lookup(std::env::var)
@@ -381,7 +376,13 @@ impl Settings {
             notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
             dashboard: optional_url(&lookup, Self::DASHBOARD_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
-            policy: optional(&lookup, Self::POLICY_VAR)?.map(PathBuf::from),
+            review: optional(&lookup, Self::REVIEW_VAR)?
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|_| SettingsError::Unusable {
+                    var: Self::REVIEW_VAR,
+                })?
+                .unwrap_or_default(),
         })
     }
 }
@@ -999,20 +1000,22 @@ mod tests {
         );
     }
 
-    /// A deployment's policy is a path, and optional: absent means the
-    /// shipped policy, and a present value is carried as-is for startup to
-    /// read - the ceiling rules apply either way.
     #[test]
-    fn the_policy_path_is_optional() {
+    fn local_review_is_explicit_and_invalid_modes_are_rejected() {
         let vars = complete();
-        assert!(Settings::from_lookup(read(&vars)).unwrap().policy.is_none());
+        assert_eq!(
+            Settings::from_lookup(read(&vars)).unwrap().review,
+            ssh_core::policy::ReviewMode::Disabled
+        );
 
         let mut vars = complete();
-        vars.insert(Settings::POLICY_VAR, "/etc/mcp-ssh/policy.cedar".to_owned());
+        vars.insert(Settings::REVIEW_VAR, "privileged".to_owned());
         assert_eq!(
-            Settings::from_lookup(read(&vars)).unwrap().policy,
-            Some(PathBuf::from("/etc/mcp-ssh/policy.cedar"))
+            Settings::from_lookup(read(&vars)).unwrap().review,
+            ssh_core::policy::ReviewMode::Privileged
         );
+        vars.insert(Settings::REVIEW_VAR, "read".to_owned());
+        assert!(Settings::from_lookup(read(&vars)).is_err());
     }
 
     /// The bounds are a deliberate set rather than defaults nobody chose, so

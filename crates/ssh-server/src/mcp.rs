@@ -41,7 +41,7 @@ Commands are argument vectors, not shell lines. Each execution must include \
 your bounded intent for that command; it is shown and recorded as \
 agent-supplied evidence, not trusted user intent. A command may run, may be \
 refused, or may need a human to approve it; a refusal is an answer and \
-retrying it unchanged will not help. Ask for the smallest scope the work \
+retrying it unchanged will not help. Ask for the smallest access_class the work \
 needs \u{2014} a larger one does not make approval more likely.";
 
 /// The principal established by HTTP authentication.

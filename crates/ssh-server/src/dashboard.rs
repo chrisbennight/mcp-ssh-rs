@@ -29,10 +29,8 @@ use axum::routing::get;
 use axum::{Form, Router};
 use base64::Engine as _;
 use serde::Deserialize;
-use ssh_core::Scope;
-use ssh_core::approval::{
-    AgreementId, Approver, Asked, MatchingWork, StandingApproval, StandingCoverage,
-};
+use ssh_core::AccessClass;
+use ssh_core::approval::{AgreementId, Approver, Asked, StandingApproval, StandingCoverage};
 use ssh_core::clock::Clock;
 use ssh_core::connect::CredentialSource;
 use ssh_core::mediate::{Bastion, MediationError};
@@ -220,7 +218,7 @@ fn refused() -> Response {
 /// One waiting request, as the page shows it.
 ///
 /// A view rather than the core type: the template then holds no opinion about
-/// how a principal or a scope is spelled, and escaping applies to plain strings
+/// how a principal or an account class is spelled, and escaping applies to plain strings
 /// whatever those types become.
 pub struct Pending {
     pub id: String,
@@ -229,11 +227,9 @@ pub struct Pending {
     pub host: String,
     pub role: String,
     pub purpose: String,
-    pub scope: String,
-    pub assessment: String,
+    pub access_class: String,
     /// The calling agent's explanation, visibly untrusted on the page.
     pub agent_intent: String,
-    pub matching: Option<MatchingShown>,
     /// Why the command waits, in the decision's words. Passed through
     /// `visible` like every agent-adjacent string: the text embeds the
     /// program name the agent chose.
@@ -250,29 +246,10 @@ impl From<Asked> for Pending {
             host: asked.host.as_str().to_owned(),
             role: asked.role.as_str().to_owned(),
             purpose: visible(asked.purpose.as_str()),
-            scope: scope_name(asked.scope).to_owned(),
-            assessment: scope_name(asked.assessment).to_owned(),
+            access_class: access_class_name(asked.access_class).to_owned(),
             agent_intent: visible(asked.agent_intent.as_str()),
-            matching: asked.matching.map(MatchingShown::from),
             why: visible(&asked.why),
             command: asked.command.iter().map(|arg| visible(arg)).collect(),
-        }
-    }
-}
-
-/// The exact v1 matcher an operator is considering.
-pub struct MatchingShown {
-    pub family: String,
-    pub max_assessment: String,
-    pub matcher_version: String,
-}
-
-impl From<MatchingWork> for MatchingShown {
-    fn from(work: MatchingWork) -> Self {
-        Self {
-            family: format!("{} {}", visible(work.program()), visible(work.subcommand())),
-            max_assessment: scope_name(work.max_assessment()).to_owned(),
-            matcher_version: work.matcher_version().to_owned(),
         }
     }
 }
@@ -307,11 +284,10 @@ pub(crate) fn visible(text: &str) -> String {
     shown
 }
 
-const fn scope_name(scope: Scope) -> &'static str {
-    match scope {
-        Scope::Read => "read",
-        Scope::Mutate => "mutate",
-        Scope::Privileged => "privileged",
+const fn access_class_name(access_class: AccessClass) -> &'static str {
+    match access_class {
+        AccessClass::ReadOnly => "read_only",
+        AccessClass::Privileged => "privileged",
     }
 }
 
@@ -344,16 +320,6 @@ impl StandingShown {
                 "Session-wide".to_owned(),
                 "Every held command in this session".to_owned(),
             ),
-            StandingCoverage::Matching { work } => (
-                "Matching work".to_owned(),
-                format!(
-                    "{} {} at or below {} · {}",
-                    visible(work.program()),
-                    visible(work.subcommand()),
-                    scope_name(work.max_assessment()),
-                    work.matcher_version()
-                ),
-            ),
         };
         Self {
             id: agreement.id.as_str().to_owned(),
@@ -376,7 +342,7 @@ pub struct Decision {
     decision: String,
     /// How long a standing agreement should answer for, in minutes;
     /// absent or `session` means as long as the session itself can last.
-    /// Read only for matching-work or session-wide approval.
+    /// Read only for session-wide approval.
     duration: Option<String>,
 }
 
@@ -386,7 +352,7 @@ pub struct SessionShown {
     pub host: String,
     pub role: String,
     pub purpose: String,
-    pub scope: String,
+    pub access_class: String,
     pub status: String,
     pub opened_at: String,
     pub last_used: String,
@@ -436,7 +402,7 @@ pub struct EvaluationShown {
     pub rationale: String,
     pub side_effects: Vec<String>,
     pub decision_digest: String,
-    pub assessment: String,
+    pub access_class: String,
     pub principal: String,
     pub session: String,
     pub command: Vec<String>,
@@ -456,7 +422,7 @@ pub struct JourneyEvaluationShown {
 pub struct JourneyShown {
     pub decision: u64,
     pub decision_digest: String,
-    pub assessment: String,
+    pub access_class: String,
     pub verdict: String,
     pub command: Vec<String>,
     pub agent_intent: String,
@@ -475,7 +441,7 @@ struct AuditQuery {
     session: Option<String>,
     host: Option<String>,
     event: Option<String>,
-    assessment: Option<String>,
+    access_class: Option<String>,
     verdict: Option<String>,
     window: Option<String>,
     q: Option<String>,
@@ -494,7 +460,7 @@ struct PageQuery {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvaluationQuery {
-    assessment: Option<String>,
+    access_class: Option<String>,
     verdict: Option<String>,
     window: Option<String>,
     before: Option<String>,
@@ -506,7 +472,7 @@ struct Filters {
     session: String,
     host: String,
     event: String,
-    assessment: String,
+    access_class: String,
     verdict: String,
     window: String,
     q: String,
@@ -609,14 +575,14 @@ fn wire_event_name(event: &serde_json::Value) -> &str {
 fn wire_summary(event: &serde_json::Value) -> String {
     match wire_event_name(event) {
         "session_opened" => format!(
-            "Opened for {} at {} scope",
+            "Opened for {} with account class {}",
             visible(wire_string(event, "purpose").unwrap_or("unavailable")),
-            wire_string(event, "scope").unwrap_or("unavailable")
+            wire_string(event, "access_class").unwrap_or("unavailable")
         ),
         "decided" => format!(
             "{} · {} · intent: {}",
             wire_string(event, "verdict").unwrap_or("unavailable"),
-            wire_string(event, "assessment").unwrap_or("unavailable"),
+            wire_string(event, "access_class").unwrap_or("unavailable"),
             visible(wire_string(event, "agent_intent").unwrap_or("unavailable"))
         ),
         "approved" => format!(
@@ -919,7 +885,7 @@ fn wire_journeys(
             JourneyShown {
                 decision: decision.sequence,
                 decision_digest: decision.digest.clone(),
-                assessment: wire_string(&decision.event, "assessment")
+                access_class: wire_string(&decision.event, "access_class")
                     .unwrap_or("unavailable")
                     .to_owned(),
                 verdict: verdict.replace('_', " "),
@@ -1008,7 +974,7 @@ fn next_audit_url(filters: &Filters, before: Option<u64>, start: u64) -> String 
         ("session", filters.session.as_str()),
         ("host", filters.host.as_str()),
         ("event", filters.event.as_str()),
-        ("assessment", filters.assessment.as_str()),
+        ("access_class", filters.access_class.as_str()),
         ("verdict", filters.verdict.as_str()),
         ("window", filters.window.as_str()),
         ("q", filters.q.as_str()),
@@ -1034,7 +1000,7 @@ fn next_evaluations_url(filters: &Filters, before: Option<u64>, start: u64) -> S
     };
     let mut encoded = url::form_urlencoded::Serializer::new(String::new());
     for (name, value) in [
-        ("assessment", filters.assessment.as_str()),
+        ("access_class", filters.access_class.as_str()),
         ("verdict", filters.verdict.as_str()),
         ("window", filters.window.as_str()),
     ] {
@@ -1132,7 +1098,7 @@ fn blank_filters() -> Filters {
         session: String::new(),
         host: String::new(),
         event: String::new(),
-        assessment: String::new(),
+        access_class: String::new(),
         verdict: String::new(),
         window: "30d".to_owned(),
         q: String::new(),
@@ -1252,7 +1218,7 @@ where
             host: snapshot.session.host.as_str().to_owned(),
             role: snapshot.session.role.as_str().to_owned(),
             purpose: visible(snapshot.session.purpose.as_str()),
-            scope: scope_name(snapshot.session.scope).to_owned(),
+            access_class: access_class_name(snapshot.session.access_class).to_owned(),
             status: match snapshot.status {
                 SessionStatus::Live => "live".to_owned(),
                 SessionStatus::Lapsed(Expiry::Idle) => "lapsed · idle".to_owned(),
@@ -1432,7 +1398,7 @@ where
     let Ok(event) = query_value(query.event, 32) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(assessment) = choice_value(query.assessment, &["read", "mutate", "privileged"]) else {
+    let Ok(access_class) = choice_value(query.access_class, &["read_only", "privileged"]) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Ok(verdict) = choice_value(
@@ -1462,7 +1428,7 @@ where
         session,
         host,
         event,
-        assessment,
+        access_class,
         verdict,
         window: window_label,
         q,
@@ -1475,7 +1441,7 @@ where
         session: filters.session.clone(),
         host: filters.host.clone(),
         event: filters.event.clone(),
-        assessment: filters.assessment.clone(),
+        access_class: filters.access_class.clone(),
         verdict: filters.verdict.clone(),
         text: filters.q.clone(),
     };
@@ -1529,7 +1495,7 @@ where
     let Ok((before, start)) = page_bounds(query.before, query.start) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(assessment) = choice_value(query.assessment, &["read", "mutate", "privileged"]) else {
+    let Ok(access_class) = choice_value(query.access_class, &["read_only", "privileged"]) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Ok(verdict) = choice_value(
@@ -1542,7 +1508,7 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     };
     let mut filters = blank_filters();
-    filters.assessment = assessment;
+    filters.access_class = access_class;
     filters.verdict = verdict;
     filters.window = window_label;
     let read = audit_reader
@@ -1551,7 +1517,7 @@ where
             start,
             window,
             event: "evaluated".to_owned(),
-            assessment: filters.assessment.clone(),
+            access_class: filters.access_class.clone(),
             verdict: filters.verdict.clone(),
             ..audit_history::Query::default()
         })
@@ -1618,8 +1584,8 @@ where
                             .map(visible)
                             .collect(),
                         decision_digest,
-                        assessment: visible(
-                            wire_string(&entry.event, "assessment").unwrap_or("unavailable"),
+                        access_class: visible(
+                            wire_string(&entry.event, "access_class").unwrap_or("unavailable"),
                         ),
                         principal: visible(&entry.principal),
                         session: visible(&entry.session),
@@ -1732,27 +1698,7 @@ where
     let agreed = match form.decision.as_str() {
         "approve" => true,
         "refuse" => false,
-        "approve-matching" => {
-            let Ok(for_millis) = standing_duration(form.duration.as_deref()) else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Html("<p>That is not a duration.</p>"),
-                )
-                    .into_response();
-            };
-            return match bastion.approve_matching_work(&id, operator.0.clone(), for_millis) {
-                Ok(agreement) => {
-                    tracing::info!(
-                        operator = operator.0,
-                        request = id.as_str(),
-                        agreement = agreement.as_str(),
-                        "a request was approved with a matching-work agreement"
-                    );
-                    Redirect::to(&format!("{DASHBOARD_PATH}/approvals")).into_response()
-                }
-                Err(why) => decision_failure(&id, &why),
-            };
-        }
+
         "approve-session" => {
             // The command in front of the operator is approved by them
             // directly; their standing agreement then answers for the rest of
@@ -1910,7 +1856,6 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use ssh_core::approval::{Approvals, Standing, Windows};
     use ssh_core::audit::Ledger;
-    use ssh_core::catalog::Catalog;
     use ssh_core::clock::TestClock;
     use ssh_core::command::Command;
     use ssh_core::policy::Engine;
@@ -1927,10 +1872,10 @@ mod tests {
     }
 
     fn asked_for(argv: &[&str], purpose: &str) -> Asked {
-        asked_at_scope(argv, purpose, Scope::Mutate)
+        asked_for_account(argv, purpose, AccessClass::Privileged)
     }
 
-    fn asked_at_scope(argv: &[&str], purpose: &str, scope: Scope) -> Asked {
+    fn asked_for_account(argv: &[&str], purpose: &str, access_class: AccessClass) -> Asked {
         let clock = Arc::new(TestClock::at(1_000));
         let sessions = SessionStore::new(
             Arc::clone(&clock),
@@ -1947,7 +1892,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("readonly").unwrap(),
                 Purpose::parse(purpose).unwrap(),
-                scope,
+                access_class,
             )
             .unwrap();
         let approvals = Approvals::new(
@@ -1959,10 +1904,8 @@ mod tests {
             4,
         );
         let command = Command::new(argv.iter().map(|a| (*a).to_owned()).collect()).unwrap();
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-            .unwrap();
+        let decision = Engine::new(ssh_core::policy::ReviewMode::Privileged)
+            .decide(&session, (command).clone());
         let held = Ledger::new(Arc::clone(&clock))
             .record_intent(
                 decision,
@@ -1986,20 +1929,18 @@ mod tests {
         .unwrap()
     }
 
-    /// An unidentified command's request must say what the catalog could not
-    /// read: "privileged" alone tells the approver nothing about why this
-    /// command, of all commands, needs their judgement.
+    /// The approval page explains the configured account review requirement.
     #[test]
-    fn the_page_says_why_an_unidentified_command_waits() {
-        let waiting = asked_at_scope(
+    fn the_page_says_why_the_account_requires_review() {
+        let waiting = asked_for_account(
             &["tar", "-cf", "/tmp/x", "/etc"],
             "archive a directory",
-            Scope::Privileged,
+            AccessClass::Privileged,
         );
         let rendered = page(vec![waiting]);
         assert!(
-            rendered.contains("does not know the program tar"),
-            "the page does not say what could not be read: {rendered}"
+            rendered.contains("This account requires human approval."),
+            "the page does not explain the review requirement: {rendered}"
         );
     }
 
@@ -2008,9 +1949,8 @@ mod tests {
     #[test]
     fn the_page_shows_what_a_decision_needs() {
         let waiting = asked(&["systemctl", "restart", "unbound"]);
-        // The assessment shown must be the one this request was actually held
-        // with, whatever the catalog assesses this command as today.
-        let assessment = scope_name(waiting.assessment).to_owned();
+        // Show the account class recorded with the request.
+        let access_class = access_class_name(waiting.access_class).to_owned();
         // The card carries the request's identifier, so the fragment link in
         // notes and in the agent's held answer lands the reader on it.
         let anchor = format!(r#"<article id="{}""#, waiting.id.as_str());
@@ -2026,7 +1966,7 @@ mod tests {
             "dns1",
             "readonly",
             "find out why resolution is failing",
-            assessment.as_str(),
+            access_class.as_str(),
             "systemctl",
             "restart",
             "unbound",
@@ -2055,7 +1995,7 @@ mod tests {
     /// whose whole purpose is deciding whether to trust that agent.
     #[test]
     fn an_argument_cannot_become_markup() {
-        // The hostile words ride a catalogued command as subcommand operands:
+        // The hostile words are command operands:
         // only a classified command can be held, and operands are the part an
         // agent writes freely.
         let rendered = page(vec![asked(&[
@@ -2142,10 +2082,7 @@ mod tests {
     fn the_page_offers_a_session_wide_approval() {
         let rendered = page(vec![asked(&["systemctl", "restart", "unbound"])]);
         assert!(rendered.contains(r#"value="approve-session""#));
-        assert!(rendered.contains(r#"value="approve-matching""#));
-        assert!(rendered.contains("systemctl restart"));
-        assert!(rendered.contains("catalog-family-v1"));
-        assert!(rendered.contains("does not infer a resource selector"));
+        assert!(!rendered.contains(r#"value="approve-matching""#));
         assert!(rendered.contains(r#"value="session" selected"#));
         for minutes in ["15", "30", "60"] {
             assert!(
@@ -2156,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatchable_commands_never_offer_a_matching_agreement() {
+    fn command_family_approval_is_not_offered() {
         let rendered = page(vec![asked(&["journalctl", "--rotate"])]);
         assert!(!rendered.contains(r#"value="approve-matching""#));
         assert!(!rendered.contains("Matching coverage:"));
@@ -2367,8 +2304,7 @@ mod tests {
         let bastion = Arc::new(Bastion::new(
             Arc::new(TestClock::at(1_000)),
             ssh_core::registry::Registry::from_json("{}").unwrap(),
-            ssh_core::catalog::Catalog::builtin().unwrap(),
-            ssh_core::policy::Engine::builtin().unwrap(),
+            ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             crate::settings::bounds(),
         ));
@@ -2421,8 +2357,7 @@ mod tests {
         let bastion = Arc::new(Bastion::new(
             Arc::new(TestClock::at(1_000)),
             ssh_core::registry::Registry::from_json("{}").unwrap(),
-            ssh_core::catalog::Catalog::builtin().unwrap(),
-            ssh_core::policy::Engine::builtin().unwrap(),
+            ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             crate::settings::bounds(),
         ));
@@ -2460,8 +2395,7 @@ mod tests {
         Arc::new(Bastion::new(
             Arc::new(TestClock::at(1_000)),
             ssh_core::registry::Registry::from_json(registry).unwrap(),
-            ssh_core::catalog::Catalog::builtin().unwrap(),
-            ssh_core::policy::Engine::builtin().unwrap(),
+            ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             crate::settings::bounds(),
         ))
@@ -2543,7 +2477,7 @@ mod tests {
                             "event": "decided",
                             "argv": ["systemctl", "status", "unbound"],
                             "agent_intent": "inspect dns health",
-                            "assessment": "read",
+                            "access_class": "read_only",
                             "verdict": "permit"
                         }),
                         previous: "b".repeat(64),
@@ -2576,7 +2510,7 @@ mod tests {
             .layer(axum::Extension(Operator("chris".to_owned())))
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/audit?window=7d&assessment=read&verdict=permit")
+                    .uri("/audit?window=7d&access_class=read_only&verdict=permit")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2590,7 +2524,7 @@ mod tests {
         assert!(body.contains("Durable fleet view."));
         assert!(body.contains("systemctl"));
         assert!(body.contains(r#"value="7d" selected"#));
-        assert!(body.contains(r#"value="read" selected"#));
+        assert!(body.contains(r#"value="read_only" selected"#));
         assert!(body.contains(r#"value="permit" selected"#));
         assert!(
             body.contains("/dashboard/sessions/session-1"),
@@ -2623,7 +2557,7 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(query.window, audit_history::Window::Week);
                 assert_eq!(query.event, "evaluated");
-                assert_eq!(query.assessment, "read");
+                assert_eq!(query.access_class, "read_only");
                 assert_eq!(query.verdict, "supports_intent");
                 Ok(audit_history::Page {
                     entries: vec![audit_history::Entry {
@@ -2651,7 +2585,7 @@ mod tests {
                             "argv": ["systemctl", "status", "unbound"],
                             "agent_intent": "inspect dns health",
                             "purpose": "diagnose dns",
-                            "assessment": "read"
+                            "access_class": "read_only"
                         }),
                         previous: "b".repeat(64),
                         digest: "a".repeat(64),
@@ -2683,7 +2617,7 @@ mod tests {
             .layer(axum::Extension(Operator("chris".to_owned())))
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/evaluations?window=7d&assessment=read&verdict=supports_intent")
+                    .uri("/evaluations?window=7d&access_class=read_only&verdict=supports_intent")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2695,14 +2629,14 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         for expected in [
-            r#"value="read" selected"#,
+            r#"value="read_only" selected"#,
             r#"value="supports_intent" selected"#,
-            "Decision assessment",
+            "Account class",
             "inspect dns health",
             "diagnose dns",
             "systemctl",
             "Reads service metadata",
-            "assessment=read",
+            "access_class=read_only",
             "verdict=supports_intent",
         ] {
             assert!(
@@ -2762,7 +2696,7 @@ mod tests {
                                 "argv": ["uname", "-a"],
                                 "agent_intent": "inspect kernel",
                                 "purpose": "diagnose dns",
-                                "assessment": "read",
+                                "access_class": "read_only",
                                 "verdict": "permit"
                             }),
                             "8".repeat(64),
@@ -2806,9 +2740,8 @@ mod tests {
                                 "approver": "chris",
                                 "override_of": null,
                                 "standing": true,
-                                "mode": "matching",
-                                "agreement": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                                "matcher_version": "matching-v1"
+                                "mode": "session",
+                                "agreement": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                             }),
                             "b".repeat(64),
                         ),
@@ -2821,9 +2754,8 @@ mod tests {
                                 "approver": "chris",
                                 "override_of": null,
                                 "standing": true,
-                                "mode": "matching",
+                                "mode": "session",
                                 "agreement": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                                "matcher_version": "matching-v1",
                                 "agreed": true
                             }),
                             "a".repeat(64),
@@ -2835,7 +2767,7 @@ mod tests {
                                 "argv": ["systemctl", "status", "unbound"],
                                 "agent_intent": "inspect dns health",
                                 "purpose": "diagnose dns",
-                                "assessment": "read",
+                                "access_class": "read_only",
                                 "verdict": "needs_approval"
                             }),
                             "d".repeat(64),
@@ -2939,7 +2871,7 @@ mod tests {
             "Decision #20",
             "Policy decision entry #20",
             "automatic",
-            "chris accepted via matching standing agreement",
+            "chris accepted via session standing agreement",
             "Approval entry #12",
             "Run abcdef0123456789-abcdef0123456789abcdef0123456789 · exit 0",
             "The read-only command supports the stated diagnosis.",
@@ -3089,10 +3021,10 @@ mod tests {
         for path in [
             format!("/audit?q={too_long}"),
             "/audit?window=90d".to_owned(),
-            "/audit?assessment=unknown".to_owned(),
+            "/audit?access_class=unknown".to_owned(),
             "/audit?verdict=allow".to_owned(),
             "/evaluations?verdict=permit".to_owned(),
-            "/evaluations?assessment=unknown".to_owned(),
+            "/evaluations?access_class=unknown".to_owned(),
             "/audit?before=20".to_owned(),
             "/audit?start=10".to_owned(),
             "/audit?before=20&start=21".to_owned(),

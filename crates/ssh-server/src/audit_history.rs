@@ -60,7 +60,7 @@ pub struct Query {
     pub session: String,
     pub host: String,
     pub event: String,
-    pub assessment: String,
+    pub access_class: String,
     pub verdict: String,
     pub text: String,
 }
@@ -462,9 +462,9 @@ fn validate_event(event: &Value) -> Result<(), ()> {
     let object = event.as_object().ok_or(())?;
     match required_string(object, "event")? {
         "session_opened" => {
-            exact_keys(object, &["event", "purpose", "scope"])?;
+            exact_keys(object, &["event", "purpose", "access_class"])?;
             Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
-            scope(required_string(object, "scope")?)
+            access_class(required_string(object, "access_class")?)
         }
         "decided" => {
             exact_keys(
@@ -474,13 +474,8 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     "agent_intent",
                     "argv",
                     "program",
-                    "subcommand",
-                    "assessment",
-                    "interpreter",
-                    "grounds",
-                    "catalog_version",
+                    "access_class",
                     "purpose",
-                    "ceiling",
                     "verdict",
                     "policies",
                 ],
@@ -490,13 +485,8 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             if required_string(object, "program")? != command.program() {
                 return Err(());
             }
-            optional_non_blank_string(object, "subcommand")?;
-            scope(required_string(object, "assessment")?)?;
-            required_bool(object, "interpreter")?;
-            validate_grounds(value_array(object, "grounds")?)?;
-            non_blank_string(required_string(object, "catalog_version")?)?;
+            access_class(required_string(object, "access_class")?)?;
             Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
-            scope(required_string(object, "ceiling")?)?;
             one_of(
                 required_string(object, "verdict")?,
                 &["permit", "needs_approval", "deny"],
@@ -518,7 +508,6 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     "standing",
                     "mode",
                     "agreement",
-                    "matcher_version",
                 ],
             )?;
             validate_answer_fields(object)
@@ -535,7 +524,6 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     "standing",
                     "mode",
                     "agreement",
-                    "matcher_version",
                     "agreed",
                 ],
             )?;
@@ -566,14 +554,14 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                         "argv",
                         "agent_intent",
                         "purpose",
-                        "assessment",
+                        "access_class",
                     ],
                 )?;
                 required_u64(object, "decided")?;
                 Command::new(string_array(object, "argv")?).map_err(|_| ())?;
                 CommandIntent::parse(required_string(object, "agent_intent")?).map_err(|_| ())?;
                 Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
-                scope(required_string(object, "assessment")?)?;
+                access_class(required_string(object, "access_class")?)?;
             } else {
                 // Evaluation entries written before context denormalization
                 // remain readable, but their missing fields render explicitly
@@ -600,60 +588,6 @@ fn validate_event(event: &Value) -> Result<(), ()> {
     }
 }
 
-fn validate_grounds(grounds: &[Value]) -> Result<(), ()> {
-    for ground in grounds {
-        let object = ground.as_object().ok_or(())?;
-        match required_string(object, "ground")? {
-            "program" => {
-                exact_keys(object, &["ground", "program", "scope"])?;
-                non_blank_string(required_string(object, "program")?)?;
-                scope(required_string(object, "scope")?)?;
-            }
-            "subcommand" => {
-                exact_keys(object, &["ground", "subcommand", "scope"])?;
-                non_blank_string(required_string(object, "subcommand")?)?;
-                scope(required_string(object, "scope")?)?;
-            }
-            "option" => {
-                exact_keys(object, &["ground", "option", "scope"])?;
-                non_blank_string(required_string(object, "option")?)?;
-                scope(required_string(object, "scope")?)?;
-            }
-            "interpreter" => {
-                exact_keys(object, &["ground", "program"])?;
-                non_blank_string(required_string(object, "program")?)?;
-            }
-            "unidentified" => {
-                exact_keys(object, &["ground", "reason"])?;
-                validate_unidentified(object.get("reason").ok_or(())?)?;
-            }
-            _ => return Err(()),
-        }
-    }
-    Ok(())
-}
-
-fn validate_unidentified(reason: &Value) -> Result<(), ()> {
-    let object = reason.as_object().ok_or(())?;
-    match required_string(object, "unidentified")? {
-        "unknown_program" | "missing_subcommand" => {
-            exact_keys(object, &["unidentified", "program"])?;
-            non_blank_string(required_string(object, "program")?)
-        }
-        "unknown_subcommand" => {
-            exact_keys(object, &["unidentified", "program", "subcommand"])?;
-            non_blank_string(required_string(object, "program")?)?;
-            non_blank_string(required_string(object, "subcommand")?)
-        }
-        "unknown_option" => {
-            exact_keys(object, &["unidentified", "program", "option"])?;
-            non_blank_string(required_string(object, "program")?)?;
-            non_blank_string(required_string(object, "option")?)
-        }
-        _ => Err(()),
-    }
-}
-
 fn validate_answer_fields(object: &serde_json::Map<String, Value>) -> Result<(), ()> {
     required_u64(object, "decided")?;
     lower_hex_id(required_string(object, "request")?)?;
@@ -662,12 +596,12 @@ fn validate_answer_fields(object: &serde_json::Map<String, Value>) -> Result<(),
     required_bool(object, "standing")?;
     one_of(
         required_string(object, "mode")?,
-        &["direct", "override", "matching", "session"],
+        &["direct", "override", "session"],
     )?;
     if let Some(agreement) = optional_string(object, "agreement")? {
         lower_hex_id(agreement)?;
     }
-    optional_non_blank_string(object, "matcher_version")
+    Ok(())
 }
 
 fn validate_recorded(value: &Value) -> Result<(), ()> {
@@ -755,8 +689,8 @@ fn optional_non_blank_string(
     }
 }
 
-fn scope(value: &str) -> Result<(), ()> {
-    one_of(value, &["read", "mutate", "privileged"])
+fn access_class(value: &str) -> Result<(), ()> {
+    one_of(value, &["read_only", "privileged"])
 }
 
 fn one_of(value: &str, choices: &[&str]) -> Result<(), ()> {
@@ -837,7 +771,7 @@ fn logql(query: &Query) -> String {
         expression.push_str(&logql_string(&json_fragment("event", &query.event)));
     }
     for (field, value) in [
-        ("assessment", query.assessment.as_str()),
+        ("access_class", query.access_class.as_str()),
         ("verdict", query.verdict.as_str()),
     ] {
         if !value.is_empty() {
@@ -1036,7 +970,7 @@ mod tests {
                     assert_eq!(end - start, 7 * 24 * 60 * 60 * 1_000_000_000);
                     assert!(params.get("query").is_some_and(|query| {
                         query.contains("\\\"session\\\":\\\"0123456789abcdef0123456789abcdef\\\"")
-                            && query.contains("\\\"assessment\\\":\\\"read\\\"")
+                            && query.contains("\\\"access_class\\\":\\\"read_only\\\"")
                             && query.contains("\\\"verdict\\\":\\\"permit\\\"")
                     }));
                     let mut values = Vec::new();
@@ -1056,7 +990,7 @@ mod tests {
         let page = reader
             .read(&Query {
                 session: "0123456789abcdef0123456789abcdef".to_owned(),
-                assessment: "read".to_owned(),
+                access_class: "read_only".to_owned(),
                 verdict: "permit".to_owned(),
                 window: Window::Week,
                 ..Query::default()
@@ -1113,13 +1047,8 @@ mod tests {
                                         "agent_intent": "inspect dns health",
                                         "argv": ["systemctl", "status", "unbound"],
                                         "program": "systemctl",
-                                        "subcommand": "status",
-                                        "assessment": "read",
-                                        "interpreter": false,
-                                        "grounds": [],
-                                        "catalog_version": "test-v1",
+                                        "access_class": "read_only",
                                         "purpose": "diagnose dns",
-                                        "ceiling": "read",
                                         "verdict": "needs_approval",
                                         "policies": ["default"]
                                     }),
@@ -1142,8 +1071,7 @@ mod tests {
                                         "override_of": null,
                                         "standing": false,
                                         "mode": "direct",
-                                        "agreement": null,
-                                        "matcher_version": null
+                                        "agreement": null
                                     }),
                                     'b',
                                 ),
@@ -1365,7 +1293,7 @@ mod tests {
             "argv": ["systemctl", "status", "unbound"],
             "agent_intent": "inspect dns health",
             "purpose": "diagnose dns",
-            "assessment": "read"
+            "access_class": "read_only"
         });
         assert!(validate_entry(&entry).is_ok());
 
@@ -1383,16 +1311,8 @@ mod tests {
             "agent_intent": "inspect the target",
             "argv": argv,
             "program": "tool",
-            "subcommand": null,
-            "assessment": "privileged",
-            "interpreter": false,
-            "grounds": [{
-                "ground": "unidentified",
-                "reason": {"unidentified": "unknown_program", "program": "tool"}
-            }],
-            "catalog_version": "test-v1",
+            "access_class": "privileged",
             "purpose": "inspect the target",
-            "ceiling": "privileged",
             "verdict": "needs_approval",
             "policies": ["unknown-command"]
         });

@@ -5,7 +5,7 @@ Instructions for coding agents working in `mcp-ssh-rs`.
 ## Purpose
 
 An MCP service that lets AI agents run commands on configured hosts over SSH,
-under policy and with a human in the loop for anything consequential. What it
+with configured accounts and optional human review. What it
 guarantees, and what it deliberately does not, is defined in the design rather
 than summarized here.
 
@@ -42,7 +42,7 @@ See [Contributing](CONTRIBUTING.md) for the development and CI workflow.
 ## Security constraints
 
 The invariants this service exists to uphold are stated once, in
-`docs/design.md` under "Trust boundaries and invariants". Read them there.
+`docs/design.md`. Read them there.
 Treat a change that weakens one as a defect regardless of what else it
 improves.
 

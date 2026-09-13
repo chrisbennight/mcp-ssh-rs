@@ -22,7 +22,6 @@ use axum::routing::get;
 use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use ssh_core::catalog::Catalog;
 use ssh_core::clock::SystemClock;
 use ssh_core::config::Config;
 use ssh_core::mediate::Bastion;
@@ -195,21 +194,11 @@ pub async fn serve(config: &Config) -> anyhow::Result<()> {
         );
     }
 
-    // A deployment's policy replaces the shipped text, never the ceiling
-    // rules: the engine prepends those to whatever is loaded here.
-    let engine = match &settings.policy {
-        Some(path) => {
-            let source = std::fs::read_to_string(path)
-                .with_context(|| format!("reading the policy at {}", path.display()))?;
-            Engine::from_source(&source).context("loading the deployment's policy")?
-        }
-        None => Engine::builtin().context("loading the policy")?,
-    };
+    let engine = Engine::new(settings.review);
 
     let bastion = Arc::new(Bastion::recording_to(
         Arc::new(SystemClock::new().context("reading the boot clock")?),
         registry,
-        Catalog::builtin().context("loading the command catalog")?,
         engine,
         credentials,
         settings::bounds(),
@@ -540,8 +529,7 @@ mod tests {
         let bastion = Arc::new(Bastion::new(
             Arc::new(ssh_core::clock::TestClock::at(1_000)),
             Registry::from_json("{}").unwrap(),
-            Catalog::builtin().unwrap(),
-            Engine::builtin().unwrap(),
+            Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             settings::bounds(),
         ));
@@ -764,8 +752,7 @@ mod tests {
         let bastion = Arc::new(Bastion::new(
             Arc::new(ssh_core::clock::TestClock::at(1_000)),
             Registry::from_json("{}").unwrap(),
-            Catalog::builtin().unwrap(),
-            Engine::builtin().unwrap(),
+            Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             settings::bounds(),
         ));

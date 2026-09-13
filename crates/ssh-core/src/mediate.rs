@@ -1,35 +1,5 @@
-//! The mediated path: the order the pieces run in, and why that order.
-//!
-//! Every other module here answers one question. This is the only place that
-//! puts them in sequence, and the sequence is the product:
-//!
-//! 1. **The session is claimed by its principal.** Before anything else, so a
-//!    caller cannot cause classification, a policy evaluation, or a record
-//!    entry against somebody else's session.
-//! 2. **The command is classified.** Facts about what it is, taken from the
-//!    command itself and never from the caller's account of it.
-//! 3. **Policy decides.** The one component that decides, from those facts and
-//!    the session.
-//! 4. **The decision is recorded**, before anything runs.
-//! 5. **Only then does it run**, and only if the decision permitted it.
-//!
-//! Steps 4 and 5 are in that order because an execution nobody can account for
-//! is worse than one that did not happen, and the ordering is enforced by the
-//! types: running requires a receipt, and a receipt comes only from a
-//! successful record.
-//!
-//! A refusal and work awaiting a human are both ordinary answers here, not
-//! errors: a refusal means policy reached a decision, and collapsing it into an
-//! error would make "policy said no" indistinguishable from "the policy engine
-//! broke".
-//!
-//! An error does **not** mean no decision was reached, and treating it that way
-//! would make retrying look safe when it is not. Policy may have decided and
-//! the intent been recorded before the target refused the connection, the
-//! bound was reached, or the record rejected the completion — and the command
-//! may already have run. What an error says is that this call could not carry
-//! the request through to an answer; the record is where to see how far it
-//! got, and a caller resubmitting is asking for the work to happen again.
+//! Audited SSH execution bound to a caller and configured account.
+//! Effects require a recorded decision and, when configured, a valid human approval.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +13,6 @@ use crate::audit::{
     Accounted, AuditError, Authorization, Broken, Entry, EvaluationArtifact, Ledger, Receipt,
     Records, Verified,
 };
-use crate::catalog::Catalog;
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandError, CommandIntent};
 use crate::connect::{ConnectError, Connection, Connector, CredentialSource};
@@ -54,7 +23,7 @@ use crate::session::{
     Lifetime, Purpose, Session, SessionError, SessionId, SessionSnapshot, SessionStore,
     TooManySessions,
 };
-use crate::{HostId, PrincipalId, RoleId, Scope};
+use crate::{AccessClass, HostId, PrincipalId, RoleId};
 
 /// What came of asking to run a command.
 ///
@@ -194,7 +163,6 @@ pub struct Bastion<C: Clock, S: CredentialSource> {
     sessions: SessionStore<Arc<C>>,
     approvals: Approvals<Arc<C>>,
     ledger: Arc<Ledger<Arc<C>>>,
-    catalog: Catalog,
     engine: Engine,
     registry: Registry,
     connector: Connector<S>,
@@ -231,24 +199,19 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     pub fn new(
         clock: Arc<C>,
         registry: Registry,
-        catalog: Catalog,
         engine: Engine,
         connector: S,
         bounds: Bounds,
     ) -> Self {
-        Self::recording_to(clock, registry, catalog, engine, connector, bounds, None)
+        Self::recording_to(clock, registry, engine, connector, bounds, None)
     }
 
     /// A service whose record also hands every entry to something that
     /// outlives the process.
     ///
-    /// Separate from `new` rather than a seventh argument everywhere, because
-    /// most callers — every test in this crate — want a record that keeps its
-    /// entries and ships them nowhere.
     pub fn recording_to(
         clock: Arc<C>,
         registry: Registry,
-        catalog: Catalog,
         engine: Engine,
         connector: S,
         bounds: Bounds,
@@ -274,7 +237,6 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                 bounds.waiting_per_session,
             ),
             ledger: Arc::clone(&ledger),
-            catalog,
             engine,
             registry,
             connector: Connector::new(connector, crate::connect::Timeouts::default()),
@@ -303,8 +265,9 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         host: HostId,
         role: RoleId,
         purpose: Purpose,
-        scope: Scope,
+        access_class: AccessClass,
     ) -> Result<Session, MediationError> {
+        self.check_account(&host, &role, access_class)?;
         let target = self.registry.resolve(&host, &role)?;
         // The target carries the host and role it was resolved for, so the
         // connection is labelled by the lookup that produced its address and
@@ -316,7 +279,9 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
             // reconciliation cannot catch the session existing without its
             // connection or the other way round.
             let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
-            let session = self.sessions.open(principal, host, role, purpose, scope)?;
+            let session = self
+                .sessions
+                .open(principal, host, role, purpose, access_class)?;
             self.connections
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -401,10 +366,9 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         let session = self.sessions.use_session(session, principal)?;
 
         let command = Command::new(argv)?;
-        let classification = self.catalog.classify(&command);
         // The decision carries both of its inputs from here on, so nothing
         // downstream can pair this verdict with another command or session.
-        let decision = self.engine.decide(&session, classification)?;
+        let decision = self.engine.decide(&session, command.clone());
 
         // Recorded before the branch below, so a refusal and a command awaiting
         // approval are as accountable as one that ran. What was attempted is
@@ -483,7 +447,6 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                         let request = asked.asked().id.clone();
                         let grant = self.approvals.use_standing(
                             &session.id,
-                            intended.decision().classification(),
                             |standing| -> Result<_, MediationError> {
                                 // Keep selection, recording, and redemption
                                 // serialized with withdrawal. Once this
@@ -822,38 +785,6 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         Ok(agreement)
     }
 
-    /// Approves the visible request and lets that answer stand only for its
-    /// deterministic catalog family inside the same session.
-    pub fn approve_matching_work(
-        &self,
-        request: &RequestId,
-        who: String,
-        for_millis: Option<Millis>,
-    ) -> Result<AgreementId, MediationError> {
-        // Checked before applying the visible answer: a forged matching button
-        // on an unmatchable request must not degrade into approve-once.
-        let matching = self.approvals.matching_for(request)?;
-        let answer = self.apply_answer(request, Approver::Human { who: who.clone() }, true)?;
-        let session = answer.asked().session.clone();
-        let until = self.standing_until(&session, for_millis);
-        let matcher_version = matching.matcher_version().to_owned();
-        let agreement = self.approvals.grant_standing(
-            &session,
-            who,
-            until,
-            StandingCoverage::Matching { work: matching },
-        );
-        tracing::info!(
-            session = session.as_str(),
-            request = request.as_str(),
-            agreement = agreement.as_str(),
-            matcher_version,
-            until,
-            "a matching-work agreement was recorded for the session"
-        );
-        Ok(agreement)
-    }
-
     fn standing_until(&self, session: &SessionId, for_millis: Option<Millis>) -> Millis {
         let mut until = self.clock.now().saturating_add(
             for_millis
@@ -1164,11 +1095,8 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
 
     /// Hosts and roles this service is configured for.
     ///
-    /// What is configured, not what a particular caller may do: it takes no
-    /// principal because policy decides about a command, and discovery has no
-    /// command to offer it. Deliberately *not* a promise that any listed pair
-    /// will be permitted — a list that pretended otherwise would be wrong the
-    /// moment a policy changed.
+    /// Discovery reports configuration. Upstream authorization still governs
+    /// whether a caller can select an account.
     pub fn inventory(&self) -> Vec<(&HostId, Vec<&RoleId>)> {
         self.registry
             .hosts()
@@ -1507,7 +1435,8 @@ mod tests {
                    "address": "{address}",
                    "host_key": "{}",
                    "roles": {{
-                     "readonly": {{ "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" }}
+                     "readonly": {{ "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" }},
+                     "operator": {{ "user": "mcp-op", "access_class": "privileged", "credential": "mcp-ssh/dns1/readonly" }}
                    }}
                  }} }}"#,
             pinned.trim()
@@ -1523,33 +1452,7 @@ mod tests {
         Bastion::recording_to(
             clock,
             registry,
-            {
-                // A deployment teaches the catalog the programs it actually
-                // issues, and these tests issue one that takes its time.
-                let mut catalog = Catalog::builtin().unwrap();
-                catalog
-                    .merge(
-                        Catalog::from_json(
-                            r#"{
-                              "version": "mediate-tests",
-                              "programs": {
-                                "sleep": {"scope": "read"},
-                                "true": {
-                                  "scope": "read",
-                                  "subcommands": {
-                                    "change": "mutate",
-                                    "other": "mutate"
-                                  }
-                                }
-                              }
-                            }"#,
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                catalog
-            },
-            Engine::builtin().unwrap(),
+            Engine::new(crate::policy::ReviewMode::Privileged),
             OneKey(client_key, gate),
             Bounds {
                 lifetime: LIFETIME,
@@ -1579,7 +1482,7 @@ mod tests {
             Err(MediationError::AccountMismatch)
         );
         assert_eq!(bastion.held_connections(), 0);
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         assert_eq!(
             bastion.check_session_account(
                 &alice(),
@@ -1601,17 +1504,42 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn a_privileged_account_cannot_be_downgraded_before_connecting() {
+        let (bastion, gate) = bastion_gated(Arc::new(TestClock::at(1_000))).await;
+        gate.arm();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bastion.open_session(
+                alice(),
+                HostId::parse("dns1").unwrap(),
+                RoleId::parse("operator").unwrap(),
+                Purpose::parse("inspect the target").unwrap(),
+                AccessClass::ReadOnly,
+            ),
+        )
+        .await
+        .expect("account validation must precede credential retrieval");
+        assert_eq!(result, Err(MediationError::AccountMismatch));
+        assert_eq!(bastion.held_connections(), 0);
+        assert!(bastion.ledger().entries().is_empty());
+    }
+
     async fn session_for<C: Clock + 'static>(
         bastion: &Bastion<C, OneKey>,
-        scope: Scope,
+        access_class: AccessClass,
     ) -> Session {
         bastion
             .open_session(
                 alice(),
                 HostId::parse("dns1").unwrap(),
-                RoleId::parse("readonly").unwrap(),
+                RoleId::parse(match access_class {
+                    AccessClass::ReadOnly => "readonly",
+                    AccessClass::Privileged => "operator",
+                })
+                .unwrap(),
                 Purpose::parse("find out why the deploy did not take effect").unwrap(),
-                scope,
+                access_class,
             )
             .await
             .expect("opening a session")
@@ -1638,7 +1566,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopping_service_starts_nothing_new() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         bastion.stop();
 
@@ -1664,7 +1592,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_that_outlives_its_wait_is_returned_and_can_be_continued() {
         let bastion = impatient().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &session.id, argv(&["sleep", "5"]))
@@ -1729,7 +1657,7 @@ mod tests {
             },
         )
         .await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &session.id, argv(&["sleep", "1"]))
@@ -1781,7 +1709,7 @@ mod tests {
         for _ in 0..6 {
             let bastion = Arc::clone(&bastion);
             opening.push(tokio::spawn(async move {
-                session_for(&*bastion, Scope::Read).await
+                session_for(&*bastion, AccessClass::ReadOnly).await
             }));
         }
         let mut sessions = Vec::new();
@@ -1807,7 +1735,7 @@ mod tests {
             ..Limits::default()
         })
         .await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &session.id, argv(&["sleep", "0.3"]))
@@ -1871,7 +1799,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_outlives_the_connection_underneath_it() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         bastion
             .exec(&alice(), &session.id, argv(&["uptime"]))
             .await
@@ -1900,7 +1828,7 @@ mod tests {
     #[tokio::test]
     async fn dialling_again_replaces_the_session_connection_rather_than_adding_one() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         assert_eq!(bastion.held_connections(), 1);
 
         lose_the_transport(&bastion, &session.id).await;
@@ -1936,7 +1864,7 @@ mod tests {
         let (bastion, gate) =
             bastion_gated(Arc::new(SystemClock::new().expect("a boot clock"))).await;
         let bastion = Arc::new(bastion);
-        let session = session_for(&*bastion, Scope::Read).await;
+        let session = session_for(&*bastion, AccessClass::ReadOnly).await;
 
         // The transport goes, so the next command has to dial rather than reuse.
         lose_the_transport(&bastion, &session.id).await;
@@ -1997,7 +1925,7 @@ mod tests {
     #[tokio::test]
     async fn a_service_that_is_stopping_does_not_dial_a_replacement() {
         let bastion = Arc::new(bastion().await);
-        let session = session_for(&*bastion, Scope::Read).await;
+        let session = session_for(&*bastion, AccessClass::ReadOnly).await;
         // The transport goes, so the next command has to dial rather than reuse.
         lose_the_transport(&bastion, &session.id).await;
 
@@ -2045,7 +1973,7 @@ mod tests {
         let clock = Arc::new(TestClock::at(1_000));
         let (bastion, gate) = bastion_gated(Arc::clone(&clock)).await;
         let bastion = Arc::new(bastion);
-        let session = session_for(&*bastion, Scope::Read).await;
+        let session = session_for(&*bastion, AccessClass::ReadOnly).await;
 
         // The transport goes, so the next command has to dial rather than reuse.
         lose_the_transport(&bastion, &session.id).await;
@@ -2088,7 +2016,7 @@ mod tests {
             ..Limits::default()
         })
         .await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         let who = alice();
 
         let abandoned = bastion.exec(&who, &session.id, argv(&["sleep", "0.3"]));
@@ -2138,7 +2066,7 @@ mod tests {
             ..Limits::default()
         })
         .await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &session.id, argv(&["sleep", "0.4"]))
@@ -2180,7 +2108,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_closes_once_however_many_callers_ask() {
         let bastion = Arc::new(bastion().await);
-        let session = session_for(&*bastion, Scope::Read).await;
+        let session = session_for(&*bastion, AccessClass::ReadOnly).await;
 
         let mut closing = Vec::new();
         for _ in 0..6 {
@@ -2225,7 +2153,7 @@ mod tests {
             },
         )
         .await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         // Cancelled while the command is running, so the identifier it would
         // have returned is never handed over and never indexed.
@@ -2258,8 +2186,8 @@ mod tests {
     #[tokio::test]
     async fn a_foreign_run_and_a_made_up_one_answer_alike_and_as_quickly() {
         let bastion = impatient().await;
-        let mine = session_for(&bastion, Scope::Privileged).await;
-        let theirs = session_for(&bastion, Scope::Privileged).await;
+        let mine = session_for(&bastion, AccessClass::ReadOnly).await;
+        let theirs = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &mine.id, argv(&["sleep", "5"]))
@@ -2309,12 +2237,12 @@ mod tests {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
 
-        let lapsed = session_for(&bastion, Scope::Read).await;
+        let lapsed = session_for(&bastion, AccessClass::ReadOnly).await;
         assert_eq!(bastion.held_connections(), 1);
 
         // Past its whole life and its grace, so the store gives up on it.
         clock.advance(LIFETIME.max + LIFETIME.grace + 1);
-        let fresh = session_for(&bastion, Scope::Read).await;
+        let fresh = session_for(&bastion, AccessClass::ReadOnly).await;
 
         assert_ne!(fresh.id, lapsed.id);
         assert_eq!(
@@ -2333,7 +2261,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let third = session_for(&bastion, Scope::Read).await;
+        let third = session_for(&bastion, AccessClass::ReadOnly).await;
 
         assert_ne!(third.id, fresh.id);
         assert_eq!(
@@ -2353,12 +2281,12 @@ mod tests {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
 
-        let lapsed = session_for(&bastion, Scope::Read).await;
+        let lapsed = session_for(&bastion, AccessClass::ReadOnly).await;
         assert_eq!(bastion.held_connections(), 1);
 
         // Idle past its bound but inside the grace, so the store still has it.
         clock.advance(LIFETIME.idle + 1);
-        let fresh = session_for(&bastion, Scope::Read).await;
+        let fresh = session_for(&bastion, AccessClass::ReadOnly).await;
 
         assert_ne!(fresh.id, lapsed.id);
         assert_eq!(
@@ -2386,8 +2314,8 @@ mod tests {
     #[tokio::test]
     async fn a_run_belongs_to_the_session_that_started_it() {
         let bastion = impatient().await;
-        let mine = session_for(&bastion, Scope::Privileged).await;
-        let theirs = session_for(&bastion, Scope::Privileged).await;
+        let mine = session_for(&bastion, AccessClass::ReadOnly).await;
+        let theirs = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &mine.id, argv(&["sleep", "5"]))
@@ -2418,7 +2346,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_is_released_once_it_is_recorded() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         for _ in 0..3 {
             let executed = bastion
@@ -2444,7 +2372,7 @@ mod tests {
     #[tokio::test]
     async fn a_permitted_command_runs_and_is_recorded() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
 
         let executed = bastion
             .exec(&alice(), &session.id, argv(&["uptime"]))
@@ -2475,7 +2403,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_by_a_human_is_recorded_when_it_is_given() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -2537,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn a_standing_agreement_answers_for_its_session_alone() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -2591,7 +2519,6 @@ mod tests {
                     standing: true,
                     mode: crate::audit::ApprovalMode::Session,
                     agreement: Some(recorded),
-                    matcher_version: None,
                     agreed: true,
                     ..
                 } if recorded == agreement.as_str()
@@ -2601,7 +2528,7 @@ mod tests {
 
         // Another session is not covered: the agreement is about one
         // session's work, not the operator's account.
-        let other = session_for(&bastion, Scope::Privileged).await;
+        let other = session_for(&bastion, AccessClass::Privileged).await;
         let elsewhere = bastion
             .exec(&alice(), &other.id, argv(&["sh", "-c", "true"]))
             .await
@@ -2624,89 +2551,6 @@ mod tests {
         assert!(bastion.ledger().verify().is_ok());
     }
 
-    #[tokio::test]
-    async fn a_matching_agreement_answers_only_its_catalog_family() {
-        let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Mutate).await;
-
-        let held = bastion
-            .exec(&alice(), &session.id, argv(&["true", "change", "first"]))
-            .await
-            .unwrap();
-        let Executed::AwaitingApproval { asked, .. } = held else {
-            panic!("expected the command to be held, got {held:?}");
-        };
-        assert!(
-            asked.asked().matching.is_some(),
-            "the identified non-interpreter family was not matchable"
-        );
-        let agreement = bastion
-            .approve_matching_work(&asked.asked().id, "chris".to_owned(), None)
-            .unwrap();
-
-        let triggering = bastion
-            .exec(&alice(), &session.id, argv(&["true", "change", "first"]))
-            .await
-            .unwrap();
-        assert!(matches!(
-            triggering,
-            Executed::Ran {
-                approved_by: Some(Approver::Human { .. }),
-                ..
-            }
-        ));
-
-        let same_family = bastion
-            .exec(&alice(), &session.id, argv(&["true", "change", "second"]))
-            .await
-            .unwrap();
-        assert!(matches!(
-            same_family,
-            Executed::Ran {
-                approved_by: Some(Approver::MatchingStanding {
-                    agreement: ref recorded_agreement,
-                    ref matcher_version,
-                    ..
-                }),
-                ..
-            } if recorded_agreement == &agreement
-                && matcher_version == crate::approval::MatchingWork::VERSION
-        ));
-        assert!(
-            bastion.ledger().entries().iter().any(|entry| matches!(
-                &entry.event,
-                Event::Approved {
-                    mode: crate::audit::ApprovalMode::Matching,
-                    agreement: Some(recorded),
-                    matcher_version: Some(version),
-                    ..
-                } if recorded == agreement.as_str()
-                    && version == crate::approval::MatchingWork::VERSION
-            )),
-            "the matching authorization did not record its provenance"
-        );
-
-        let other_family = bastion
-            .exec(&alice(), &session.id, argv(&["true", "other", "second"]))
-            .await
-            .unwrap();
-        assert!(
-            matches!(other_family, Executed::AwaitingApproval { .. }),
-            "a different subcommand family was covered: {other_family:?}"
-        );
-
-        assert!(bastion.revoke_standing(&agreement));
-        let after = bastion
-            .exec(&alice(), &session.id, argv(&["true", "change", "third"]))
-            .await
-            .unwrap();
-        assert!(
-            matches!(after, Executed::AwaitingApproval { .. }),
-            "a revoked matching agreement still answered: {after:?}"
-        );
-        assert!(bastion.ledger().verify().is_ok());
-    }
-
     /// A standing agreement is bounded twice: by the time its grantor chose,
     /// and - whatever they chose - by when the session's own age will end it,
     /// so an agreement given late in a session cannot claim or display more
@@ -2715,7 +2559,7 @@ mod tests {
     async fn a_standing_agreement_expires_when_its_time_is_up() {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         // A third of the session's idle bound in, the default grant reaches
         // only to the session's end - not a full maximum lifetime from now.
@@ -2780,7 +2624,7 @@ mod tests {
     async fn an_agreement_nothing_collected_in_time_is_reported_as_lapsed() {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -2867,7 +2711,7 @@ mod tests {
     async fn a_standing_agreement_answers_a_retry_whose_own_approval_lapsed() {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -2925,7 +2769,7 @@ mod tests {
     #[tokio::test]
     async fn requests_about_a_closed_session_are_not_still_offered() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -2990,7 +2834,7 @@ mod tests {
             Some(Arc::clone(&boundary) as Arc<dyn Records>),
         )
         .await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let mut bytes = [0_u8; 8];
         rand::fill(&mut bytes);
@@ -3057,7 +2901,7 @@ mod tests {
     async fn requests_nobody_answered_are_let_go_of() {
         let clock = Arc::new(TestClock::at(1_000));
         let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         let held = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "true"]))
@@ -3090,7 +2934,7 @@ mod tests {
     #[tokio::test]
     async fn a_retry_joins_the_request_rather_than_creating_one() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
         let argv = argv(&["sh", "-c", "true"]);
 
         let held = bastion
@@ -3116,7 +2960,7 @@ mod tests {
     #[tokio::test]
     async fn a_held_command_runs_once_a_human_agrees_and_not_twice() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         // Named freshly, so what this observes is this command's effect rather
         // than a leftover from an earlier run.
@@ -3185,7 +3029,7 @@ mod tests {
     #[tokio::test]
     async fn work_needing_approval_does_not_run_but_is_still_recorded() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Privileged).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
 
         // Named freshly each run, so what this observes is this command's
         // effect. A fixed name would let a leftover from an earlier run, or
@@ -3223,79 +3067,13 @@ mod tests {
         assert_eq!(entries.len(), 2, "nothing was recorded as having completed");
     }
 
-    /// A command beyond the session's ceiling is refused outright rather than
-    /// queued for a human, because it is outside what the session was opened
-    /// for at all.
-    #[tokio::test]
-    async fn work_beyond_the_ceiling_is_refused() {
-        let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
-
-        let executed = bastion
-            .exec(
-                &alice(),
-                &session.id,
-                argv(&["docker", "restart", "traefik"]),
-            )
-            .await
-            .unwrap();
-        let Executed::Refused { decision, .. } = executed else {
-            panic!("expected a refusal, got {executed:?}");
-        };
-        assert!(
-            decision.explanation().contains("read"),
-            "the refusal should say what the ceiling was: {}",
-            decision.explanation()
-        );
-    }
-
-    /// A program the catalog cannot describe never runs unattended. It is
-    /// assessed maximally rather than assumed benign, so in a session opened
-    /// at the maximal scope it waits for a human, and in any lesser session
-    /// the ceiling refuses it outright.
-    #[tokio::test]
-    async fn an_unrecognised_program_waits_for_a_human_or_is_refused() {
-        let bastion = bastion().await;
-
-        let session = session_for(&bastion, Scope::Privileged).await;
-        let executed = bastion
-            .exec(
-                &alice(),
-                &session.id,
-                argv(&["tar", "-cf", "/tmp/x", "/etc"]),
-            )
-            .await
-            .unwrap();
-        let Executed::AwaitingApproval { decision, .. } = executed else {
-            panic!("expected the command to wait for a human, got {executed:?}");
-        };
-        assert!(
-            !decision.classification().identified(),
-            "the record should say the catalog could not identify it"
-        );
-
-        let lesser = session_for(&bastion, Scope::Read).await;
-        let executed = bastion
-            .exec(
-                &alice(),
-                &lesser.id,
-                argv(&["tar", "-cf", "/tmp/x", "/etc"]),
-            )
-            .await
-            .unwrap();
-        assert!(
-            matches!(executed, Executed::Refused { .. }),
-            "an unidentified command exceeded a read ceiling but was not refused: {executed:?}"
-        );
-    }
-
     /// Invariant 3 at the surface a caller actually touches: holding another
     /// principal's session identifier is not enough to use it, and the answer
     /// is the same one given for a session that never existed.
     #[tokio::test]
     async fn another_principal_cannot_drive_the_session() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         let bob = PrincipalId::parse("bob").unwrap();
 
         let err = bastion
@@ -3323,7 +3101,7 @@ mod tests {
                 HostId::parse("nowhere").unwrap(),
                 RoleId::parse("readonly").unwrap(),
                 Purpose::parse("check something").unwrap(),
-                Scope::Read,
+                AccessClass::ReadOnly,
             )
             .await
             .unwrap_err();
@@ -3335,7 +3113,7 @@ mod tests {
     #[tokio::test]
     async fn closing_ends_the_session_and_records_it() {
         let bastion = bastion().await;
-        let session = session_for(&bastion, Scope::Read).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
         bastion.close_session(&alice(), &session.id).await.unwrap();
 
         let entries = bastion.ledger().entries();
@@ -3363,6 +3141,11 @@ mod tests {
         let inventory = bastion.inventory();
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].0.as_str(), "dns1");
-        assert_eq!(inventory[0].1[0].as_str(), "readonly");
+        let roles: std::collections::BTreeSet<_> =
+            inventory[0].1.iter().map(|role| role.as_str()).collect();
+        assert_eq!(
+            roles,
+            std::collections::BTreeSet::from(["operator", "readonly"])
+        );
     }
 }

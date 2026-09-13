@@ -63,7 +63,7 @@ def verify_live():
     assert any(entry["event"]["event"] == "completed" and entry["event"]["run"] == result["run"]
                for entry in entries)
     assert mcp_bearer not in logs and password not in logs
-    print("Quickstart passed: permitted read, held command, separate operator login, CSRF refusal, execution, and audit identity.")
+    print("Quickstart passed: account review, separate operator login, CSRF refusal, execution, and audit identity.")
 
 
 def main():

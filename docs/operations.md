@@ -2,7 +2,7 @@
 
 The initial supported setup is one administrative domain using Linux containers
 and POSIX-shell SSH targets. Start with the [disposable tutorial](quickstart.md).
-Review the [design preconditions](design.md#preconditions) before attaching real
+Review the [design preconditions](design.md#non-goals-and-preconditions) before attaching real
 hosts. Multiple independent tenants, multiple active replicas, OAuth login,
 and file-transfer integration are outside the initial supported setup.
 
@@ -78,16 +78,15 @@ Include `host`, `role`, and `access_class` when opening, executing, polling, or
 closing a session. The arguments must match the configured account and the
 session; they let an upstream gateway make an account-access decision.
 
-## Policy and configuration changes
+## Local review and configuration changes
 
-The shipped policy permits catalog-classified reads within the session's scope
-and holds consequential commands for approval. Use `MCP_SSH_POLICY_PATH` for a
-replacement Cedar policy. The service retains its built-in scope ceiling rules.
-Test your policy with allowed, denied, and held commands on disposable targets
-before using it on real hosts. Catalog extension configuration is not yet part
-of this setup.
+Set `MCP_SSH_REVIEW` to `disabled` (the default), `all`, or `privileged`.
+The setting controls local human review for configured accounts. Privileged
+review holds every command on an account marked privileged; it does not inspect
+command text. An upstream gateway separately decides account entitlement.
+Neither local approval nor an agent's requested class grants target permissions.
 
-Registry, policy, credentials, and bearer configuration are read at startup.
+Registry, review, credentials, and bearer configuration are read at startup.
 Restart after changing them. Restart loses active sessions, runs, and pending
 approvals; it does not undo commands already sent to a target. For standalone
 credential rotation, stop new requests, restart with new credentials, and
@@ -121,7 +120,7 @@ come from `settings::bounds`; they are not environment settings.
 Collect the service's JSON standard output into a log store with appropriate
 access control and retention. Command arguments, identity labels, and output
 can contain sensitive operational data. The process-local chain is not durable
-storage or a restart-spanning history. See the [recording design](design.md#3-trust-boundaries-and-invariants).
+storage or a restart-spanning history. See the [recording design](design.md#audit-and-evaluation).
 
 `MCP_SSH_AUDIT_QUERY_URL` enables the existing Loki history reader. Without it,
 historical dashboard pages explicitly report the durable source unavailable.

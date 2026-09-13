@@ -3,7 +3,7 @@
 //! One execution path, not a fast one and a slow one. An agent cannot predict
 //! whether a command will return immediately or grind for minutes, so asking it
 //! to choose up front guarantees wrong guesses in both directions — and two
-//! paths would mean two authorization paths, two classification paths, and two
+//! paths would mean two authorization paths and two
 //! audit shapes that drift apart.
 //!
 //! So every command is started the same way and waited on for a bounded time.
@@ -1386,7 +1386,6 @@ mod tests {
     /// somewhere else.
     fn recorded_for(host: &str, argv: &[&str]) -> Receipt {
         use crate::audit::Ledger;
-        use crate::catalog::Catalog;
         use crate::clock::TestClock;
         use crate::policy::Engine;
         use crate::session::{Lifetime, Purpose, SessionStore};
@@ -1405,41 +1404,11 @@ mod tests {
             crate::HostId::parse(host).unwrap(),
             crate::RoleId::parse("readonly").unwrap(),
             Purpose::parse("exercise the execution path").unwrap(),
-            crate::Scope::Privileged,
+            crate::AccessClass::Privileged,
         )
         .unwrap();
-        // A deployment teaches the catalog the programs it actually issues, and
-        // these tests issue shell tools. Without this the receipt cannot be
-        // minted at all, which is the gate working rather than a nuisance.
-        let mut catalog = Catalog::builtin().unwrap();
-        catalog
-            .merge(
-                Catalog::from_json(
-                    r#"{
-                      "version": "run-tests",
-                      "programs": {
-                        "printf": {"scope": "read"},
-                        "echo": {"scope": "read"},
-                        "sleep": {"scope": "read"},
-                        "true": {"scope": "read"}
-                      }
-                    }"#,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let classification = catalog.classify(&command(argv));
-        // A test deployment's policy, permitting what these tests run. The
-        // shipped one holds an interpreter for a human, which is right and is
-        // not what this module is exercising - the receipt is still real, still
-        // written to a real ledger, and still bound to this command.
-        let decision = Engine::from_source(
-            r#"@id("run-tests-permit")
-               permit (principal, action == Action::"run", resource);"#,
-        )
-        .unwrap()
-        .decide(&session, classification)
-        .unwrap();
+        let decision =
+            Engine::new(crate::policy::ReviewMode::Disabled).decide(&session, command(argv));
         Ledger::new(TestClock::at(1_000))
             .record_intent(
                 decision,

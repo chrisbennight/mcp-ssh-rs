@@ -40,25 +40,23 @@ the helper does not print credentials. The browser asks for these when you
 open the dashboard. This local HTTP login is for the tutorial; see
 [operating the service](operations.md) before using remote connections.
 
-## Run a permitted command and request approval
+## Request approval
 
 ```sh
 python3 examples/quickstart/demo.py request
 ```
 
 The supplied Python MCP client initializes the connection, opens a session,
-and runs `whoami`. Its result should have `outcome: "ran"`, `exit: 0`, and
-stdout containing `demo`.
-
-It then asks to run `touch /home/demo/tutorial-marker`. The result should have
+and asks to run `touch /home/demo/tutorial-marker`. The result should have
 `outcome: "awaiting_approval"` and a link to the approval page. No file has been
 created yet. Keep the session and request identifiers as returned; they are
 not credentials and are not constructed by the client.
 
-`touch` is not in the built-in command catalog, so it receives the maximum
-assessment. The tutorial session therefore uses the `privileged` scope ceiling
-to allow the operator to consider it. This ceiling does not grant root access:
-the target still executes as the restricted `demo` account.
+The tutorial marks the writable demo account privileged and enables local
+review for privileged accounts. Every command on that account requires review,
+regardless of its text. The label does not grant root access: the target still
+executes as the non-root `demo` account with its configured operating-system
+permissions.
 
 Open the dashboard URL, log in, and review the host, role, command arguments,
 and declared purpose. Choose **Approve once** for the marker command. Approval
@@ -96,7 +94,7 @@ advertises MCP protocol version `2025-11-25`.
 
 Clients must send the MCP token on every request. They do not send a principal
 argument or `x-mcp-identity` header in standalone mode. Clients sharing the
-token share the configured identity; see the [authentication design](design.md#4-architecture)
+token share the configured identity; see the [authentication design](design.md#account-authorization)
 before sharing a deployment. Browser-based MCP clients and OAuth login are not
 part of this setup.
 

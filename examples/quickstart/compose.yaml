@@ -17,6 +17,7 @@ services:
       context: ../..
     environment:
       MCP_SSH_AUTH_MODE: standalone
+      MCP_SSH_REVIEW: privileged
       MCP_SSH_BEARER: ${DEMO_MCP_BEARER}
       MCP_SSH_OPERATOR_PASSWORD: ${DEMO_OPERATOR_PASSWORD}
       MCP_SSH_REGISTRY: /config/registry.json

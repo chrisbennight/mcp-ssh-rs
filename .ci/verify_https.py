@@ -133,6 +133,7 @@ def service(binary, fixture, roots, jwks_url, endpoint, token, image):
     configured = {
         "MCP_SSH_LISTEN": f"127.0.0.1:{port}",
         "MCP_SSH_REGISTRY": str(fixture / "registry.json"),
+        "MCP_SSH_REVIEW": "all",
         "MCP_SSH_CREDENTIAL_TEST": (fixture / "ssh").read_text(),
         "MCP_SSH_GATEWAY_BEARER_CURRENT": secrets.token_urlsafe(32),
         "MCP_SSH_PROXY_BEARER_CURRENT": secrets.token_urlsafe(32),
@@ -262,7 +263,7 @@ def check(binary, image):
                         assert initialize(base, headers)[0] == 200
                         assert request(base + "/mcp", headers, {"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202
                         session = tool(base, headers, "ssh_open_session", {"host": "test", "role": "user",
-                            "purpose": "Transport check without SSH execution", "scope": "privileged"})
+                            "purpose": "Transport check without SSH execution"})
                         held = tool(base, headers, "ssh_exec", {"session": session["session"],
                             "intent": "Generate an approval notification only", "command": ["touch", "/unused"]})
                         assert held["outcome"] == "awaiting_approval"

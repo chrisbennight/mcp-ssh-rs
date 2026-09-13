@@ -130,7 +130,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::HeaderValue;
     use axum::http::Request as HttpRequest;
-    use ssh_core::catalog::Catalog;
     use ssh_core::policy::Engine;
     use ssh_core::registry::Registry;
     use tower::ServiceExt as _;
@@ -189,8 +188,7 @@ mod tests {
         let bastion = Arc::new(Bastion::new(
             Arc::new(ssh_core::clock::TestClock::at(1_000)),
             Registry::from_json("{}").unwrap(),
-            Catalog::builtin().unwrap(),
-            Engine::builtin().unwrap(),
+            Engine::new(ssh_core::policy::ReviewMode::Privileged),
             NoCredentials,
             crate::settings::bounds(),
         ));
