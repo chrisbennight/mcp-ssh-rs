@@ -467,7 +467,7 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             access_class(required_string(object, "access_class")?)
         }
         "decided" => {
-            exact_keys(
+            operation_keys(
                 object,
                 &[
                     "event",
@@ -486,10 +486,7 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             if required_string(object, "program")? != command.program() {
                 return Err(());
             }
-            one_of(
-                required_string(object, "operation")?,
-                &["execute", "download", "upload"],
-            )?;
+
             access_class(required_string(object, "access_class")?)?;
             Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
             one_of(
@@ -565,7 +562,7 @@ fn validate_event(event: &Value) -> Result<(), ()> {
         "session_closed" => exact_keys(object, &["event"]),
         "evaluated" => {
             if object.contains_key("decided") {
-                exact_keys(
+                operation_keys(
                     object,
                     &[
                         "event",
@@ -578,19 +575,14 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                         "access_class",
                     ],
                 )?;
-                one_of(
-                    required_string(object, "operation")?,
-                    &["execute", "download", "upload"],
-                )?;
+
                 required_u64(object, "decided")?;
                 Command::new(string_array(object, "argv")?).map_err(|_| ())?;
                 CommandIntent::parse(required_string(object, "agent_intent")?).map_err(|_| ())?;
                 Purpose::parse(required_string(object, "purpose")?).map_err(|_| ())?;
                 access_class(required_string(object, "access_class")?)?;
             } else {
-                // Evaluation entries written before context denormalization
-                // remain readable, but their missing fields render explicitly
-                // as unavailable in the dashboard.
+                // Missing context renders as unavailable; the reader never invents audit facts.
                 exact_keys(object, &["event", "artifact"])?;
             }
             let artifact: Artifact =
@@ -648,6 +640,24 @@ fn validate_recorded(value: &Value) -> Result<(), ()> {
             non_blank_string(required_string(object, "matched")?)
         }
         _ => Err(()),
+    }
+}
+
+/// Optional operation metadata is validated without rewriting recorded evidence.
+fn operation_keys(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Result<(), ()> {
+    if let Some(operation) = object.get("operation") {
+        one_of(
+            operation.as_str().ok_or(())?,
+            &["execute", "download", "upload"],
+        )?;
+        exact_keys(object, keys)
+    } else {
+        let required: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key != "operation")
+            .collect();
+        exact_keys(object, &required)
     }
 }
 
@@ -1068,7 +1078,7 @@ mod tests {
                                 event_line(
                                     10,
                                     serde_json::json!({
-                                        "event": "decided", "operation": "execute",
+                                        "event": "decided",
                                         "agent_intent": "inspect dns health",
                                         "argv": ["systemctl", "status", "unbound"],
                                         "program": "systemctl",
@@ -1321,6 +1331,9 @@ mod tests {
             "purpose": "diagnose dns",
             "access_class": "read_only"
         });
+        assert!(validate_entry(&entry).is_ok());
+
+        entry.event.as_object_mut().unwrap().remove("operation");
         assert!(validate_entry(&entry).is_ok());
 
         entry.event = serde_json::json!({"event": "evaluated", "artifact": artifact});

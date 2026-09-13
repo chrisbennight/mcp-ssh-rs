@@ -188,6 +188,7 @@ impl Transfers {
         let now = self.clock.now();
         items.retain(|_, item| {
             now.saturating_sub(item.created) < TTL
+                || matches!(item.content, Content::Receiving)
                 || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1)
         });
         if items.len() >= MAX_ITEMS
@@ -417,7 +418,7 @@ impl Transfers {
         self.items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .retain(|_, item| now.saturating_sub(item.created) < TTL || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1));
+            .retain(|_, item| now.saturating_sub(item.created) < TTL || matches!(item.content, Content::Receiving) || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1));
     }
 }
 
@@ -684,6 +685,53 @@ mod tests {
             store.authorize_upload(&owner("another"), UploadParams::default()),
             Err(TransferError::Capacity)
         ));
+    }
+
+    #[test]
+    fn receiving_uploads_remain_charged_after_reference_expiry() {
+        let clock = Arc::new(TestClock::at(1000));
+        let store = Arc::new(Transfers::new(clock.clone(), "https://ssh.example").unwrap());
+        let caller = owner("caller");
+        let upload = store
+            .authorize_upload(&caller, UploadParams::default())
+            .unwrap();
+        clock.advance(TTL.saturating_sub(1));
+        let id = url::Url::parse(&upload.upload.url)
+            .unwrap()
+            .path_segments()
+            .unwrap()
+            .next_back()
+            .unwrap()
+            .to_owned();
+        let ticketed = store
+            .take_ticket(&id, upload.upload.headers.get(HEADER).unwrap(), true)
+            .unwrap();
+        let receiving = Receiving {
+            store: Arc::clone(&store),
+            id: ticketed.id,
+        };
+        clock.advance(1);
+        store.sweep();
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        for _ in 1..OWNER_ITEMS {
+            store
+                .authorize_upload(&caller, UploadParams::default())
+                .unwrap();
+        }
+        assert!(matches!(
+            store.authorize_upload(&caller, UploadParams::default()),
+            Err(TransferError::Capacity)
+        ));
+        assert!(
+            store.publish(&receiving.id, Vec::new(), true).is_err(),
+            "expiry still prevents publication"
+        );
+        drop(receiving);
+        assert!(
+            store
+                .authorize_upload(&caller, UploadParams::default())
+                .is_ok()
+        );
     }
 
     #[test]
