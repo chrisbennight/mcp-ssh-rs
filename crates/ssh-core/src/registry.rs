@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use crate::{HostId, RoleId};
+use crate::{AccessClass, HostId, RoleId};
 
 /// Names a credential in the secret store. Not the credential itself.
 ///
@@ -113,6 +113,7 @@ pub struct Target<'a> {
     host_key: &'a PinnedHostKey,
     user: &'a str,
     credential: &'a CredentialRef,
+    access_class: AccessClass,
 }
 
 impl<'a> Target<'a> {
@@ -148,6 +149,11 @@ impl<'a> Target<'a> {
     pub const fn credential(&self) -> &'a CredentialRef {
         self.credential
     }
+
+    #[must_use]
+    pub const fn access_class(&self) -> AccessClass {
+        self.access_class
+    }
 }
 
 /// What one role on one host resolves to.
@@ -161,6 +167,7 @@ struct RoleEntry {
     #[serde(deserialize_with = "non_blank")]
     user: String,
     credential: CredentialRef,
+    access_class: AccessClass,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -291,6 +298,7 @@ impl Registry {
             host_key: &entry.host_key,
             user: &assigned.user,
             credential: &assigned.credential,
+            access_class: assigned.access_class,
         })
     }
 
@@ -305,6 +313,15 @@ impl Registry {
             .get(host)
             .into_iter()
             .flat_map(|entry| entry.roles.keys())
+    }
+
+    pub fn accounts(&self, host: &HostId) -> impl Iterator<Item = (&RoleId, AccessClass)> {
+        self.hosts.get(host).into_iter().flat_map(|entry| {
+            entry
+                .roles
+                .iter()
+                .map(|(role, account)| (role, account.access_class))
+        })
     }
 }
 
@@ -332,21 +349,56 @@ mod tests {
         "address": "dns1.internal:22",
         "host_key": "SHA256:AAAA1111",
         "roles": {
-          "readonly": { "user": "mcp-ro", "credential": "mcp-ssh/dns1/readonly" },
-          "operator": { "user": "mcp-op", "credential": "mcp-ssh/dns1/operator" }
+          "readonly": { "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" },
+          "operator": { "user": "mcp-op", "access_class": "privileged", "credential": "mcp-ssh/dns1/operator" }
         }
       },
       "server": {
         "address": "server.internal:22",
         "host_key": "SHA256:BBBB2222",
         "roles": {
-          "readonly": { "user": "agent", "credential": "mcp-ssh/server/readonly" }
+          "readonly": { "user": "agent", "access_class": "read_only", "credential": "mcp-ssh/server/readonly" }
         }
       }
     }"#;
 
     fn registry() -> Registry {
         Registry::from_json(REGISTRY).unwrap()
+    }
+
+    #[test]
+    fn account_class_is_configured_and_not_inferred_from_its_name() {
+        let registry = Registry::from_json(
+            r#"{
+            "target": {"address":"localhost:22", "host_key":"SHA256:X",
+                "roles":{"readonly":{"user":"root","credential":"test",
+                    "access_class":"privileged"}}}
+        }"#,
+        )
+        .unwrap();
+        let target = registry
+            .resolve(
+                &HostId::parse("target").unwrap(),
+                &RoleId::parse("readonly").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(target.access_class(), AccessClass::Privileged);
+    }
+
+    #[test]
+    fn account_class_must_be_explicit_and_recognized() {
+        for field in [
+            "",
+            r#", "access_class":"mutate""#,
+            r#", "access_class":null"#,
+        ] {
+            let raw = format!(
+                r#"{{"target":{{"address":"localhost:22",
+                "host_key":"SHA256:X", "roles":{{"user":{{"user":"demo",
+                "credential":"test"{field}}}}}}}}}"#
+            );
+            assert!(Registry::from_json(&raw).is_err());
+        }
     }
 
     #[test]
@@ -449,7 +501,7 @@ mod tests {
             (
                 "a blank credential reference names nothing to authenticate with",
                 r#"{ "dns1": { "address": "a:22", "host_key": "SHA256:X",
-                     "roles": { "readonly": { "user": "u", "credential": "" } } } }"#,
+                     "roles": { "readonly": { "user": "u", "access_class": "read_only", "credential": "" } } } }"#,
             ),
             (
                 "a host name no caller can construct could be advertised but never resolved",
@@ -458,7 +510,7 @@ mod tests {
             (
                 "and the same for a role name",
                 r#"{ "dns1": { "address": "a:22", "host_key": "SHA256:X",
-                     "roles": { "read only": { "user": "u", "credential": "c" } } } }"#,
+                     "roles": { "read only": { "user": "u", "access_class": "read_only", "credential": "c" } } } }"#,
             ),
             (
                 "a blank address leaves nothing to dial",
@@ -467,7 +519,7 @@ mod tests {
             (
                 "a blank login account leaves nobody to authenticate as",
                 r#"{ "dns1": { "address": "a:22", "host_key": "SHA256:X",
-                     "roles": { "readonly": { "user": "", "credential": "c" } } } }"#,
+                     "roles": { "readonly": { "user": "", "access_class": "read_only", "credential": "c" } } } }"#,
             ),
         ];
         for (why, raw) in cases {
@@ -488,8 +540,8 @@ mod tests {
             "address": "dns1.internal:22",
             "host_key": "SHA256:AAAA1111",
             "roles": {
-              "readonly": { "user": "mcp-ro", "credential": "mcp-ssh/dns1/readonly" },
-              "readonly": { "user": "root", "credential": "mcp-ssh/dns1/root" }
+              "readonly": { "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" },
+              "readonly": { "user": "root", "access_class": "privileged", "credential": "mcp-ssh/dns1/root" }
             }
           }
         }"#;
@@ -498,14 +550,14 @@ mod tests {
             "address": "dns1.internal:22",
             "host_key": "SHA256:AAAA1111",
             "roles": {
-              "readonly": { "user": "mcp-ro", "credential": "mcp-ssh/dns1/readonly" }
+              "readonly": { "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" }
             }
           },
           "dns1": {
             "address": "attacker.internal:22",
             "host_key": "SHA256:CCCC3333",
             "roles": {
-              "readonly": { "user": "root", "credential": "mcp-ssh/dns1/root" }
+              "readonly": { "user": "root", "access_class": "privileged", "credential": "mcp-ssh/dns1/root" }
             }
           }
         }"#;

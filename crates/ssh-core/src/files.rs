@@ -1112,7 +1112,7 @@ mod tests {
         let registry = Registry::from_json(&format!(
             r#"{{"testhost": {{"address": "{address}", "host_key": "{key}",
                  "roles": {{"readonly": {{"user": "agent",
-                            "credential": "mcp-ssh/test/readonly"}}}}}}}}"#,
+                            "access_class": "read_only", "credential": "mcp-ssh/test/readonly"}}}}}}}}"#,
             address = address,
             key = pinned.as_str(),
         ))

@@ -687,7 +687,7 @@ mod tests {
     fn registry_for(address: &str, host_key: &PinnedHostKey) -> Registry {
         Registry::from_json(&format!(
             r#"{{"testhost": {{"address": "{address}", "host_key": "{key}",
-                 "roles": {{"readonly": {{"user": "mcp-ro", "credential": "{REFERENCE}"}}}}}}}}"#,
+                 "roles": {{"readonly": {{"user": "mcp-ro", "access_class": "read_only", "credential": "{REFERENCE}"}}}}}}}}"#,
             address = address,
             key = host_key.as_str().replace('\\', "\\\\").replace('"', "\\\""),
         ))

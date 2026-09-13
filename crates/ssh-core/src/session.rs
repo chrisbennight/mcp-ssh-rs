@@ -280,6 +280,22 @@ pub struct SessionStore<C: Clock> {
 }
 
 impl<C: Clock> SessionStore<C> {
+    /// Checks immutable session identity without extending its lifetime.
+    pub fn check_binding(
+        &self,
+        id: &SessionId,
+        principal: &PrincipalId,
+        host: &HostId,
+        role: &RoleId,
+    ) -> Result<(), SessionError> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let session = sessions.get(id.as_str()).ok_or(SessionError::Unknown)?;
+        if &session.principal != principal || &session.host != host || &session.role != role {
+            return Err(SessionError::Unknown);
+        }
+        Ok(())
+    }
+
     /// `per_principal` is the most entries one principal may occupy, counting
     /// both live sessions and lapsed ones still being remembered.
     ///
@@ -590,6 +606,41 @@ mod tests {
                 Scope::Read,
             )
             .expect("within the per-principal limit")
+    }
+
+    #[test]
+    fn session_binding_rejects_a_different_caller_host_or_account() {
+        let store = store();
+        let session = open(&store, "alice");
+        store.clock.advance(LIFETIME.idle / 2);
+        for (caller, host, role) in [
+            ("bob", "dns1", "readonly"),
+            ("alice", "dns2", "readonly"),
+            ("alice", "dns1", "operator"),
+        ] {
+            assert_eq!(
+                store.check_binding(
+                    &session.id,
+                    &principal(caller),
+                    &HostId::parse(host).unwrap(),
+                    &RoleId::parse(role).unwrap()
+                ),
+                Err(SessionError::Unknown)
+            );
+        }
+        store
+            .check_binding(
+                &session.id,
+                &principal("alice"),
+                &session.host,
+                &session.role,
+            )
+            .unwrap();
+        store.clock.advance(LIFETIME.idle / 2);
+        assert!(matches!(
+            store.use_session(&session.id, &principal("alice")),
+            Err(SessionError::Expired { .. })
+        ));
     }
 
     #[test]

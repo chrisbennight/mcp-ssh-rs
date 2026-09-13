@@ -74,6 +74,15 @@ the design is unsound without them:
 - Host identity is verified against pinned material rather than trusted on
   first use.
 
+Account entries carry an explicit `read_only` or `privileged` access class.
+The administrator declares that label; the target's operating system enforces
+the actual permissions. The service neither infers the class from an account
+name nor certifies its permissions. MCP session operations expose the host,
+account, and class so an upstream gateway can authorize account access. These
+arguments must match configuration and the session's immutable binding; asking
+for a class never grants it. A standalone bearer shares one configured identity
+and authorizes access to the configured accounts.
+
 ---
 
 ## 2. Use cases

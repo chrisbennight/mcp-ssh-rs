@@ -2475,8 +2475,8 @@ mod tests {
                 "address": "dns1.internal:22",
                 "host_key": "SHA256:AAAA1111",
                 "roles": {
-                  "readonly": {"user": "mcp-ro", "credential": "mcp-ssh/dns1/readonly"},
-                  "operator": {"user": "mcp-op", "credential": "mcp-ssh/dns1/operator"}
+                  "readonly": {"user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly"},
+                  "operator": {"user": "mcp-op", "access_class": "privileged", "credential": "mcp-ssh/dns1/operator"}
                 }
               }
             }"#,

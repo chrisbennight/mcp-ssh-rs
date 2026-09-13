@@ -49,7 +49,7 @@ host key, and roles. A role names a target account and a credential reference.
     "address": "host.example:22",
     "host_key": "<verified OpenSSH public host key>",
     "roles": {
-      "readonly": {"user": "mcp-read", "credential": "example-read"}
+      "readonly": {"user": "mcp-read", "credential": "example-read", "access_class": "read_only"}
     }
   }
 }
@@ -71,6 +71,12 @@ the target permissions it needs, and verify a privileged operation fails under
 the restricted account. A role named `readonly` does not configure the target
 account or prevent writes by itself. Do not grant Docker-socket or unrestricted
 sudo access to a role intended for diagnosis.
+
+Set every account's `access_class` to `read_only` or `privileged`; the service
+rejects missing or unrecognized classes. Discovery returns that configured class.
+Include `host`, `role`, and `access_class` when opening, executing, polling, or
+closing a session. The arguments must match the configured account and the
+session; they let an upstream gateway make an account-access decision.
 
 ## Policy and configuration changes
 
