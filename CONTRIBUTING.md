@@ -64,10 +64,11 @@ before running it; the check refuses to reuse `.quickstart/`.
 ## GitHub checks and images
 
 [CI](.github/workflows/ci.yml) runs `audit`, `test`, and `verify-image` on pull requests
-and pushes to `main`, using GitHub-hosted runners and public dependencies.
+and pushes to `main` or version tags (`v*`), using GitHub-hosted runners and public dependencies.
+A release tag must equal `v` followed by the workspace package version.
 The Dockerfile's optional crate mirror is not required by CI.
 
-After all checks pass on a push to `main`, `publish` builds and checks its own
+After all checks pass on a push to `main` or a matching version tag, `publish` builds and checks its own
 image, then pushes `ghcr.io/chrisbennight/mcp-ssh-rs:sha-<full-commit-sha>`.
 Only that job receives package-write permission. It uses the workflow's
 `GITHUB_TOKEN`; no Infisical credentials or deployment webhook are needed.
@@ -84,7 +85,8 @@ GitHub repository settings and installed apps are managed separately from the
 checked-in workflow. Before merging, configure a rule for `main` requiring a
 pull request, up-to-date branches, `audit`, `test`, `verify-image`, and `pr-review/gate`.
 Restrict force pushes and deletion. Do not require `publish` on PRs: it runs
-only after a push to `main`.
+only after a push to `main` or a version tag. Restrict creation and updates of
+version tags to release maintainers.
 
 AERB supplies the review status. Its configuration remains in
 [`.gitea/pr-review/policy.yaml`](.gitea/pr-review/policy.yaml), the path its
