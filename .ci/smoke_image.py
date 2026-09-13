@@ -47,6 +47,7 @@ def check(image: str) -> None:
         registry.chmod(0o644)
         environment = os.environ.copy()
         environment.update({
+            "MCP_SSH_AUTH_MODE": "gateway",
             "MCP_SSH_REGISTRY": "/registry.json",
             "MCP_SSH_CREDENTIAL_SMOKE_READONLY": key.read_text(),
             "MCP_SSH_GATEWAY_BEARER_CURRENT": secrets.token_urlsafe(32),
@@ -64,7 +65,7 @@ def check(image: str) -> None:
             "--mount", f"type=bind,source={registry},target=/registry.json,readonly",
         ]
         for variable in (
-            "MCP_SSH_REGISTRY", "MCP_SSH_CREDENTIAL_SMOKE_READONLY",
+            "MCP_SSH_AUTH_MODE", "MCP_SSH_REGISTRY", "MCP_SSH_CREDENTIAL_SMOKE_READONLY",
             "MCP_SSH_GATEWAY_BEARER_CURRENT", "MCP_SSH_PROXY_BEARER_CURRENT",
             "MCP_SSH_IDENTITY_JWKS_URL", "MCP_SSH_IDENTITY_ISSUER",
         ):
