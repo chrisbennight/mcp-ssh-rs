@@ -32,17 +32,17 @@ use crate::notify::Notifier;
 use crate::tools;
 
 const INSTRUCTIONS: &str = "\
-Mediated SSH on the hosts this service is configured for. You never hold an \
-SSH credential and never choose a host address: name a host and a role from \
-ssh_hosts, say what the work is for, and every command is authorized \
-individually against policy.
+SSH on configured accounts. You never hold an SSH credential or choose a host \
+address. Select a host, role, and configured access_class from ssh_hosts. \
+Those arguments must match the account and remain fixed for the session. \
+A label does not grant permissions or certify that an account cannot write.
 
-Commands are argument vectors, not shell lines. Each execution must include \
-your bounded intent for that command; it is shown and recorded as \
-agent-supplied evidence, not trusted user intent. A command may run, may be \
-refused, or may need a human to approve it; a refusal is an answer and \
-retrying it unchanged will not help. Ask for the smallest access_class the work \
-needs \u{2014} a larger one does not make approval more likely.";
+Commands are argument vectors. Each execution includes bounded intent, shown \
+and recorded as agent-supplied evidence, not trusted user intent. Target account \
+permissions govern what commands can do. Local human review, when configured, \
+applies by account rather than command content. A command may run, be refused, \
+or await approval. A refusal is not permission to retry unchanged. Poll a \
+running command and investigate an unknown outcome before submitting it again.";
 
 /// The principal established by HTTP authentication.
 ///
