@@ -33,8 +33,11 @@ def ssh_target(fixture):
     build.mkdir()
     (build / "Dockerfile").write_text("""FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN apt-get update && apt-get install --no-install-recommends -y openssh-server && rm -rf /var/lib/apt/lists/* && useradd --uid 20000 --create-home test && passwd -d test && mkdir -p /run/sshd
+COPY --chown=0:0 --chmod=0644 authorized_keys /authorized_keys
 ENTRYPOINT ["/usr/sbin/sshd", "-D", "-e"]
 """)
+    # Copy only the public key; OpenSSH must not inherit the host user's UID.
+    (build / "authorized_keys").write_bytes((fixture / "ssh.pub").read_bytes())
     command("docker", "build", "--tag", "mcp-ssh-tls-target", str(build))
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
@@ -43,7 +46,6 @@ ENTRYPOINT ["/usr/sbin/sshd", "-D", "-e"]
     try:
         command("docker", "run", "--detach", "--name", name, "--network", "host",
                 "--mount", f"type=bind,source={fixture / 'ssh'},target=/host_key,readonly",
-                "--mount", f"type=bind,source={fixture / 'ssh.pub'},target=/authorized_keys,readonly",
                 "mcp-ssh-tls-target", "-h", "/host_key", "-p", str(port),
                 "-o", "ListenAddress=127.0.0.1", "-o", "AuthorizedKeysFile=/authorized_keys",
                 "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
@@ -217,6 +219,9 @@ def check(binary, image):
         fixture.chmod(0o755)
         (fixture / "empty-roots").mkdir()
         command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(fixture / "ssh"))
+        (fixture / "ssh.pub").chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(fixture / "ssh.pub", 1001, 1001)
         for name in ["ca", "other"]:
             command("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                     "-subj", "/CN=Disposable test CA", "-keyout", str(fixture / (name + ".key")),

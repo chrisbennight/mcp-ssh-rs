@@ -4,9 +4,9 @@ An MCP service that runs SSH commands through configured accounts, with
 a reviewable execution record and optional human approval. MCP (Model
 Context Protocol) lets an AI client call these operations as tools.
 
-**Status: preparing the first public release.** Development currently takes
-place in this private GitHub repository. The initial supported setup is a
-personal Linux/container deployment in one administrative domain.
+**Status: preparing the first release.** Development takes place on GitHub.
+The initial supported setup is a personal Linux/container deployment in one
+administrative domain.
 
 ## Try it
 
