@@ -35,13 +35,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::approval::{Answer, Approver, Asked, Grant};
-use crate::catalog::{Classification, Ground};
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandIntent};
 use crate::policy::{Decision, Verdict};
 use crate::run::{Outcome, RunId, Stream};
 use crate::session::{Session, SessionId};
-use crate::{HostId, PrincipalId, RoleId, Scope};
+use crate::{AccessClass, HostId, PrincipalId, RoleId};
 
 /// A digest, as lowercase hex.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -100,7 +99,6 @@ pub enum Recorded {
 pub enum ApprovalMode {
     Direct,
     Override,
-    Matching,
     Session,
 }
 
@@ -262,7 +260,7 @@ pub enum EvaluationError {
 pub enum Event {
     SessionOpened {
         purpose: String,
-        scope: Scope,
+        access_class: AccessClass,
     },
     /// A command was submitted, and this is what was decided before any run.
     Decided {
@@ -270,21 +268,11 @@ pub enum Event {
         agent_intent: String,
         argv: Vec<String>,
         program: String,
-        /// The subcommand the catalog recognised, where the program has any.
-        subcommand: Option<String>,
-        assessment: Scope,
-        /// Whether the program runs whatever it is handed.
-        interpreter: bool,
-        /// Why the assessment landed where it did.
-        grounds: Vec<Ground>,
-        /// Which catalog said so, so the entry stays readable after the
-        /// vocabulary changes underneath it.
-        catalog_version: String,
+        access_class: AccessClass,
         /// The session's own inputs to the answer. Policy is asked about a
         /// command *in a session*, so an entry without these records the
         /// verdict and not everything the verdict was based on.
         purpose: String,
-        ceiling: Scope,
         verdict: Verdict,
         policies: Vec<String>,
     },
@@ -313,12 +301,10 @@ pub enum Event {
         /// for the same reason as `override_of`: a reader separating the two
         /// must not have to parse a name.
         standing: bool,
-        /// Direct, override, matching, or session-wide.
+        /// Direct, override, or session-wide.
         mode: ApprovalMode,
         /// The standing agreement that answered, if one did.
         agreement: Option<String>,
-        /// The deterministic matcher version, for matching answers.
-        matcher_version: Option<String>,
     },
     /// A human answered a request for approval, either way.
     ///
@@ -342,7 +328,6 @@ pub enum Event {
         standing: bool,
         mode: ApprovalMode,
         agreement: Option<String>,
-        matcher_version: Option<String>,
         /// Whether they agreed.
         agreed: bool,
     },
@@ -370,7 +355,7 @@ pub enum Event {
         argv: Vec<String>,
         agent_intent: String,
         purpose: String,
-        assessment: Scope,
+        access_class: AccessClass,
     },
 }
 
@@ -684,7 +669,7 @@ struct ReadableDecision {
     argv: Vec<String>,
     agent_intent: String,
     purpose: String,
-    assessment: Scope,
+    access_class: AccessClass,
 }
 
 /// What this record has written, in order.
@@ -741,8 +726,7 @@ impl<C: Clock> Ledger<C> {
     /// disagreement about what ran resolvable.
     ///
     /// The decision and typed agent intent are consumed together. The decision
-    /// carries the session and classification, and the classification carries
-    /// the command, so trusted authorization facts cannot be transposed while
+    /// carries the session and command, so trusted authorization facts cannot be transposed while
     /// the separately provenanced agent explanation remains attached to that
     /// exact deliberation. Taking both by value keeps the count right too: one
     /// answer from the decision point is one recorded intent and one receipt,
@@ -754,12 +738,11 @@ impl<C: Clock> Ledger<C> {
         agent_intent: CommandIntent,
     ) -> Result<Intended, AuditError> {
         let session = decision.session();
-        let classification = decision.classification();
-        let command = classification.command();
+        let command = decision.command();
         let argv = command.argv().to_vec();
         let recorded_agent_intent = agent_intent.as_str().to_owned();
         let purpose = session.purpose.as_str().to_owned();
-        let assessment = classification.assessment();
+        let access_class = session.access_class;
         // The evaluation index is held before the ledger so retention and an
         // evaluator cannot observe the decision in only one of the two. This
         // is the same lock order used by evaluation append and sealing.
@@ -772,17 +755,12 @@ impl<C: Clock> Ledger<C> {
             Event::Decided {
                 argv: argv.clone(),
                 agent_intent: recorded_agent_intent.clone(),
-                program: classification.program().to_owned(),
-                subcommand: subcommand_of(classification),
-                assessment,
-                interpreter: classification.interpreter(),
-                grounds: classification.grounds().to_vec(),
-                catalog_version: classification.catalog_version().to_owned(),
+                program: command.program().to_owned(),
+                access_class,
                 // The session's own inputs to the answer. Without them the
                 // entry says what policy decided and not everything policy was
                 // told, so a reader cannot check the verdict against the facts.
                 purpose: purpose.clone(),
-                ceiling: session.scope,
                 verdict: decision.verdict(),
                 policies: decision.policies().to_vec(),
             },
@@ -795,7 +773,7 @@ impl<C: Clock> Ledger<C> {
                 argv,
                 agent_intent: recorded_agent_intent,
                 purpose,
-                assessment,
+                access_class,
             },
         );
 
@@ -844,11 +822,7 @@ impl<C: Clock> Ledger<C> {
         if decision.verdict() != Verdict::NeedsApproval {
             return Err(AuditError::NotHeldForApproval { sequence: decided });
         }
-        if grant.action()
-            != crate::approval::digest_of(
-                decision.classification().command(),
-                intended.agent_intent(),
-            )
+        if grant.action() != crate::approval::digest_of(decision.command(), intended.agent_intent())
         {
             return Err(AuditError::NotItsApproval { sequence: decided });
         }
@@ -863,16 +837,13 @@ impl<C: Clock> Ledger<C> {
         }
         self.this_deliberation(decided, grant.decided_digest(), &session.id)?;
 
-        let (approver, override_of, standing, mode, agreement, matcher_version) = match grant
-            .approver()
-        {
-            Approver::Human { who } => (who.clone(), None, false, ApprovalMode::Direct, None, None),
+        let (approver, override_of, standing, mode, agreement) = match grant.approver() {
+            Approver::Human { who } => (who.clone(), None, false, ApprovalMode::Direct, None),
             Approver::Override { who, because } => (
                 who.clone(),
                 Some(because.clone()),
                 false,
                 ApprovalMode::Override,
-                None,
                 None,
             ),
             Approver::SessionStanding { who, agreement } => (
@@ -881,19 +852,6 @@ impl<C: Clock> Ledger<C> {
                 true,
                 ApprovalMode::Session,
                 Some(agreement.as_str().to_owned()),
-                None,
-            ),
-            Approver::MatchingStanding {
-                who,
-                agreement,
-                matcher_version,
-            } => (
-                who.clone(),
-                None,
-                true,
-                ApprovalMode::Matching,
-                Some(agreement.as_str().to_owned()),
-                Some(matcher_version.clone()),
             ),
         };
         let entry = self.append(
@@ -906,7 +864,6 @@ impl<C: Clock> Ledger<C> {
                 standing,
                 mode,
                 agreement,
-                matcher_version,
             },
         )?;
         // The grant is spent here: it was taken by value, it does not copy, and
@@ -920,7 +877,7 @@ impl<C: Clock> Ledger<C> {
                     digest: entry.digest.clone(),
                     who: Attribution::of(session),
                 },
-                command: decision.classification().command().clone(),
+                command: decision.command().clone(),
             },
             approver,
         ))
@@ -980,15 +937,13 @@ impl<C: Clock> Ledger<C> {
     pub fn record_answer(&self, answer: &Answer) -> Result<Entry, AuditError> {
         let asked = answer.asked();
         self.this_deliberation(asked.decided, &asked.decided_digest, &asked.session)?;
-        let (who, override_of, standing, mode, agreement, matcher_version) = match answer.approver()
-        {
-            Approver::Human { who } => (who.clone(), None, false, ApprovalMode::Direct, None, None),
+        let (who, override_of, standing, mode, agreement) = match answer.approver() {
+            Approver::Human { who } => (who.clone(), None, false, ApprovalMode::Direct, None),
             Approver::Override { who, because } => (
                 who.clone(),
                 Some(because.clone()),
                 false,
                 ApprovalMode::Override,
-                None,
                 None,
             ),
             Approver::SessionStanding { who, agreement } => (
@@ -997,19 +952,6 @@ impl<C: Clock> Ledger<C> {
                 true,
                 ApprovalMode::Session,
                 Some(agreement.as_str().to_owned()),
-                None,
-            ),
-            Approver::MatchingStanding {
-                who,
-                agreement,
-                matcher_version,
-            } => (
-                who.clone(),
-                None,
-                true,
-                ApprovalMode::Matching,
-                Some(agreement.as_str().to_owned()),
-                Some(matcher_version.clone()),
             ),
         };
         self.append(
@@ -1022,7 +964,6 @@ impl<C: Clock> Ledger<C> {
                 standing,
                 mode,
                 agreement,
-                matcher_version,
                 agreed: answer.agreed(),
             },
         )
@@ -1137,7 +1078,7 @@ impl<C: Clock> Ledger<C> {
                 argv: decision.argv.clone(),
                 agent_intent: decision.agent_intent.clone(),
                 purpose: decision.purpose.clone(),
-                assessment: decision.assessment,
+                access_class: decision.access_class,
             },
         )?;
         evaluations.issued_ids.insert(id.clone());
@@ -1151,7 +1092,7 @@ impl<C: Clock> Ledger<C> {
             Attribution::of(session),
             Event::SessionOpened {
                 purpose: session.purpose.as_str().to_owned(),
-                scope: session.scope,
+                access_class: session.access_class,
             },
         )
     }
@@ -1476,17 +1417,6 @@ pub(crate) fn secret_shape(text: &str) -> Option<&'static str> {
         .map(|(_, what)| *what)
 }
 
-/// The subcommand the catalog recognised, read from the grounds it recorded.
-fn subcommand_of(classification: &Classification) -> Option<String> {
-    classification
-        .grounds()
-        .iter()
-        .find_map(|ground| match ground {
-            Ground::Subcommand { subcommand, .. } => Some(subcommand.clone()),
-            _ => None,
-        })
-}
-
 /// Whether the entry this authorization names belongs to this record.
 ///
 /// By digest, not by position. A position repeats — entry seven of one record
@@ -1631,7 +1561,6 @@ pub enum Broken {
 )]
 mod tests {
     use super::*;
-    use crate::catalog::Catalog;
     use crate::clock::TestClock;
     use crate::policy::Engine;
     use crate::run::{Limits, RunState, Runs, Stream};
@@ -1643,8 +1572,7 @@ mod tests {
         grace: 5_000,
     };
 
-    /// A session whose ceiling lets privileged work be held for a human rather
-    /// than refused outright, which is what a decision about an agreement needs.
+    /// A privileged account subject to the fixture's local review setting.
     fn session_that_can_be_asked_about() -> Session {
         SessionStore::new(TestClock::at(1_000), LIFETIME, 8)
             .open(
@@ -1652,7 +1580,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("readonly").unwrap(),
                 Purpose::parse("restart the proxy after the config change").unwrap(),
-                Scope::Privileged,
+                AccessClass::Privileged,
             )
             .expect("within the per-principal limit")
     }
@@ -1664,7 +1592,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("readonly").unwrap(),
                 Purpose::parse("find out why the deploy did not take effect").unwrap(),
-                Scope::Read,
+                AccessClass::ReadOnly,
             )
             .expect("within the per-principal limit")
     }
@@ -1690,12 +1618,8 @@ mod tests {
         session: &Session,
         argv: &[&str],
     ) -> Option<Receipt> {
-        let catalog = Catalog::builtin().unwrap();
-        let classification = catalog.classify(&command(argv));
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(session, classification)
-            .unwrap();
+        let decision =
+            Engine::new(crate::policy::ReviewMode::Privileged).decide(session, command(argv));
         ledger.record_intent(decision, intent()).unwrap().receipt
     }
 
@@ -1787,21 +1711,18 @@ mod tests {
         assert_eq!(entry.session, session.id);
     }
 
-    /// A refusal is worth recording and authorizes nothing. Minting a receipt
-    /// for one would turn the record of a refusal into permission to run the
-    /// command it refused.
+    /// A held decision must be recorded without authorizing execution.
     #[test]
-    fn a_refusal_is_recorded_and_authorizes_nothing() {
+    fn a_held_decision_is_recorded_and_authorizes_nothing() {
         let ledger = ledger();
-        let session = session();
-        // Privileged work in a session opened for reading: refused.
+        let session = session_that_can_be_asked_about();
         let refused = recorded_decision(&ledger, &session, &["docker", "exec", "web", "ls"]);
         assert!(refused.is_none(), "a refusal handed back permission to run");
 
         let Event::Decided { verdict, .. } = &ledger.entries()[0].event else {
             panic!("the refusal was not recorded");
         };
-        assert_eq!(*verdict, Verdict::Deny);
+        assert_eq!(*verdict, Verdict::NeedsApproval);
     }
 
     /// A receipt names the whole of what was authorized. Anything it left out
@@ -1924,9 +1845,9 @@ mod tests {
         const CALLERS: usize = 16;
         let ready = std::sync::Barrier::new(CALLERS);
         let wrote = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        std::thread::scope(|threads| {
             for _ in 0..CALLERS {
-                scope.spawn(|| {
+                threads.spawn(|| {
                     let outcome = outcome_for(&receipt, "ok");
                     ready.wait();
                     if ledger.record_outcome(outcome).is_ok() {
@@ -1989,16 +1910,21 @@ mod tests {
         assert_ne!(completion.entry.session, theirs.id);
     }
 
-    /// A refusal did not authorize anything, so nothing can complete against
-    /// it. Otherwise a transcript could show a command running on the record of
-    /// the decision that refused it.
+    /// A held decision cannot be used as a completed run's authorization.
     #[test]
-    fn nothing_completes_against_a_refusal() {
+    fn nothing_completes_against_an_unapproved_decision() {
         let ledger = ledger();
-        let session = session();
-        // Privileged work in a session opened for reading: refused.
+        let session = session_that_can_be_asked_about();
         assert!(recorded_decision(&ledger, &session, &["docker", "exec", "web", "ls"]).is_none());
-        let permitted = recorded_run(&ledger, &session, &["docker", "ps"]);
+        let permitted = ledger
+            .record_intent(
+                Engine::new(crate::policy::ReviewMode::Disabled)
+                    .decide(&session, command(&["docker", "ps"])),
+                intent(),
+            )
+            .unwrap()
+            .receipt
+            .unwrap();
 
         let refusal = ledger.entries()[0].digest.clone();
         let err = ledger
@@ -2017,15 +1943,13 @@ mod tests {
     fn an_agreement_is_only_recorded_against_a_decision_that_asked_for_one() {
         let ledger = ledger();
         let session = session();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
 
         // A command policy permitted outright needs nobody's agreement, and
         // recording one would put a human's name against a choice they were
         // never asked to make.
-        let permitted = engine
-            .decide(&session, catalog.classify(&command(&["docker", "ps"])))
-            .unwrap();
+        let permitted = engine.decide(&session, (command(&["docker", "ps"])).clone());
         let entry = ledger.record_intent(permitted, intent()).unwrap();
         let grant = Grant::granted_for(
             crate::approval::RequestId::from_raw("a-request"),
@@ -2033,10 +1957,7 @@ mod tests {
             Approver::Human {
                 who: "chris".to_owned(),
             },
-            crate::approval::digest_of(
-                entry.decision.classification().command(),
-                entry.agent_intent(),
-            ),
+            crate::approval::digest_of(entry.decision.command(), entry.agent_intent()),
             entry.entry.sequence,
             entry.entry.digest.as_str().to_owned(),
         );
@@ -2055,9 +1976,7 @@ mod tests {
     #[test]
     fn a_held_decision_authorizes_nothing_until_somebody_agrees() {
         let ledger = ledger();
-        let session = session();
-        // Privileged work in a session opened for reading is refused outright;
-        // work that needs a human is held instead.
+        let session = session_that_can_be_asked_about();
         let held = recorded_decision(&ledger, &session, &["systemctl", "restart", "nginx"]);
         assert!(
             held.is_none(),
@@ -2072,19 +1991,15 @@ mod tests {
     #[test]
     fn an_agreement_cannot_be_spent_on_a_command_it_was_not_given_for() {
         let ledger = ledger();
-        // A ceiling that lets the command be held rather than refused outright:
-        // a decision nobody was asked about is a different test.
         let session = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
 
         // A decision that was held for a human, about one command.
-        let held = engine
-            .decide(
-                &session,
-                catalog.classify(&command(&["systemctl", "restart", "nginx"])),
-            )
-            .unwrap();
+        let held = engine.decide(
+            &session,
+            (command(&["systemctl", "restart", "nginx"])).clone(),
+        );
         let entry = ledger.record_intent(held, intent()).unwrap();
 
         // An agreement given for a different one.
@@ -2121,17 +2036,17 @@ mod tests {
         let ledger = ledger();
         let mine = session_that_can_be_asked_about();
         let theirs = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
-        let restart = catalog.classify(&command(&["systemctl", "restart", "nginx"]));
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
+        let restart = (command(&["systemctl", "restart", "nginx"])).clone();
 
         // The same command held for two people. Their deliberation is recorded
         // first, so the agreement about it names a real entry of this record.
         let held_for_them = ledger
-            .record_intent(engine.decide(&theirs, restart.clone()).unwrap(), intent())
+            .record_intent(engine.decide(&theirs, restart.clone()), intent())
             .unwrap();
         let held_for_me = ledger
-            .record_intent(engine.decide(&mine, restart).unwrap(), intent())
+            .record_intent(engine.decide(&mine, restart), intent())
             .unwrap();
 
         // An agreement about their deliberation, presented alongside mine.
@@ -2144,7 +2059,7 @@ mod tests {
                 who: "chris".to_owned(),
             },
             crate::approval::digest_of(
-                held_for_them.decision.classification().command(),
+                held_for_them.decision.command(),
                 held_for_them.agent_intent(),
             ),
             held_for_them.entry.sequence,
@@ -2169,27 +2084,24 @@ mod tests {
     fn an_agreement_cannot_name_an_entry_that_asked_nobody() {
         let ledger = ledger();
         let session = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
 
         // Two entries of the same session: one policy permitted outright, one
         // it held for a person.
         let permitted = ledger
             .record_intent(
-                engine
-                    .decide(&session, catalog.classify(&command(&["docker", "ps"])))
-                    .unwrap(),
+                Engine::new(crate::policy::ReviewMode::Disabled)
+                    .decide(&session, command(&["docker", "ps"])),
                 intent(),
             )
             .unwrap();
         let held = ledger
             .record_intent(
-                engine
-                    .decide(
-                        &session,
-                        catalog.classify(&command(&["systemctl", "restart", "nginx"])),
-                    )
-                    .unwrap(),
+                engine.decide(
+                    &session,
+                    (command(&["systemctl", "restart", "nginx"])).clone(),
+                ),
                 intent(),
             )
             .unwrap();
@@ -2202,10 +2114,7 @@ mod tests {
             Approver::Human {
                 who: "chris".to_owned(),
             },
-            crate::approval::digest_of(
-                held.decision.classification().command(),
-                held.agent_intent(),
-            ),
+            crate::approval::digest_of(held.decision.command(), held.agent_intent()),
             permitted.entry.sequence,
             permitted.entry.digest.as_str().to_owned(),
         );
@@ -2219,86 +2128,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn matching_answers_record_the_agreement_and_matcher_provenance() {
-        let ledger = ledger();
-        let session = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let classification = catalog.classify(&command(&["systemctl", "restart", "unbound"]));
-        let matching = crate::approval::MatchingWork::from_classification(&classification)
-            .expect("systemctl restart is matchable");
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(&session, classification)
-            .unwrap();
-        let intended = ledger.record_intent(decision, intent()).unwrap();
-        let request = crate::approval::RequestId::from_raw("a-request");
-        let agreement =
-            crate::approval::AgreementId::parse("0123456789abcdef0123456789abcdef").unwrap();
-        let approver = Approver::MatchingStanding {
-            who: "chris".to_owned(),
-            agreement: agreement.clone(),
-            matcher_version: crate::approval::MatchingWork::VERSION.to_owned(),
-        };
-        let asked = Asked {
-            id: request.clone(),
-            session: session.id.clone(),
-            principal: session.principal.clone(),
-            host: session.host.clone(),
-            role: session.role.clone(),
-            purpose: session.purpose.clone(),
-            scope: session.scope,
-            command: intended.decision.classification().command().argv().to_vec(),
-            agent_intent: intended.agent_intent().clone(),
-            decided: intended.entry.sequence,
-            decided_digest: intended.entry.digest.as_str().to_owned(),
-            assessment: intended.decision.classification().assessment(),
-            matching: Some(matching),
-            why: intended.decision.explanation().to_owned(),
-            asked_at: 1_000,
-            decide_by: 2_000,
-        };
-
-        let answered = ledger
-            .record_answer(&Answer::answered_for(asked, approver.clone(), true))
-            .unwrap();
-        assert!(matches!(
-            answered.event,
-            Event::Answered {
-                mode: ApprovalMode::Matching,
-                agreement: Some(ref recorded),
-                matcher_version: Some(ref version),
-                ..
-            } if recorded == agreement.as_str()
-                && version == crate::approval::MatchingWork::VERSION
-        ));
-
-        let grant = Grant::granted_for(
-            request,
-            session.id.clone(),
-            approver.clone(),
-            crate::approval::digest_of(
-                intended.decision.classification().command(),
-                intended.agent_intent(),
-            ),
-            intended.entry.sequence,
-            intended.entry.digest.as_str().to_owned(),
-        );
-        let (_receipt, recorded_approver) = ledger.record_approval(&intended, grant).unwrap();
-        assert_eq!(recorded_approver, approver);
-        assert!(matches!(
-            ledger.entries().last().map(|entry| &entry.event),
-            Some(Event::Approved {
-                mode: ApprovalMode::Matching,
-                agreement: Some(recorded),
-                matcher_version: Some(version),
-                ..
-            }) if recorded == agreement.as_str()
-                && version == crate::approval::MatchingWork::VERSION
-        ));
-        assert!(ledger.verify().is_ok());
-    }
-
     /// The trail of who answered what is worth what it can be checked against.
     /// An answer naming an entry that never asked for a person would make the
     /// record say somebody decided about a deliberation that never happened.
@@ -2306,14 +2135,11 @@ mod tests {
     fn an_answer_cannot_name_a_deliberation_that_never_asked() {
         let ledger = ledger();
         let session = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
 
         let permitted = ledger
             .record_intent(
-                engine
-                    .decide(&session, catalog.classify(&command(&["docker", "ps"])))
-                    .unwrap(),
+                Engine::new(crate::policy::ReviewMode::Disabled)
+                    .decide(&session, command(&["docker", "ps"])),
                 intent(),
             )
             .unwrap();
@@ -2325,13 +2151,11 @@ mod tests {
             host: session.host.clone(),
             role: session.role.clone(),
             purpose: session.purpose.clone(),
-            scope: session.scope,
+            access_class: session.access_class,
             command: vec!["systemctl".to_owned(), "restart".to_owned()],
             agent_intent: intent(),
             decided: permitted.entry.sequence,
             decided_digest: permitted.entry.digest.as_str().to_owned(),
-            assessment: Scope::Privileged,
-            matching: None,
             why: "held for a test".to_owned(),
             asked_at: 1_000,
             decide_by: 2_000,
@@ -2369,15 +2193,15 @@ mod tests {
         let ledger = ledger();
         let mine = session_that_can_be_asked_about();
         let theirs = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
-        let restart = catalog.classify(&command(&["systemctl", "restart", "nginx"]));
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
+        let restart = (command(&["systemctl", "restart", "nginx"])).clone();
 
         let held_for_them = ledger
-            .record_intent(engine.decide(&theirs, restart.clone()).unwrap(), intent())
+            .record_intent(engine.decide(&theirs, restart.clone()), intent())
             .unwrap();
         let held_for_me = ledger
-            .record_intent(engine.decide(&mine, restart).unwrap(), intent())
+            .record_intent(engine.decide(&mine, restart), intent())
             .unwrap();
 
         // Their deliberation is retired, keeping only its digest.
@@ -2390,7 +2214,7 @@ mod tests {
                 who: "chris".to_owned(),
             },
             crate::approval::digest_of(
-                held_for_them.decision.classification().command(),
+                held_for_them.decision.command(),
                 held_for_them.agent_intent(),
             ),
             held_for_them.entry.sequence,
@@ -2414,17 +2238,15 @@ mod tests {
     fn an_agreement_naming_the_wrong_entry_is_refused() {
         let ledger = ledger();
         let session = session_that_can_be_asked_about();
-        let catalog = Catalog::builtin().unwrap();
-        let engine = Engine::builtin().unwrap();
+
+        let engine = Engine::new(crate::policy::ReviewMode::Privileged);
 
         let held = ledger
             .record_intent(
-                engine
-                    .decide(
-                        &session,
-                        catalog.classify(&command(&["systemctl", "restart", "nginx"])),
-                    )
-                    .unwrap(),
+                engine.decide(
+                    &session,
+                    (command(&["systemctl", "restart", "nginx"])).clone(),
+                ),
                 intent(),
             )
             .unwrap();
@@ -2435,10 +2257,7 @@ mod tests {
             Approver::Human {
                 who: "chris".to_owned(),
             },
-            crate::approval::digest_of(
-                held.decision.classification().command(),
-                held.agent_intent(),
-            ),
+            crate::approval::digest_of(held.decision.command(), held.agent_intent()),
             held.entry.sequence,
             "not the digest of that entry".to_owned(),
         );
@@ -2580,11 +2399,7 @@ mod tests {
         );
     }
 
-    /// The entry has to carry what produced the decision, or a later reader
-    /// cannot tell why it went the way it did - especially once the catalog has
-    /// moved on. Policy is asked about a command *in a session*, so the
-    /// session's own inputs belong here too: an entry naming only what the
-    /// command is cannot be checked against the answer it got.
+    /// A decision records its command and configured account context.
     #[test]
     fn a_decision_records_the_facts_behind_it() {
         let ledger = ledger();
@@ -2592,26 +2407,17 @@ mod tests {
         recorded_run(&ledger, &session, &["docker", "ps"]);
 
         let Event::Decided {
-            subcommand,
-            interpreter,
-            grounds,
-            catalog_version,
+            argv,
             purpose,
-            ceiling,
+            access_class,
             ..
         } = &ledger.entries()[0].event
         else {
             panic!("expected a decision");
         };
-        assert_eq!(subcommand.as_deref(), Some("ps"));
-        assert!(!interpreter);
-        assert!(!grounds.is_empty(), "the reasons were not recorded");
-        assert!(
-            !catalog_version.is_empty(),
-            "the catalog that decided is not named"
-        );
+        assert_eq!(argv, &["docker", "ps"]);
         assert_eq!(purpose, session.purpose.as_str());
-        assert_eq!(*ceiling, session.scope);
+        assert_eq!(*access_class, session.access_class);
     }
 
     /// What happened joins to what was decided. Reading a transcript by
@@ -2893,7 +2699,7 @@ mod tests {
             argv,
             agent_intent,
             purpose,
-            assessment,
+            access_class,
             ..
         } = &recorded.event
         else {
@@ -2903,7 +2709,7 @@ mod tests {
         assert_eq!(argv, &["docker", "ps"]);
         assert_eq!(agent_intent, "exercise the recorded command");
         assert_eq!(purpose, "find out why the deploy did not take effect");
-        assert_eq!(*assessment, Scope::Read);
+        assert_eq!(*access_class, AccessClass::ReadOnly);
         assert_eq!(ledger.verify().unwrap().entries, 2);
 
         let retried = ledger.record_evaluation(artifact.clone()).unwrap();

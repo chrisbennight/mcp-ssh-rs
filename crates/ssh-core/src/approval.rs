@@ -13,9 +13,8 @@
 //! - A grant is bound to **one exact argument vector**. A different command
 //!   cannot be substituted under an approval a human gave for this one.
 //! - A grant redeems **once**. A second attempt is refused.
-//! - A grant **expires**. Approval that accumulated into a standing permission
-//!   would be indistinguishable from having raised the ceiling, which is what
-//!   the session's declared scope exists to prevent.
+//! - A grant **expires**. Standing session approvals have their own explicit,
+//!   bounded lifetime and can be revoked.
 //!
 //! # Break-glass
 //!
@@ -33,12 +32,11 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::audit::Intended;
-use crate::catalog::Classification;
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandIntent};
 use crate::policy::Verdict;
 use crate::session::{Purpose, SessionId};
-use crate::{HostId, PrincipalId, RoleId, Scope};
+use crate::{AccessClass, HostId, PrincipalId, RoleId};
 
 /// Opaque handle to an approval request.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -124,71 +122,6 @@ fn new_identifier() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The deterministic family a matching agreement may answer for.
-///
-/// This is deliberately narrower than "similar": the same live session fixes
-/// principal, host, role, purpose, and ceiling; the same catalog version,
-/// identified non-interpreter program and subcommand fix what vocabulary was
-/// understood; and a later assessment may not exceed the one the operator saw.
-/// Arguments remain visible in each audit entry, but v1 does not claim to infer
-/// resource selectors from untyped command operands.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct MatchingWork {
-    matcher_version: String,
-    catalog_version: String,
-    program: String,
-    subcommand: String,
-    max_assessment: Scope,
-}
-
-impl MatchingWork {
-    pub const VERSION: &'static str = "catalog-family-v1";
-
-    #[must_use]
-    pub fn from_classification(classification: &Classification) -> Option<Self> {
-        if !classification.identified() || classification.interpreter() {
-            return None;
-        }
-        Some(Self {
-            matcher_version: Self::VERSION.to_owned(),
-            catalog_version: classification.catalog_version().to_owned(),
-            program: classification.program().to_owned(),
-            subcommand: classification.subcommand()?.to_owned(),
-            max_assessment: classification.assessment(),
-        })
-    }
-
-    #[must_use]
-    pub fn matches(&self, classification: &Classification) -> bool {
-        classification.identified()
-            && !classification.interpreter()
-            && classification.catalog_version() == self.catalog_version
-            && classification.program() == self.program
-            && classification.subcommand() == Some(self.subcommand.as_str())
-            && classification.assessment() <= self.max_assessment
-    }
-
-    #[must_use]
-    pub fn matcher_version(&self) -> &str {
-        &self.matcher_version
-    }
-
-    #[must_use]
-    pub fn program(&self) -> &str {
-        &self.program
-    }
-
-    #[must_use]
-    pub fn subcommand(&self) -> &str {
-        &self.subcommand
-    }
-
-    #[must_use]
-    pub const fn max_assessment(&self) -> Scope {
-        self.max_assessment
-    }
-}
-
 /// Who agreed.
 ///
 /// One field for both, so that an override is recorded in exactly the place a
@@ -207,12 +140,6 @@ pub enum Approver {
     /// command somebody clicked for from one their standing answer covered,
     /// in the same place they already look for the approver.
     SessionStanding { who: String, agreement: AgreementId },
-    /// A person's standing agreement for one deterministic work family.
-    MatchingStanding {
-        who: String,
-        agreement: AgreementId,
-        matcher_version: String,
-    },
 }
 
 impl Approver {
@@ -224,9 +151,7 @@ impl Approver {
     /// discovered later by somebody reading the log.
     fn is_stated(&self) -> bool {
         match self {
-            Self::Human { who }
-            | Self::SessionStanding { who, .. }
-            | Self::MatchingStanding { who, .. } => !who.trim().is_empty(),
+            Self::Human { who } | Self::SessionStanding { who, .. } => !who.trim().is_empty(),
             Self::Override { who, because } => !who.trim().is_empty() && !because.trim().is_empty(),
         }
     }
@@ -251,7 +176,7 @@ pub struct Asked {
     pub host: HostId,
     pub role: RoleId,
     pub purpose: Purpose,
-    pub scope: Scope,
+    pub access_class: AccessClass,
     /// The exact command, as an argument vector.
     pub command: Vec<String>,
     /// The calling agent's own explanation. It is evidence, not trusted user
@@ -262,15 +187,7 @@ pub struct Asked {
     /// That entry's digest, so an agreement can be checked against the entry
     /// itself rather than against a position anything could name.
     pub decided_digest: String,
-    /// What classification made of it, in the words a policy saw.
-    pub assessment: Scope,
-    /// The deterministic family an operator may let this answer stand for.
-    ///
-    /// Absent when catalog facts cannot safely define the v1 matcher.
-    pub matching: Option<MatchingWork>,
-    /// Why the command waits, in the decision's own words - which for a
-    /// command the catalog could not identify is what it could not read. The
-    /// approver decides from this page alone, so the reason has to be on it.
+    /// Why local review is required for this account.
     pub why: String,
     pub asked_at: Millis,
     pub decide_by: Millis,
@@ -533,8 +450,6 @@ pub struct Windows {
 pub enum StandingCoverage {
     /// Every held command in the session.
     Session,
-    /// Only commands inside a deterministic catalog family and risk bound.
-    Matching { work: MatchingWork },
 }
 
 /// A human's standing agreement for one session, as the store keeps it.
@@ -586,10 +501,7 @@ impl<C: Clock> Approvals<C> {
 
     /// Records an individually revocable standing agreement.
     ///
-    /// A newer agreement replaces one for the same slot: one session-wide
-    /// answer, or one matching answer for a program/subcommand family. This
-    /// avoids overlapping agreements whose provenance would depend on map
-    /// iteration order.
+    /// A newer agreement replaces the previous agreement for the session.
     pub fn grant_standing(
         &self,
         session: &SessionId,
@@ -607,65 +519,10 @@ impl<C: Clock> Approvals<C> {
         };
         let now = self.clock.now();
         let mut standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
-        standing.retain(|_, existing| {
-            now < existing.until
-                && (existing.session != agreement.session
-                    || !same_coverage_slot(&existing.coverage, &agreement.coverage))
-        });
+        standing
+            .retain(|_, existing| now < existing.until && existing.session != agreement.session);
         standing.insert(id.as_str().to_owned(), agreement);
         id
-    }
-
-    /// Uses the narrowest standing agreement that answers this classification.
-    ///
-    /// Selection, expiry, and the supplied operation are serialized with
-    /// withdrawal. A withdrawal that returns has therefore either won before
-    /// this use, or followed a use that already turned the standing answer
-    /// into an exact, single-use grant. The operation must not call a method
-    /// that locks the standing-agreement store again.
-    #[must_use]
-    pub(crate) fn use_standing<R>(
-        &self,
-        session: &SessionId,
-        classification: &Classification,
-        use_approval: impl FnOnce(Approver) -> R,
-    ) -> Option<R> {
-        let standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
-        let now = self.clock.now();
-        let matching = standing.values().find(|agreement| {
-            agreement.session == *session
-                && now < agreement.until
-                && matches!(
-                    &agreement.coverage,
-                    StandingCoverage::Matching { work } if work.matches(classification)
-                )
-        });
-        let approver = if let Some(agreement) = matching
-            && let StandingCoverage::Matching { work } = &agreement.coverage
-        {
-            Some(Approver::MatchingStanding {
-                who: agreement.who.clone(),
-                agreement: agreement.id.clone(),
-                matcher_version: work.matcher_version().to_owned(),
-            })
-        } else {
-            standing
-                .values()
-                .find(|agreement| {
-                    agreement.session == *session
-                        && now < agreement.until
-                        && matches!(agreement.coverage, StandingCoverage::Session)
-                })
-                .map(|agreement| Approver::SessionStanding {
-                    who: agreement.who.clone(),
-                    agreement: agreement.id.clone(),
-                })
-        };
-        let result = use_approval(approver?);
-        // Explicit: non-lexical lifetimes must not release the lock before the
-        // operation that turns this standing answer into a one-shot grant.
-        drop(standing);
-        Some(result)
     }
 
     /// Withdraws one standing agreement, saying whether there was one.
@@ -678,6 +535,25 @@ impl<C: Clock> Approvals<C> {
             .unwrap_or_else(|e| e.into_inner())
             .remove(agreement.as_str())
             .is_some()
+    }
+
+    /// Holds session agreement selection and redemption against withdrawal.
+    pub(crate) fn use_standing<R>(
+        &self,
+        session: &SessionId,
+        use_approval: impl FnOnce(Approver) -> R,
+    ) -> Option<R> {
+        let standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.now();
+        let agreement = standing
+            .values()
+            .find(|agreement| agreement.session == *session && now < agreement.until)?;
+        let result = use_approval(Approver::SessionStanding {
+            who: agreement.who.clone(),
+            agreement: agreement.id.clone(),
+        });
+        drop(standing);
+        Some(result)
     }
 
     /// The standing agreements still answering, for the surface that shows
@@ -694,25 +570,6 @@ impl<C: Clock> Approvals<C> {
             .collect()
     }
 
-    /// Returns the matcher attached to a still-waiting request.
-    pub fn matching_for(&self, request: &RequestId) -> Result<MatchingWork, ApprovalError> {
-        let now = self.clock.now();
-        let requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
-        let held = requests
-            .get(request.as_str())
-            .ok_or(ApprovalError::Unknown)?;
-        if !matches!(held.state, State::Waiting) {
-            return Err(ApprovalError::AlreadyDecided);
-        }
-        if now >= held.asked.decide_by {
-            return Err(ApprovalError::Lapsed);
-        }
-        held.asked
-            .matching
-            .clone()
-            .ok_or(ApprovalError::NotMatchable)
-    }
-
     /// Records that a command is waiting for a human.
     ///
     /// Returns the existing request when this session has already asked about
@@ -724,9 +581,7 @@ impl<C: Clock> Approvals<C> {
             return Err(ApprovalError::NotHeld);
         }
         let session = held.decision().session();
-        let command = held.decision().classification().command();
-        let assessment = held.decision().classification().assessment();
-        let matching = MatchingWork::from_classification(held.decision().classification());
+        let command = held.decision().command();
         let why = held.decision().explanation().to_owned();
         let agent_intent = held.agent_intent().clone();
         // Taken from the entry rather than from a caller, so a request cannot
@@ -857,13 +712,11 @@ impl<C: Clock> Approvals<C> {
             host: session.host.clone(),
             role: session.role.clone(),
             purpose: session.purpose.clone(),
-            scope: session.scope,
+            access_class: session.access_class,
             command: command.argv().to_vec(),
             agent_intent,
             decided,
             decided_digest,
-            assessment,
-            matching,
             why,
             asked_at: now,
             decide_by: now.saturating_add(self.windows.decide_within),
@@ -1187,20 +1040,6 @@ pub enum ApprovalError {
     NotHeld,
     #[error("too many commands from this session are already waiting for a human")]
     TooManyWaiting,
-    #[error("this request does not have a deterministic matching-work envelope")]
-    NotMatchable,
-}
-
-fn same_coverage_slot(left: &StandingCoverage, right: &StandingCoverage) -> bool {
-    match (left, right) {
-        (StandingCoverage::Session, StandingCoverage::Session) => true,
-        (StandingCoverage::Matching { work: left }, StandingCoverage::Matching { work: right }) => {
-            left.catalog_version == right.catalog_version
-                && left.program == right.program
-                && left.subcommand == right.subcommand
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -1213,7 +1052,6 @@ fn same_coverage_slot(left: &StandingCoverage, right: &StandingCoverage) -> bool
 mod tests {
     use super::*;
     use crate::audit::Ledger;
-    use crate::catalog::Catalog;
     use crate::clock::TestClock;
     use crate::policy::Engine;
     use crate::session::{Lifetime, Session, SessionStore};
@@ -1240,7 +1078,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("operator").unwrap(),
                 Purpose::parse("restart traefik after the config change").unwrap(),
-                Scope::Mutate,
+                AccessClass::Privileged,
             )
             .unwrap()
     }
@@ -1300,10 +1138,8 @@ mod tests {
     /// picked out by hand is exactly what these tests must not be able to set
     /// up when production cannot.
     fn held(session: &Session, command: &Command) -> crate::audit::Intended {
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(session, Catalog::builtin().unwrap().classify(command))
-            .unwrap();
+        let decision =
+            Engine::new(crate::policy::ReviewMode::Privileged).decide(session, (command).clone());
         assert_eq!(
             decision.verdict(),
             Verdict::NeedsApproval,
@@ -1603,7 +1439,7 @@ mod tests {
         );
         assert_eq!(asked.command, ["docker", "restart", "traefik"]);
         assert_eq!(asked.agent_intent.as_str(), "exercise the approval flow");
-        assert_eq!(asked.assessment, Scope::Mutate);
+        assert_eq!(asked.access_class, AccessClass::Privileged);
         assert_eq!(approvals.waiting(|_| true).len(), 1);
     }
 
@@ -1764,8 +1600,7 @@ mod tests {
         }
     }
 
-    /// Approvals expire rather than accumulating. An approval that stayed
-    /// redeemable would be indistinguishable from having raised the ceiling.
+    /// An expired approval cannot authorize execution.
     #[test]
     fn an_approval_expires_rather_than_becoming_standing_privilege() {
         let approvals = approvals();
@@ -1857,10 +1692,8 @@ mod tests {
         let command = command(&["docker", "restart", "traefik"]);
 
         let first = asking(&approvals, &session, &command);
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-            .unwrap();
+        let decision =
+            Engine::new(crate::policy::ReviewMode::Privileged).decide(&session, (command).clone());
         let changed = Ledger::new(TestClock::at(1_000))
             .record_intent(
                 decision,
@@ -1963,92 +1796,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn matching_agreements_are_deterministic_narrow_and_individually_revocable() {
-        let approvals = approvals();
-        let mine = session("agent-a");
-        let theirs = session("agent-b");
-        let catalog = Catalog::builtin().unwrap();
-        let unmatchable = asking(&approvals, &mine, &command(&["journalctl", "--rotate"]));
-        assert_eq!(
-            approvals.matching_for(&unmatchable.id),
-            Err(ApprovalError::NotMatchable),
-            "an unmatchable forged form would degrade into approve-once"
-        );
-        let reviewed = catalog.classify(&command(&["docker", "restart", "traefik"]));
-        let work = MatchingWork::from_classification(&reviewed).expect("restart is matchable");
-        let matching_id = approvals.grant_standing(
-            &mine.id,
-            "chris".to_owned(),
-            10_000,
-            StandingCoverage::Matching { work },
-        );
-        let session_id = approvals.grant_standing(
-            &mine.id,
-            "chris".to_owned(),
-            10_000,
-            StandingCoverage::Session,
-        );
-
-        let same_family = catalog.classify(&command(&["docker", "restart", "postgres"]));
-        assert_eq!(
-            approvals.use_standing(&mine.id, &same_family, std::convert::identity),
-            Some(Approver::MatchingStanding {
-                who: "chris".to_owned(),
-                agreement: matching_id.clone(),
-                matcher_version: MatchingWork::VERSION.to_owned(),
-            }),
-            "the narrower matching agreement did not supply provenance"
-        );
-
-        let other_family = catalog.classify(&command(&["systemctl", "restart", "unbound"]));
-        assert_eq!(
-            approvals.use_standing(&mine.id, &other_family, std::convert::identity),
-            Some(Approver::SessionStanding {
-                who: "chris".to_owned(),
-                agreement: session_id.clone(),
-            }),
-            "a different family matched the narrower agreement"
-        );
-        assert_eq!(
-            approvals.use_standing(&theirs.id, &same_family, std::convert::identity),
-            None,
-            "an agreement crossed sessions"
-        );
-
-        assert!(approvals.revoke_standing(&matching_id));
-        assert_eq!(
-            approvals.use_standing(&mine.id, &same_family, std::convert::identity),
-            Some(Approver::SessionStanding {
-                who: "chris".to_owned(),
-                agreement: session_id.clone(),
-            }),
-            "revoking matching work also revoked or hid the session safety valve"
-        );
-        assert!(approvals.revoke_standing(&session_id));
-        assert_eq!(
-            approvals.use_standing(&mine.id, &same_family, std::convert::identity),
-            None
-        );
-
-        assert!(
-            MatchingWork::from_classification(&catalog.classify(&command(&[
-                "sh",
-                "-c",
-                "echo unbounded"
-            ])))
-            .is_none(),
-            "an interpreter was offered as deterministic matching work"
-        );
-        assert!(
-            MatchingWork::from_classification(
-                &catalog.classify(&command(&["not-in-the-catalog", "restart"]))
-            )
-            .is_none(),
-            "an unidentified command was offered as deterministic matching work"
-        );
-    }
-
     /// Withdrawal and standing use have one ordering: if use wins, it becomes
     /// an exact one-shot grant before withdrawal can return; if withdrawal
     /// wins, no later use can see the agreement.
@@ -2056,9 +1803,6 @@ mod tests {
     fn standing_use_holds_the_withdrawal_boundary_until_it_finishes() {
         let approvals = Arc::new(approvals());
         let mine = session("agent-a");
-        let classification = Catalog::builtin()
-            .unwrap()
-            .classify(&command(&["docker", "restart", "postgres"]));
         let agreement = approvals.grant_standing(
             &mine.id,
             "chris".to_owned(),
@@ -2066,12 +1810,11 @@ mod tests {
             StandingCoverage::Session,
         );
         let session = mine.id.clone();
-        let classification_for_use = classification.clone();
         let using = Arc::clone(&approvals);
         let (entered, wait_until_released) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let use_thread = std::thread::spawn(move || {
-            using.use_standing(&session, &classification_for_use, |approver| {
+            using.use_standing(&session, |approver| {
                 entered.send(()).unwrap();
                 released.recv().unwrap();
                 approver
@@ -2088,7 +1831,7 @@ mod tests {
 
         assert!(approvals.revoke_standing(&agreement));
         assert_eq!(
-            approvals.use_standing(&mine.id, &classification, std::convert::identity),
+            approvals.use_standing(&mine.id, std::convert::identity),
             None,
             "an agreement remained usable after withdrawal returned"
         );
@@ -2105,9 +1848,6 @@ mod tests {
             WAITING_PER_SESSION,
         ));
         let mine = session("agent-a");
-        let classification = Catalog::builtin()
-            .unwrap()
-            .classify(&command(&["docker", "restart", "postgres"]));
         approvals.grant_standing(
             &mine.id,
             "chris".to_owned(),
@@ -2120,10 +1860,8 @@ mod tests {
         clock.arm(Arc::clone(&entered), Arc::clone(&release));
         let using = Arc::clone(&approvals);
         let session = mine.id.clone();
-        let classification_for_use = classification.clone();
-        let use_thread = std::thread::spawn(move || {
-            using.use_standing(&session, &classification_for_use, std::convert::identity)
-        });
+        let use_thread =
+            std::thread::spawn(move || using.use_standing(&session, std::convert::identity));
 
         entered.wait();
         let expiry_read_holds_the_boundary = approvals.standing.try_lock().is_err();

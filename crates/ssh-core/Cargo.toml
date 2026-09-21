@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 aws-lc-rs = { workspace = true }
-cedar-policy = { workspace = true }
 nix = { version = "0.31.3", features = ["time"] }
 rand = { workspace = true }
 rsa = { workspace = true }

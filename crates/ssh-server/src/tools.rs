@@ -37,7 +37,7 @@ use ssh_core::connect::{ConnectError, CredentialSource};
 use ssh_core::mediate::{Bastion, Executed, MediationError};
 use ssh_core::run::RunId;
 use ssh_core::session::{Purpose, SessionId};
-use ssh_core::{HostId, RoleId, Scope};
+use ssh_core::{HostId, RoleId};
 
 use crate::mcp::AuthenticatedPrincipal;
 
@@ -64,11 +64,6 @@ pub struct OpenSessionArgs {
     /// A human may be asked to approve work in this session, and this is what
     /// they are shown. "Investigating" is not a purpose.
     pub purpose: String,
-    /// The most privileged class of work this session may perform.
-    ///
-    /// A ceiling, not a grant: every command is still decided individually, and
-    /// asking for more than the work needs makes approval harder, not easier.
-    pub scope: ScopeArg,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -92,24 +87,6 @@ impl From<ssh_core::AccessClass> for AccessClassArg {
         match value {
             ssh_core::AccessClass::ReadOnly => Self::ReadOnly,
             ssh_core::AccessClass::Privileged => Self::Privileged,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ScopeArg {
-    Read,
-    Mutate,
-    Privileged,
-}
-
-impl From<ScopeArg> for Scope {
-    fn from(arg: ScopeArg) -> Self {
-        match arg {
-            ScopeArg::Read => Self::Read,
-            ScopeArg::Mutate => Self::Mutate,
-            ScopeArg::Privileged => Self::Privileged,
         }
     }
 }
@@ -175,7 +152,6 @@ pub struct SessionOpened {
     pub host: String,
     pub role: String,
     pub access_class: AccessClassArg,
-    pub scope: ScopeArg,
 }
 
 /// What an agent is told about one of a command's streams.
@@ -326,11 +302,7 @@ pub enum ExecResult {
     },
     /// It has not run and will not.
     ///
-    /// Policy declined it - including a command the catalog could not read in
-    /// a session whose scope does not reach the maximal assessment such a
-    /// command carries; `why` says what would have to be different. It is a
-    /// decision about the command that was sent, and sending it again in the
-    /// same session gets the same answer.
+    /// A refusal does not become approval by repeating the same request.
     Refused { why: String },
 }
 
@@ -540,7 +512,13 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
                 .check_account(&host, &role, args.access_class.into())
                 .map_err(bad_request)?;
             let session = match bastion
-                .open_session(principal.clone(), host, role, purpose, args.scope.into())
+                .open_session(
+                    principal.clone(),
+                    host,
+                    role,
+                    purpose,
+                    args.access_class.into(),
+                )
                 .await
             {
                 Ok(session) => session,
@@ -551,7 +529,6 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
                 host: session.host.as_str().to_owned(),
                 role: session.role.as_str().to_owned(),
                 access_class: args.access_class,
-                scope: args.scope,
             })
         }
         EXEC => {
@@ -743,9 +720,6 @@ fn approved_by(approver: &ssh_core::approval::Approver) -> String {
         ssh_core::approval::Approver::SessionStanding { who, .. } => {
             format!("approved by {who}'s standing agreement for this session")
         }
-        ssh_core::approval::Approver::MatchingStanding { who, .. } => {
-            format!("approved by {who}'s standing agreement for matching work")
-        }
     }
 }
 
@@ -782,9 +756,6 @@ fn said_no(approver: &ssh_core::approval::Approver) -> String {
         }
         ssh_core::approval::Approver::SessionStanding { who, .. } => {
             format!("refused by {who}'s standing agreement for this session")
-        }
-        ssh_core::approval::Approver::MatchingStanding { who, .. } => {
-            format!("refused by {who}'s standing agreement for matching work")
         }
     }
 }
@@ -900,14 +871,7 @@ fn session_named(raw: &str) -> Result<SessionId, McpError> {
 /// No outcome is not the same as nothing happening, and the name of this is
 /// deliberately about the outcome rather than about the command.
 ///
-/// A command the catalog cannot describe no longer surfaces here at all: it
-/// classifies at the maximal assessment and flows through the ordinary
-/// decision path, so the caller sees the same refusal or awaiting-approval
-/// answers any other command gets. What remains here are failures, and the
-/// failures are not alike: a command that ran and could not be recorded says
-/// so in as many words, because a caller reading "failed" and sending it
-/// again repeats work that already happened. The rest could not be carried
-/// through to an answer at all.
+/// A command that may have run must not be reported as safe to retry.
 fn without_an_outcome(error: &MediationError) -> Result<CallToolResult, McpError> {
     Ok(mediation_failure(error))
 }
@@ -984,10 +948,9 @@ mod tests {
     /// this asserts that rather than the absence of a word.
     #[test]
     fn no_tool_accepts_a_principal() {
-        let catalog = catalog();
-        assert!(!catalog.tools.is_empty(), "nothing was published");
+        assert!(!catalog().tools.is_empty(), "nothing was published");
 
-        for tool in &catalog.tools {
+        for tool in &catalog().tools {
             let schema = serde_json::to_value(&*tool.input_schema).unwrap();
             assert_eq!(
                 schema.get("additionalProperties"),
@@ -997,7 +960,7 @@ mod tests {
             );
         }
 
-        let rendered = serde_json::to_string(&catalog).unwrap();
+        let rendered = serde_json::to_string(&catalog()).unwrap();
         for forbidden in ["principal", "identity", "on_behalf_of"] {
             assert!(
                 !rendered.contains(forbidden),
@@ -1347,7 +1310,7 @@ mod tests {
         use ssh_core::clock::TestClock;
         use ssh_core::command::Command;
         use ssh_core::session::{Lifetime, SessionStore};
-        use ssh_core::{PrincipalId, catalog::Catalog, policy::Engine};
+        use ssh_core::{PrincipalId, policy::Engine};
 
         let session = SessionStore::new(
             TestClock::at(1_000),
@@ -1363,7 +1326,7 @@ mod tests {
             HostId::parse("dns1").unwrap(),
             RoleId::parse("operator").unwrap(),
             Purpose::parse("restart the proxy after the config change").unwrap(),
-            Scope::Privileged,
+            ssh_core::AccessClass::Privileged,
         )
         .unwrap();
         let command = Command::new(
@@ -1373,10 +1336,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        Engine::builtin()
-            .unwrap()
-            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-            .unwrap()
+        Engine::new(ssh_core::policy::ReviewMode::Privileged).decide(&session, (command).clone())
     }
 
     /// Break-glass is not an approval by another name: nobody was reached, and
@@ -1408,10 +1368,9 @@ mod tests {
     /// unknown-run error where the output used to be.
     #[test]
     fn polling_is_annotated_as_delivering_once() {
-        let catalog = catalog();
-        let poll = catalog
+        let poll = catalog()
             .tools
-            .iter()
+            .into_iter()
             .find(|tool| tool.name == POLL)
             .expect("ssh_poll is published");
         let annotations = poll.annotations.as_ref().expect("annotated");
@@ -1430,10 +1389,9 @@ mod tests {
     /// client it is safe to repeat something that is not.
     #[test]
     fn execution_is_annotated_as_consequential() {
-        let catalog = catalog();
-        let exec = catalog
+        let exec = catalog()
             .tools
-            .iter()
+            .into_iter()
             .find(|tool| tool.name == EXEC)
             .expect("ssh_exec is published");
         let annotations = exec.annotations.as_ref().expect("annotated");
@@ -1446,10 +1404,9 @@ mod tests {
     /// reaches nothing.
     #[test]
     fn discovery_is_annotated_as_harmless() {
-        let catalog = catalog();
-        let hosts = catalog
+        let hosts = catalog()
             .tools
-            .iter()
+            .into_iter()
             .find(|tool| tool.name == HOSTS)
             .expect("ssh_hosts is published");
         let annotations = hosts.annotations.as_ref().expect("annotated");
@@ -1463,7 +1420,7 @@ mod tests {
     fn the_surface_is_the_five_tools_it_claims() {
         let names: Vec<_> = catalog()
             .tools
-            .iter()
+            .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(names, vec![HOSTS, OPEN_SESSION, EXEC, POLL, CLOSE_SESSION]);
@@ -1486,10 +1443,9 @@ mod tests {
     /// is the contract agents plan against, so both facts must be explicit.
     #[test]
     fn execution_schema_requires_intent_and_an_argument_vector() {
-        let catalog = catalog();
-        let exec = catalog
+        let exec = catalog()
             .tools
-            .iter()
+            .into_iter()
             .find(|tool| tool.name == EXEC)
             .expect("ssh_exec is published");
         let schema = serde_json::to_value(&exec.input_schema).unwrap();
@@ -1521,13 +1477,12 @@ mod tests {
     fn a_held_answer_names_the_page_where_a_person_decides() {
         use ssh_core::approval::{Approvals, Standing, Windows};
         use ssh_core::audit::Ledger;
-        use ssh_core::catalog::Catalog;
         use ssh_core::clock::TestClock;
         use ssh_core::command::Command;
         use ssh_core::mediate::Executed;
         use ssh_core::policy::Engine;
         use ssh_core::session::{Lifetime, Purpose, SessionStore};
-        use ssh_core::{HostId, PrincipalId, RoleId, Scope};
+        use ssh_core::{HostId, PrincipalId, RoleId};
         use std::sync::Arc;
 
         let clock = Arc::new(TestClock::at(1_000));
@@ -1546,7 +1501,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("operator").unwrap(),
                 Purpose::parse("restart the resolver").unwrap(),
-                Scope::Mutate,
+                ssh_core::AccessClass::Privileged,
             )
             .unwrap();
         let approvals = Approvals::new(
@@ -1565,18 +1520,14 @@ mod tests {
         .unwrap();
         let ledger = Ledger::new(Arc::clone(&clock));
         let held = || {
-            let decision = Engine::builtin()
-                .unwrap()
-                .decide(&session, Catalog::builtin().unwrap().classify(&command))
-                .unwrap();
+            let decision = Engine::new(ssh_core::policy::ReviewMode::Privileged)
+                .decide(&session, (command).clone());
             let asked = match approvals
                 .ask(
                     &ledger
                         .record_intent(
-                            Engine::builtin()
-                                .unwrap()
-                                .decide(&session, Catalog::builtin().unwrap().classify(&command))
-                                .unwrap(),
+                            Engine::new(ssh_core::policy::ReviewMode::Privileged)
+                                .decide(&session, (command).clone()),
                             CommandIntent::parse("exercise tool rendering").unwrap(),
                         )
                         .unwrap(),
@@ -1620,13 +1571,12 @@ mod tests {
     fn a_lapsed_agreement_says_whose_it_was_and_where_the_new_one_waits() {
         use ssh_core::approval::{Approvals, Approver, Standing, Windows};
         use ssh_core::audit::Ledger;
-        use ssh_core::catalog::Catalog;
         use ssh_core::clock::TestClock;
         use ssh_core::command::Command;
         use ssh_core::mediate::Executed;
         use ssh_core::policy::Engine;
         use ssh_core::session::{Lifetime, Purpose, SessionStore};
-        use ssh_core::{HostId, PrincipalId, RoleId, Scope};
+        use ssh_core::{HostId, PrincipalId, RoleId};
         use std::sync::Arc;
 
         let clock = Arc::new(TestClock::at(1_000));
@@ -1645,7 +1595,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("operator").unwrap(),
                 Purpose::parse("restart the resolver").unwrap(),
-                Scope::Mutate,
+                ssh_core::AccessClass::Privileged,
             )
             .unwrap();
         let approvals = Approvals::new(
@@ -1663,18 +1613,14 @@ mod tests {
         ])
         .unwrap();
         let ledger = Ledger::new(Arc::clone(&clock));
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-            .unwrap();
+        let decision = Engine::new(ssh_core::policy::ReviewMode::Privileged)
+            .decide(&session, (command).clone());
         let asked = match approvals
             .ask(
                 &ledger
                     .record_intent(
-                        Engine::builtin()
-                            .unwrap()
-                            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-                            .unwrap(),
+                        Engine::new(ssh_core::policy::ReviewMode::Privileged)
+                            .decide(&session, (command).clone()),
                         CommandIntent::parse("exercise tool rendering").unwrap(),
                     )
                     .unwrap(),
@@ -1734,12 +1680,11 @@ mod tests {
     fn only_a_fresh_hold_is_announced_and_only_somewhere_to_go() {
         use ssh_core::approval::{Approvals, Asked, Standing, Windows};
         use ssh_core::audit::Ledger;
-        use ssh_core::catalog::Catalog;
         use ssh_core::clock::TestClock;
         use ssh_core::command::Command;
         use ssh_core::policy::Engine;
         use ssh_core::session::{Lifetime, Purpose, SessionStore};
-        use ssh_core::{HostId, PrincipalId, RoleId, Scope};
+        use ssh_core::{HostId, PrincipalId, RoleId};
         use std::sync::{Arc, Mutex};
 
         struct Recording(Mutex<Vec<crate::notify::Note>>);
@@ -1766,7 +1711,7 @@ mod tests {
                     HostId::parse("dns1").unwrap(),
                     RoleId::parse("operator").unwrap(),
                     Purpose::parse("restart the resolver").unwrap(),
-                    Scope::Mutate,
+                    ssh_core::AccessClass::Privileged,
                 )
                 .unwrap();
             let approvals = Approvals::new(
@@ -1783,10 +1728,8 @@ mod tests {
                 "unbound".to_owned(),
             ])
             .unwrap();
-            let decision = Engine::builtin()
-                .unwrap()
-                .decide(&session, Catalog::builtin().unwrap().classify(&command))
-                .unwrap();
+            let decision = Engine::new(ssh_core::policy::ReviewMode::Privileged)
+                .decide(&session, (command).clone());
             let held = Ledger::new(clock)
                 .record_intent(
                     decision,

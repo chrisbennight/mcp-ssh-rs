@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 pub mod approval;
 pub mod audit;
-pub mod catalog;
 pub mod clock;
 pub mod command;
 pub mod config;
@@ -25,24 +24,6 @@ pub mod session;
 #[serde(rename_all = "snake_case")]
 pub enum AccessClass {
     ReadOnly,
-    Privileged,
-}
-
-/// How much a piece of work could do.
-///
-/// One vocabulary for two questions that have to be compared: what a session is
-/// allowed to reach (a ceiling, declared when it opens) and what a command
-/// turns out to be (an assessment, produced by classification). Separate types
-/// would need a conversion between them, and that conversion is exactly where a
-/// mismatch would hide.
-///
-/// Ordered from least to most privileged, so combining assessments is a maximum
-/// and a comparison against a ceiling is an ordinary one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Scope {
-    Read,
-    Mutate,
     Privileged,
 }
 

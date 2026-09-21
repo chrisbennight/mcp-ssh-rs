@@ -105,14 +105,8 @@ def request_demo():
         raise RuntimeError("A tutorial request already exists; collect it before starting another")
     initialize_client()
     session = tool("ssh_open_session", {"host": "demo", "role": "user",
-        "purpose": "Read the demo account name and create a disposable tutorial file", "scope": "privileged"})
+        "purpose": "Create a disposable tutorial file"})
     session_id = session["session"]
-    result = tool("ssh_exec", {"session": session_id, "intent": "Check the disposable account",
-                              "command": ["whoami"]})
-    result = poll_until_settled(session_id, result)
-    if result.get("outcome") != "ran" or result.get("exit") != 0:
-        raise RuntimeError("The permitted tutorial command did not complete")
-    print(json.dumps(result, indent=2))
     command = {"session": session_id, "intent": "Create the tutorial marker in the demo account",
                "command": ["touch", "/home/demo/tutorial-marker"]}
     result = tool("ssh_exec", command)

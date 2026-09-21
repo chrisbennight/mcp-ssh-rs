@@ -132,7 +132,7 @@ mod tests {
     use ssh_core::audit::Ledger;
     use ssh_core::clock::TestClock;
     use ssh_core::session::{Lifetime, Purpose, Session, SessionStore};
-    use ssh_core::{HostId, PrincipalId, RoleId, Scope};
+    use ssh_core::{AccessClass, HostId, PrincipalId, RoleId};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -207,7 +207,7 @@ mod tests {
             HostId::parse("dns1").unwrap(),
             RoleId::parse("readonly").unwrap(),
             Purpose::parse("find out why the deploy did nothing").unwrap(),
-            Scope::Read,
+            AccessClass::ReadOnly,
         )
         .unwrap()
     }

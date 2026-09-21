@@ -355,8 +355,7 @@ pub enum FileOp {
 impl FileOp {
     /// The name this operation is recorded and decided under.
     ///
-    /// Prefixed, so it cannot collide with a program name in the same catalog
-    /// and so a record makes clear this was not a command.
+    /// The prefix distinguishes file operations in the audit record.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -364,15 +363,6 @@ impl FileOp {
             Self::Write => "file.write",
             Self::List => "file.list",
             Self::Stat => "file.stat",
-        }
-    }
-
-    /// The least the operation could be doing, before the path is considered.
-    #[must_use]
-    pub const fn scope(self) -> crate::Scope {
-        match self {
-            Self::Read | Self::List | Self::Stat => crate::Scope::Read,
-            Self::Write => crate::Scope::Mutate,
         }
     }
 }
@@ -1547,16 +1537,11 @@ mod tests {
     /// operation on /etc/hosts" with a flag would make an audit reader work out
     /// which one happened.
     #[test]
-    fn each_operation_is_named_and_scoped_as_itself() {
+    fn each_operation_is_named_as_itself() {
         assert_eq!(FileOp::Read.name(), "file.read");
         assert_eq!(FileOp::Write.name(), "file.write");
-        assert_eq!(FileOp::Read.scope(), crate::Scope::Read);
-        assert_eq!(FileOp::List.scope(), crate::Scope::Read);
-        assert_eq!(FileOp::Stat.scope(), crate::Scope::Read);
-        assert_eq!(FileOp::Write.scope(), crate::Scope::Mutate);
 
-        // The prefix is what keeps an operation from being mistaken for a
-        // program of the same name in the same catalog.
+        // File operations have a distinct audit namespace.
         for op in [FileOp::Read, FileOp::Write, FileOp::List, FileOp::Stat] {
             assert!(op.name().starts_with("file."), "{:?}", op);
         }

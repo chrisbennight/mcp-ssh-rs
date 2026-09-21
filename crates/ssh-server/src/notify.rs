@@ -33,7 +33,7 @@ pub struct Note {
     pub role: String,
     pub purpose: String,
     /// How the command was classified, which is why it is waiting.
-    pub assessment: String,
+    pub access_class: String,
     /// Where to answer it.
     pub url: String,
     /// A one-line rendering, for channels that show text and nothing else.
@@ -50,7 +50,7 @@ impl Note {
     /// proxy ever sees: it lands the reader on the card this note is about.
     #[must_use]
     pub fn about(asked: &Asked, dashboard: &Url) -> Self {
-        let assessment = scope_name(asked.assessment);
+        let access_class = access_class_name(asked.access_class);
         // The page with this request as the fragment, so the reader lands on
         // the card the note is about rather than at the top of a queue. The
         // identifier is service-minted hex, so it needs no escaping to sit in
@@ -78,13 +78,13 @@ impl Note {
             host: asked.host.as_str().to_owned(),
             role: asked.role.as_str().to_owned(),
             purpose: purpose.clone(),
-            assessment: assessment.to_owned(),
+            access_class: access_class.to_owned(),
             text: format!(
-                "{} is waiting to run a {} command on {} as {} — {} — {}",
+                "{} is waiting to run a command on {} as {} (account class: {}) — {} — {}",
                 principal,
-                assessment,
                 asked.host.as_str(),
                 asked.role.as_str(),
+                access_class,
                 purpose,
                 url,
             ),
@@ -93,11 +93,10 @@ impl Note {
     }
 }
 
-const fn scope_name(scope: ssh_core::Scope) -> &'static str {
-    match scope {
-        ssh_core::Scope::Read => "read",
-        ssh_core::Scope::Mutate => "mutate",
-        ssh_core::Scope::Privileged => "privileged",
+const fn access_class_name(access_class: ssh_core::AccessClass) -> &'static str {
+    match access_class {
+        ssh_core::AccessClass::ReadOnly => "read_only",
+        ssh_core::AccessClass::Privileged => "privileged",
     }
 }
 
@@ -198,12 +197,11 @@ mod tests {
     use super::*;
     use ssh_core::approval::{Approvals, Standing, Windows};
     use ssh_core::audit::Ledger;
-    use ssh_core::catalog::Catalog;
     use ssh_core::clock::TestClock;
     use ssh_core::command::Command;
     use ssh_core::policy::Engine;
     use ssh_core::session::{Lifetime, Purpose, SessionStore};
-    use ssh_core::{HostId, PrincipalId, RoleId, Scope};
+    use ssh_core::{AccessClass, HostId, PrincipalId, RoleId};
     use std::sync::Arc;
 
     /// A waiting request, built the way production builds one: through policy
@@ -233,7 +231,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("operator").unwrap(),
                 Purpose::parse(purpose).unwrap(),
-                Scope::Mutate,
+                AccessClass::Privileged,
             )
             .unwrap();
         let approvals = Approvals::new(
@@ -250,10 +248,8 @@ mod tests {
             "unbound".to_owned(),
         ])
         .unwrap();
-        let decision = Engine::builtin()
-            .unwrap()
-            .decide(&session, Catalog::builtin().unwrap().classify(&command))
-            .unwrap();
+        let decision = Engine::new(ssh_core::policy::ReviewMode::Privileged)
+            .decide(&session, (command).clone());
         let held = Ledger::new(clock)
             .record_intent(
                 decision,
@@ -281,7 +277,7 @@ mod tests {
             note.url,
             format!("https://ssh.example/dashboard/approvals#{}", note.request)
         );
-        for expected in ["agent-clawde", "dns1", "operator", "mutate"] {
+        for expected in ["agent-clawde", "dns1", "operator", "privileged"] {
             assert!(note.text.contains(expected), "the note omits {expected}");
         }
         let rendered = serde_json::to_string(&note).unwrap();

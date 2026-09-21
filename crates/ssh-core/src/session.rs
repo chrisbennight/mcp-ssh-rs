@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{Clock, Millis};
-use crate::{HostId, PrincipalId, RoleId, Scope};
+use crate::{AccessClass, HostId, PrincipalId, RoleId};
 
 /// Handle to a session: shaped, not merely opaque.
 ///
@@ -69,7 +69,7 @@ pub struct MalformedSessionId;
 /// the process, so the first session after a restart reuses the identifier the
 /// first session before it had — and a delayed or retried request carrying that
 /// stale handle would land on a *different* session belonging to the same
-/// principal, inheriting its host, role, purpose and scope. Restarting is
+/// principal, inheriting its host, role, purpose and account class. Restarting is
 /// supposed to invalidate sessions, not silently re-point them.
 ///
 /// Ownership is still what authorizes, so this is not a bearer token. It is
@@ -161,7 +161,7 @@ pub struct Lifetime {
     /// usefully* —
     /// the owner who comes back is told the session lapsed and what it was for,
     /// rather than being told it never existed and left to reconstruct the
-    /// host, role, purpose and scope from memory.
+    /// host, role, purpose and account class from memory.
     ///
     /// It does not gate that answer, only how long the entry outlives an
     /// unrelated caller's collection: an owner who returns to a session still
@@ -183,7 +183,7 @@ pub struct Session {
     pub host: HostId,
     pub role: RoleId,
     pub purpose: Purpose,
-    pub scope: Scope,
+    pub access_class: AccessClass,
     opened_at: Millis,
     last_used: Millis,
     lifetime: Lifetime,
@@ -244,7 +244,7 @@ pub struct SessionSnapshot {
 /// What a caller needs to open an equivalent session after one lapses.
 ///
 /// Carried on the error rather than left for the caller to reconstruct: an
-/// agent that has to guess the host, role, purpose, and scope it was using will
+/// agent that has to guess the host, role, purpose, and account class it was using will
 /// guess differently, and the replacement session will not be the one a human
 /// approved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,7 +252,7 @@ pub struct LapsedContext {
     pub host: HostId,
     pub role: RoleId,
     pub purpose: Purpose,
-    pub scope: Scope,
+    pub access_class: AccessClass,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -325,7 +325,7 @@ impl<C: Clock> SessionStore<C> {
         host: HostId,
         role: RoleId,
         purpose: Purpose,
-        scope: Scope,
+        access_class: AccessClass,
     ) -> Result<Session, TooManySessions> {
         let id = SessionId(new_identifier());
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,7 +366,7 @@ impl<C: Clock> SessionStore<C> {
             host,
             role,
             purpose,
-            scope,
+            access_class,
             opened_at: now,
             last_used: now,
             lifetime: self.lifetime,
@@ -517,7 +517,7 @@ impl<C: Clock> SessionStore<C> {
                 host: session.host.clone(),
                 role: session.role.clone(),
                 purpose: session.purpose.clone(),
-                scope: session.scope,
+                access_class: session.access_class,
             });
             // Answered before forgetting, so reaching a session that is still
             // held always tells its owner what happened to it — the whole
@@ -603,7 +603,7 @@ mod tests {
                 HostId::parse("dns1").unwrap(),
                 RoleId::parse("readonly").unwrap(),
                 Purpose::parse("check why the deploy did not take effect").unwrap(),
-                Scope::Read,
+                AccessClass::ReadOnly,
             )
             .expect("within the per-principal limit")
     }
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(why, Expiry::Idle);
         assert_eq!(context.host.as_str(), "dns1");
         assert_eq!(context.role.as_str(), "readonly");
-        assert_eq!(context.scope, Scope::Read);
+        assert_eq!(context.access_class, AccessClass::ReadOnly);
         assert_eq!(
             context.purpose.as_str(),
             "check why the deploy did not take effect"
@@ -991,7 +991,7 @@ mod tests {
                     HostId::parse("dns1").unwrap(),
                     RoleId::parse("readonly").unwrap(),
                     Purpose::parse("one too many").unwrap(),
-                    Scope::Read,
+                    AccessClass::ReadOnly,
                 ),
                 Err(TooManySessions { .. })
             ),
