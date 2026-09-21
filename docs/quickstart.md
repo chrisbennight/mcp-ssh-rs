@@ -22,6 +22,8 @@ cd mcp-ssh-rs
 
 This tutorial builds from source; it does not require a published binary or
 access to a prebuilt service image.
+To use a published service container instead, follow
+[release installation](installation.md#obtain-and-try-the-container).
 
 ## Start
 

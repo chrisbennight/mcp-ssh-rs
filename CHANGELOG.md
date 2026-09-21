@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0
+
+Publication status, the source revision, tested image digest, and compatibility
+evidence are recorded in the
+[GitHub release](https://github.com/chrisbennight/mcp-ssh-rs/releases/tag/v0.1.0).
 
 Initial public release:
 
