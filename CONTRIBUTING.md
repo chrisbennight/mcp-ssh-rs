@@ -6,7 +6,7 @@ the resulting behavior, and how you tested it. Do not include credentials or
 private deployment configuration in a patch or diagnostic output.
 
 For suspected vulnerabilities, use [Security reports](SECURITY.md). Maintainers
-preparing a public snapshot should follow [Preparing a public release](docs/releases.md).
+preparing a release should follow [Preparing a public release](docs/releases.md).
 
 ## Local checks
 
@@ -76,9 +76,9 @@ It reads the image back from GHCR and checks its image ID. Use the reported
 digest for an exact deployment: rerunning the same commit can replace its SHA
 tag. There is no moving `latest` tag or automatic deployment to a host.
 
-The repository is private during preparation. Newly created GHCR packages are
-private by default; maintainers should verify package access separately before
-sharing a pull command. Repository visibility does not itself publish a package.
+Newly created GHCR packages are private by default; maintainers should verify
+package access separately before sharing a pull command. Repository visibility
+does not itself publish a package.
 
 ## Maintainer setup
 
@@ -94,7 +94,7 @@ loader uses, despite GitHub hosting the repository. Give the AERB installation
 access to this repository and verify that a review posts `pr-review/gate` on
 the current PR commit before requiring that status.
 
-Give the chosen Renovate installation access to this private repository.
+Give the chosen Renovate installation access to this repository.
 [Renovate configuration](renovate.json) covers Cargo, Docker, GitHub Actions,
 and the Rust toolchain. It retains the existing security-only Cargo update
 policy. Installing an app and configuring branch rules are not performed by CI.
