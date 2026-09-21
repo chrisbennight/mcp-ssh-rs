@@ -336,6 +336,33 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         Ok(session)
     }
 
+    /// Validates the caller's account label against administrator configuration.
+    pub fn check_account(
+        &self,
+        host: &HostId,
+        role: &RoleId,
+        access_class: crate::AccessClass,
+    ) -> Result<(), MediationError> {
+        if self.registry.resolve(host, role)?.access_class() != access_class {
+            return Err(MediationError::AccountMismatch);
+        }
+        Ok(())
+    }
+
+    /// Account selection is immutable for a session, including across reconnects.
+    pub fn check_session_account(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        host: &HostId,
+        role: &RoleId,
+        access_class: crate::AccessClass,
+    ) -> Result<(), MediationError> {
+        self.sessions
+            .check_binding(session, principal, host, role)?;
+        self.check_account(host, role, access_class)
+    }
+
     /// Test-only shorthand for execution-path tests whose subject is not
     /// caller-supplied intent. Production callers cannot omit it.
     #[cfg(test)]
@@ -1149,6 +1176,13 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
             .collect()
     }
 
+    pub fn account_inventory(&self) -> Vec<(&HostId, Vec<(&RoleId, crate::AccessClass)>)> {
+        self.registry
+            .hosts()
+            .map(|host| (host, self.registry.accounts(host).collect()))
+            .collect()
+    }
+
     #[must_use]
     pub fn ledger(&self) -> &Ledger<Arc<C>> {
         &self.ledger
@@ -1226,6 +1260,8 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MediationError {
+    #[error("the requested account access class does not match configuration")]
+    AccountMismatch,
     #[error("the service is stopping and is not starting new work")]
     Stopping,
     #[error(transparent)]
@@ -1471,7 +1507,7 @@ mod tests {
                    "address": "{address}",
                    "host_key": "{}",
                    "roles": {{
-                     "readonly": {{ "user": "mcp-ro", "credential": "mcp-ssh/dns1/readonly" }}
+                     "readonly": {{ "user": "mcp-ro", "access_class": "read_only", "credential": "mcp-ssh/dns1/readonly" }}
                    }}
                  }} }}"#,
             pinned.trim()
@@ -1531,6 +1567,38 @@ mod tests {
 
     fn alice() -> PrincipalId {
         PrincipalId::parse("alice").unwrap()
+    }
+
+    #[tokio::test]
+    async fn account_class_cannot_be_asserted_by_the_caller() {
+        let bastion = bastion().await;
+        let host = HostId::parse("dns1").unwrap();
+        let role = RoleId::parse("readonly").unwrap();
+        assert_eq!(
+            bastion.check_account(&host, &role, crate::AccessClass::Privileged),
+            Err(MediationError::AccountMismatch)
+        );
+        assert_eq!(bastion.held_connections(), 0);
+        let session = session_for(&bastion, Scope::Read).await;
+        assert_eq!(
+            bastion.check_session_account(
+                &alice(),
+                &session.id,
+                &host,
+                &role,
+                crate::AccessClass::Privileged
+            ),
+            Err(MediationError::AccountMismatch)
+        );
+        bastion
+            .check_session_account(
+                &alice(),
+                &session.id,
+                &host,
+                &role,
+                crate::AccessClass::ReadOnly,
+            )
+            .unwrap();
     }
 
     async fn session_for<C: Clock + 'static>(

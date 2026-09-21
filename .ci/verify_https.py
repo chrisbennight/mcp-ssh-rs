@@ -201,6 +201,8 @@ def initialize(base, headers):
 
 
 def tool(base, headers, name, arguments):
+    if name != "ssh_hosts":
+        arguments = {**arguments, "host": "test", "role": "user", "access_class": "read_only"}
     status, body = request(base + "/mcp", headers, {"jsonrpc": "2.0", "id": 1,
         "method": "tools/call", "params": {"name": name, "arguments": arguments}})
     assert status == 200
@@ -248,7 +250,7 @@ def check(binary, image):
         with ssh_target(fixture) as ssh_port, peer(jwks) as plain, peer(jwks) as destination:
             (fixture / "registry.json").write_text(json.dumps({"test": {"address": f"127.0.0.1:{ssh_port}",
                 "host_key": (fixture / "ssh.pub").read_text().strip(),
-                "roles": {"user": {"user": "test", "credential": "test"}}}}))
+                "roles": {"user": {"user": "test", "access_class": "read_only", "credential": "test"}}}}))
             plain_url = f"http://127.0.0.1:{plain.server_port}"
             for case in ["trusted", "untrusted", "wrong-host", "expired", "redirect"]:
                 roots = fixture / ("other.pem" if case == "untrusted" else "ca.pem")

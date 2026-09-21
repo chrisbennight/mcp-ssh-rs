@@ -24,6 +24,8 @@ mode. The tutorial uses public build dependencies and a small Python MCP client.
 
 - Host and role discovery, bounded sessions, command execution, result polling,
   and session closure through MCP.
+- Explicit account access classes, checked against configuration and session
+  ownership on MCP session operations.
 - Cedar command policy and a browser queue for held commands.
 - Verified SSH host keys and target credentials supplied by the operator.
 - Structured execution logs, with optional Loki history and notification adapters.

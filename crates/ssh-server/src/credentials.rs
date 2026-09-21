@@ -235,7 +235,7 @@ mod tests {
             .iter()
             .map(|(host, reference)| {
                 format!(
-                    r#""{host}": {{ "address": "{host}.internal:22", "host_key": "SHA256:AAAA1111", "roles": {{ "readonly": {{ "user": "mcp-ro", "credential": "{reference}" }} }} }}"#
+                    r#""{host}": {{ "address": "{host}.internal:22", "host_key": "SHA256:AAAA1111", "roles": {{ "readonly": {{ "user": "mcp-ro", "access_class": "read_only", "credential": "{reference}" }} }} }}"#
                 )
             })
             .collect::<Vec<_>>()

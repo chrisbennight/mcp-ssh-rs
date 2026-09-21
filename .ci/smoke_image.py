@@ -40,7 +40,7 @@ def check(image: str) -> None:
                 "address": "127.0.0.1:22",
                 "host_key": "SHA256:AAAA1111",
                 "roles": {"readonly": {
-                    "user": "nobody", "credential": "smoke-readonly",
+                    "user": "nobody", "access_class": "read_only", "credential": "smoke-readonly",
                 }},
             },
         }))

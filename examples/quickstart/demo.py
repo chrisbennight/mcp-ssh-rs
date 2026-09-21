@@ -29,7 +29,7 @@ def initialize(port, service_image=None):
     registry = {"demo": {
         "address": "target:22",
         "host_key": (DATA / "host_key.pub").read_text().strip(),
-        "roles": {"user": {"user": "demo", "credential": "demo"}},
+        "roles": {"user": {"user": "demo", "access_class": "privileged", "credential": "demo"}},
     }}
     (DATA / "registry.json").write_text(json.dumps(registry))
     (DATA / "registry.json").chmod(0o644)
@@ -90,6 +90,8 @@ def initialize_client():
 
 
 def tool(name, arguments):
+    if name != "ssh_hosts":
+        arguments = {**arguments, "host": "demo", "role": "user", "access_class": "privileged"}
     result = rpc("tools/call", {"name": name, "arguments": arguments})
     if result.get("isError"):
         raise RuntimeError("The tool could not complete; inspect the local service logs")

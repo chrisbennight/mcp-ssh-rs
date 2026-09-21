@@ -57,6 +57,8 @@ pub struct OpenSessionArgs {
     pub host: String,
     /// Which role to act as on that host.
     pub role: String,
+    /// The configured account class, checked by the service before connecting.
+    pub access_class: AccessClassArg,
     /// What this session is for, in a sentence.
     ///
     /// A human may be asked to approve work in this session, and this is what
@@ -67,6 +69,31 @@ pub struct OpenSessionArgs {
     /// A ceiling, not a grant: every command is still decided individually, and
     /// asking for more than the work needs makes approval harder, not easier.
     pub scope: ScopeArg,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessClassArg {
+    ReadOnly,
+    Privileged,
+}
+
+impl From<AccessClassArg> for ssh_core::AccessClass {
+    fn from(value: AccessClassArg) -> Self {
+        match value {
+            AccessClassArg::ReadOnly => Self::ReadOnly,
+            AccessClassArg::Privileged => Self::Privileged,
+        }
+    }
+}
+
+impl From<ssh_core::AccessClass> for AccessClassArg {
+    fn from(value: ssh_core::AccessClass) -> Self {
+        match value {
+            ssh_core::AccessClass::ReadOnly => Self::ReadOnly,
+            ssh_core::AccessClass::Privileged => Self::Privileged,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -90,6 +117,12 @@ impl From<ScopeArg> for Scope {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecArgs {
+    /// The host bound to the session.
+    pub host: String,
+    /// The configured account bound to the session.
+    pub role: String,
+    /// The configured account class; this argument does not grant access.
+    pub access_class: AccessClassArg,
     /// The session to run in, exactly as `ssh_open_session` returned it.
     pub session: String,
     /// What this command is intended to accomplish.
@@ -108,6 +141,12 @@ pub struct ExecArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PollArgs {
+    /// The host bound to the session.
+    pub host: String,
+    /// The configured account bound to the session.
+    pub role: String,
+    /// The configured account class; this argument does not grant access.
+    pub access_class: AccessClassArg,
     /// The session the command was run in, exactly as `ssh_open_session`
     /// returned it.
     pub session: String,
@@ -120,6 +159,12 @@ pub struct PollArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CloseSessionArgs {
+    /// The host bound to the session.
+    pub host: String,
+    /// The configured account bound to the session.
+    pub role: String,
+    /// The configured account class; this argument does not grant access.
+    pub access_class: AccessClassArg,
     /// The session to end, exactly as `ssh_open_session` returned it.
     pub session: String,
 }
@@ -129,6 +174,7 @@ pub struct SessionOpened {
     pub session: String,
     pub host: String,
     pub role: String,
+    pub access_class: AccessClassArg,
     pub scope: ScopeArg,
 }
 
@@ -296,7 +342,13 @@ pub struct HostsResult {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct HostEntry {
     pub host: String,
-    pub roles: Vec<String>,
+    pub roles: Vec<AccountEntry>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AccountEntry {
+    pub role: String,
+    pub access_class: AccessClassArg,
 }
 
 /// The tools this service publishes.
@@ -464,13 +516,16 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
             // it the one place a made-up argument passes unnoticed.
             let Empty {} = parse(arguments)?;
             let hosts = bastion
-                .inventory()
+                .account_inventory()
                 .into_iter()
                 .map(|(host, roles)| HostEntry {
                     host: host.as_str().to_owned(),
                     roles: roles
                         .iter()
-                        .map(|role| (*role).as_str().to_owned())
+                        .map(|(role, class)| AccountEntry {
+                            role: role.as_str().to_owned(),
+                            access_class: (*class).into(),
+                        })
                         .collect(),
                 })
                 .collect();
@@ -481,6 +536,9 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
             let host = HostId::parse(&args.host).map_err(bad_request)?;
             let role = RoleId::parse(&args.role).map_err(bad_request)?;
             let purpose = Purpose::parse(&args.purpose).map_err(bad_request)?;
+            bastion
+                .check_account(&host, &role, args.access_class.into())
+                .map_err(bad_request)?;
             let session = match bastion
                 .open_session(principal.clone(), host, role, purpose, args.scope.into())
                 .await
@@ -492,11 +550,21 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
                 session: session.id.as_str().to_owned(),
                 host: session.host.as_str().to_owned(),
                 role: session.role.as_str().to_owned(),
+                access_class: args.access_class,
                 scope: args.scope,
             })
         }
         EXEC => {
             let args: ExecArgs = parse(arguments)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session_named(&args.session)?,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
             let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
             match bastion
                 .exec_intended(
@@ -516,6 +584,15 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
         }
         POLL => {
             let args: PollArgs = parse(arguments)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session_named(&args.session)?,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
             match bastion
                 .poll(
                     principal,
@@ -531,6 +608,15 @@ pub async fn dispatch<C: Clock + 'static, S: CredentialSource>(
         }
         CLOSE_SESSION => {
             let args: CloseSessionArgs = parse(arguments)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session_named(&args.session)?,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
             match bastion
                 .close_session(principal, &session_named(&args.session)?)
                 .await
@@ -930,6 +1016,7 @@ mod tests {
         };
 
         let smuggled = with_principal(serde_json::json!({
+            "host": "target", "role": "reader", "access_class": "read_only",
             "session": "0123456789abcdef0123456789abcdef",
             "command": ["uptime"],
             "intent": "Check whether the host is up",
@@ -948,6 +1035,7 @@ mod tests {
         );
 
         let honest = with_principal(serde_json::json!({
+            "host": "target", "role": "reader", "access_class": "read_only",
             "session": "0123456789abcdef0123456789abcdef",
             "command": ["uptime"],
             "intent": "Check whether the host is up",

@@ -19,6 +19,15 @@ pub mod run;
 pub mod secret;
 pub mod session;
 
+/// Administrator-declared account permissions, enforced by the target OS.
+/// This label does not classify commands or grant access by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessClass {
+    ReadOnly,
+    Privileged,
+}
+
 /// How much a piece of work could do.
 ///
 /// One vocabulary for two questions that have to be compared: what a session is
