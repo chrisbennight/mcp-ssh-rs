@@ -7,6 +7,32 @@ private deployment configuration in a patch or diagnostic output.
 
 For suspected vulnerabilities, use [Security reports](SECURITY.md). Maintainers should follow [Releasing](docs/releases.md).
 
+## Ways to help
+
+Small fixes, clearer documentation, and reproducible bug reports are welcome.
+Discuss substantial features in an issue before implementation so maintainers
+can agree on scope and ongoing maintenance. Use [Get help](SUPPORT.md) for
+questions and reporting guidance.
+
+Useful first contributions include:
+
+- **Improve one troubleshooting answer.** Reproduce a setup problem with the
+  disposable demo and document how to recognize and resolve it. The result
+  should let another user recover without maintainer help.
+- **Check a client combination.** Reproduce discovery, command review, and
+  result collection with a named client version. Report the tested transport
+  and limitations, or contribute a guide others can follow.
+- **Clarify one documentation path.** Follow a task from the README and fix a
+  confusing step or missing link, checking the destination against the current
+  behavior.
+
+For code changes, start with the checks below and include regression evidence.
+Outside contributors can fork the repository, push a branch to their fork,
+and open a PR against `main`. Include the problem, resulting behavior, and
+validation using the PR template. Maintainers handle review integrations,
+repository settings, and publication; contributors do not need access to
+private infrastructure or maintainer credentials.
+
 ## Local checks
 
 Install Rust through rustup, then run these commands from the repository root.
