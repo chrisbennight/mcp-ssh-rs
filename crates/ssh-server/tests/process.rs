@@ -113,3 +113,46 @@ async fn an_unopenable_required_sink_prevents_protocol_startup() {
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("opening output sinks"));
 }
+
+#[tokio::test]
+async fn service_errors_use_diagnostics_without_polluting_the_audit_stream() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.0.join("registry.json"), "{").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .command()
+            .env("MCP_SSH_TRANSPORT", "http")
+            .env("MCP_SSH_AUTH_MODE", "standalone")
+            .env(
+                "MCP_SSH_BEARER",
+                "disposable-process-test-bearer-credential",
+            )
+            .env("MCP_SSH_AUDIT_SINK", "stderr")
+            .env(
+                "MCP_SSH_LOG_SINK",
+                format!("file:{}", fixture.0.join("diagnostics.jsonl").display()),
+            )
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(
+        result.stderr.is_empty(),
+        "audit stream contains diagnostic text"
+    );
+    let diagnostics = std::fs::read_to_string(fixture.0.join("diagnostics.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = diagnostics
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(records.iter().any(|record| {
+        record
+            .pointer("/fields/error")
+            .and_then(serde_json::Value::as_str)
+            == Some("parsing the registry")
+    }));
+}
