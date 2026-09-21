@@ -1,8 +1,7 @@
 # Security reports
 
-The project is preparing its first public release. Security fixes currently
-target `main`; there are no maintained stable release branches or promised
-response times.
+Security fixes target `main`. There are no maintained stable release branches
+or promised response times.
 
 Use **Security → Advisories → Report a vulnerability** if that option is
 available in the repository. It sends a private report to the maintainers.

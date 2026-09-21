@@ -49,6 +49,6 @@ and configured CA bundle. Do not work around it by disabling verification.
 Use the endpoint's final URL when it redirects.
 
 HTTPS protects transport; it does not add an authentication scheme to an
-integration. The current Loki reader still assumes its existing container and
-stream labels and does not configure tenant or authorization headers. A remote
-Loki deployment requiring those needs a separately configured protected adapter.
+integration. The Loki reader uses deployment-supplied `MCP_SSH_AUDIT_LABELS`.
+It does not configure tenant or authorization headers; deployments requiring
+those need a separately configured protected adapter.

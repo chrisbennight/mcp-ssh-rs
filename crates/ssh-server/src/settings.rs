@@ -47,6 +47,7 @@ pub struct EvaluatorSettings {
 /// embed a credential in its path, the way webhook services commonly issue
 /// them, so only its presence is shown.
 pub struct Settings {
+    pub operator_header: axum::http::HeaderName,
     pub file_origin: Option<Url>,
     pub file_root: Option<PathBuf>,
     pub process: crate::process::ProcessOptions,
@@ -70,6 +71,7 @@ pub struct Settings {
     /// Internal, read-only endpoint for the deployment-owned durable audit
     /// source. Absent leaves historical dashboard views explicitly unavailable.
     pub audit_query: Option<Url>,
+    pub audit_labels: Option<crate::audit_history::Labels>,
     /// Explicit identity source for the MCP and human surfaces.
     pub identity: Authentication,
     /// Where to post a note when a command is waiting on a human.
@@ -133,12 +135,14 @@ impl Settings {
     pub const EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_CURRENT";
     pub const PREVIOUS_EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_PREVIOUS";
     pub const EVALUATOR_NAME_VAR: &'static str = "MCP_SSH_EVALUATOR_NAME";
+    pub const AUDIT_LABELS_VAR: &'static str = "MCP_SSH_AUDIT_LABELS";
     pub const AUDIT_QUERY_VAR: &'static str = "MCP_SSH_AUDIT_QUERY_URL";
     pub const NOTIFY_VAR: &'static str = "MCP_SSH_NOTIFY_URL";
     pub const DASHBOARD_VAR: &'static str = "MCP_SSH_DASHBOARD_URL";
     pub const JWKS_VAR: &'static str = "MCP_SSH_IDENTITY_JWKS_URL";
     pub const ISSUER_VAR: &'static str = "MCP_SSH_IDENTITY_ISSUER";
     pub const TRUSTED_HOSTS_VAR: &'static str = "MCP_SSH_TRUSTED_HOSTS";
+    pub const OPERATOR_HEADER_VAR: &'static str = "MCP_SSH_OPERATOR_HEADER";
     pub const FILE_ROOT_VAR: &'static str = "MCP_SSH_FILE_ROOT";
     pub const FILE_ORIGIN_VAR: &'static str = "MCP_SSH_FILE_ORIGIN";
     pub const REVIEW_VAR: &'static str = "MCP_SSH_REVIEW";
@@ -378,6 +382,42 @@ impl Settings {
                 }
             }
         };
+        let audit_query = optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?;
+        let audit_labels = optional(&lookup, Self::AUDIT_LABELS_VAR)?
+            .map(|raw| {
+                crate::audit_history::Labels::parse(&raw).map_err(|_| SettingsError::Unusable {
+                    var: Self::AUDIT_LABELS_VAR,
+                })
+            })
+            .transpose()?;
+        if audit_query.is_some() != audit_labels.is_some() {
+            return Err(SettingsError::Unusable {
+                var: Self::AUDIT_LABELS_VAR,
+            });
+        }
+        let configured_header = optional(&lookup, Self::OPERATOR_HEADER_VAR)?;
+        if configured_header.is_some() && !gateway {
+            return Err(SettingsError::Unusable {
+                var: Self::OPERATOR_HEADER_VAR,
+            });
+        }
+        let operator_header = axum::http::HeaderName::from_bytes(
+            configured_header
+                .as_deref()
+                .unwrap_or(crate::dashboard::OPERATOR_HEADER)
+                .as_bytes(),
+        )
+        .map_err(|_| SettingsError::Unusable {
+            var: Self::OPERATOR_HEADER_VAR,
+        })?;
+        if matches!(
+            operator_header.as_str(),
+            "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-mcp-identity"
+        ) {
+            return Err(SettingsError::Unusable {
+                var: Self::OPERATOR_HEADER_VAR,
+            });
+        }
         let file_root = optional(&lookup, Self::FILE_ROOT_VAR)?.map(PathBuf::from);
         if file_root.is_some() && (!stdio || optional(&lookup, Self::FILE_ORIGIN_VAR)?.is_some()) {
             return Err(SettingsError::Unusable {
@@ -385,6 +425,7 @@ impl Settings {
             });
         }
         Ok(Self {
+            operator_header,
             file_root,
             file_origin: optional_url(&lookup, Self::FILE_ORIGIN_VAR, &["http", "https"])?,
             process,
@@ -395,7 +436,8 @@ impl Settings {
             identity,
             review,
             dashboard,
-            audit_query: optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?,
+            audit_query,
+            audit_labels,
             notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
         })
@@ -789,6 +831,23 @@ mod tests {
     }
 
     #[test]
+    fn operator_header_is_configurable_but_cannot_name_credentials() {
+        let mut vars = complete();
+        vars.insert(Settings::OPERATOR_HEADER_VAR, "x-test-operator".to_owned());
+        assert_eq!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .operator_header
+                .as_str(),
+            "x-test-operator"
+        );
+        for invalid in ["Authorization", "cookie", "x-mcp-identity", "bad header"] {
+            vars.insert(Settings::OPERATOR_HEADER_VAR, invalid.to_owned());
+            assert!(Settings::from_lookup(read(&vars)).is_err());
+        }
+    }
+
+    #[test]
     fn durable_audit_reader_is_optional_and_requires_a_web_base() {
         let vars = complete();
         assert!(
@@ -800,6 +859,10 @@ mod tests {
 
         let mut configured = complete();
         configured.insert(Settings::AUDIT_QUERY_VAR, "http://loki:3100/".to_owned());
+        configured.insert(
+            Settings::AUDIT_LABELS_VAR,
+            r#"{"service":"ssh"}"#.to_owned(),
+        );
         assert_eq!(
             Settings::from_lookup(read(&configured))
                 .unwrap()
@@ -934,6 +997,10 @@ mod tests {
         vars.insert(
             Settings::AUDIT_QUERY_VAR,
             "https://loki.example/".to_owned(),
+        );
+        vars.insert(
+            Settings::AUDIT_LABELS_VAR,
+            r#"{"service":"ssh"}"#.to_owned(),
         );
         let settings = Settings::from_lookup(read(&vars)).unwrap();
         assert!(

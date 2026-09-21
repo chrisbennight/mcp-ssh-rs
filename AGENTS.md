@@ -4,8 +4,8 @@ Instructions for coding agents working in `mcp-ssh-rs`.
 
 ## Purpose
 
-An MCP service that lets AI agents run commands on configured hosts over SSH,
-with configured accounts and optional human review. What it
+An MCP service for SSH commands and binary file transfer through configured
+accounts, with optional human review. What it
 guarantees, and what it deliberately does not, is defined in the design rather
 than summarized here.
 
@@ -23,8 +23,7 @@ down first" — prose specifications are unvalidated and drift.
 
 - Never work directly in the main checkout. Fetch `main` from the GitHub
   remote, create a dedicated branch and an ignored `.worktrees/` worktree,
-  and work there. Check the remote URL; older checkouts may still use Gitea
-  as `origin`.
+  and work there. Verify the remote URL before fetching or pushing.
 - Use the GitHub MCP for repository, pull-request, and Actions operations.
   Use local Git for checkouts, commits, and pushes.
 - Do not commit, push, open, or merge a PR without explicit user

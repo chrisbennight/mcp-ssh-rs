@@ -51,10 +51,9 @@ const OPERATIONS_OUTPUT_PREVIEW_BYTES: usize = 2 << 10;
 
 /// Header the proxy's authenticator puts the signed-in operator's name in.
 ///
-/// Authentik's outpost sets this and Traefik forwards it. It is believed only
-/// because the request also carried the proxy's credential, which nothing on
-/// the other side of the proxy holds.
-const OPERATOR_HEADER: &str = "x-authentik-username";
+/// Default operator identity header set by the authenticated reverse proxy.
+/// It is trusted only alongside the proxy's separate credential.
+pub(crate) const OPERATOR_HEADER: &str = "x-mcp-operator";
 
 /// Header a browser stamps on every request with how the initiating page
 /// relates to the destination.
@@ -86,14 +85,21 @@ impl Operator {
 pub struct Proxy {
     bearers: Arc<SharedBearer>,
     local_operator: Option<String>,
+    operator_header: axum::http::HeaderName,
 }
 
 impl Proxy {
+    pub fn with_operator_header(mut self, header: axum::http::HeaderName) -> Self {
+        self.operator_header = header;
+        self
+    }
+
     #[must_use]
     pub const fn new(bearers: Arc<SharedBearer>) -> Self {
         Self {
             bearers,
             local_operator: None,
+            operator_header: axum::http::HeaderName::from_static(OPERATOR_HEADER),
         }
     }
 
@@ -102,6 +108,7 @@ impl Proxy {
         Self {
             bearers: password,
             local_operator: Some(operator),
+            operator_header: axum::http::HeaderName::from_static(OPERATOR_HEADER),
         }
     }
 }
@@ -135,7 +142,7 @@ pub async fn require_operator(
         if !proxy.bearers.accepts(presented.as_bytes()) {
             return refused();
         }
-        let Some(who) = single_header(request.headers(), OPERATOR_HEADER) else {
+        let Some(who) = single_header(request.headers(), proxy.operator_header.as_str()) else {
             return refused();
         };
         if who.trim().is_empty() {

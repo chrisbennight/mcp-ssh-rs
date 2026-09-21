@@ -220,7 +220,9 @@ pub async fn serve(
                 .context("HTTP authentication requires a bearer")?;
             (
                 Some(Ingress::new(Arc::new(bearers), verifier)),
-                settings.proxy_bearers.map(|b| Proxy::new(Arc::new(b))),
+                settings.proxy_bearers.map(|b| {
+                    Proxy::new(Arc::new(b)).with_operator_header(settings.operator_header.clone())
+                }),
                 None,
             )
         }
@@ -258,7 +260,11 @@ pub async fn serve(
     };
     let audit_reader: Arc<dyn crate::audit_history::ReadsAudit> = match settings.audit_query {
         Some(endpoint) => Arc::new(
-            crate::audit_history::Loki::new(endpoint).context("configuring audit history")?,
+            crate::audit_history::Loki::new(
+                endpoint,
+                settings.audit_labels.context("audit labels are required")?,
+            )
+            .context("configuring audit history")?,
         ),
         None => Arc::new(crate::audit_history::Unavailable),
     };
@@ -702,7 +708,7 @@ mod tests {
                             axum::http::header::AUTHORIZATION,
                             "Bearer 89abcdef0123456789abcdef01234567",
                         )
-                        .header("x-authentik-username", "chris")
+                        .header(crate::dashboard::OPERATOR_HEADER, "chris")
                         .body(Body::empty())
                         .unwrap(),
                 )

@@ -72,7 +72,8 @@ and the host's Docker socket because they expose deployment credentials.
 using the separately authenticated operator surface. The gateway supplies
 an EdDSA-signed `x-mcp-identity` assertion for audience `mcp-ssh-rs` and its
 service bearer. The authenticated dashboard proxy supplies its separate bearer
-and `x-authentik-username`, stripping caller-supplied identity headers first.
+and the operator identity header configured by `MCP_SSH_OPERATOR_HEADER`
+(default `x-mcp-operator`), stripping caller-supplied identity headers first.
 Optional `MCP_SSH_GATEWAY_BEARER_PREVIOUS` and
 `MCP_SSH_PROXY_BEARER_PREVIOUS` support a rotation overlap. Gateway and
 standalone settings cannot be mixed. A failed gateway never enables standalone
@@ -163,10 +164,11 @@ and retention. Command arguments, identity labels, and output
 can contain sensitive operational data. The process-local chain is not durable
 storage or a restart-spanning history. See the [recording design](design.md#audit-and-evaluation).
 
-`MCP_SSH_AUDIT_QUERY_URL` enables the existing Loki history reader. Without it,
-historical dashboard pages explicitly report the durable source unavailable.
-The current reader assumes the container label `mcp-ssh` and stdout stream;
-adapting labels and authenticated remote Loki access remains deployment work.
+Configure `MCP_SSH_AUDIT_QUERY_URL` and `MCP_SSH_AUDIT_LABELS` together to enable
+Loki history. Labels are an explicit JSON object, such as
+`{"app":"ssh-service","stream":"audit"}`, matching the deployment's collector.
+Without the pair, historical pages report the durable source unavailable.
+Authenticated remote Loki access requires a separately protected adapter.
 `MCP_SSH_NOTIFY_URL`, together with `MCP_SSH_DASHBOARD_URL`, enables an optional
 approval-notification webhook. Neither integration is required for the tutorial.
 These outbound integrations and gateway key discovery support verified HTTPS

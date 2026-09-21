@@ -235,8 +235,7 @@ fn acting_for(extensions: &Extensions) -> Result<&AuthenticatedPrincipal, McpErr
     // The ingress layer attaches the principal to the HTTP request. The
     // transport does not surface that request's extensions here directly; it
     // carries the whole `http::request::Parts` as a single extension, and the
-    // principal lives inside it. Read it from there — the top level never holds
-    // it on the wire, only the tests that construct a context by hand once did.
+    // principal lives inside it. Top-level extensions cannot establish HTTP identity.
     extensions
         .get::<axum::http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<AuthenticatedPrincipal>())
