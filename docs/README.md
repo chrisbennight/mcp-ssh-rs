@@ -6,6 +6,7 @@ before configuring any existing SSH host.
 | I want to… | Start here | What you need |
 | --- | --- | --- |
 | See a command reviewed and completed | [Local demonstration](quickstart.md) | Docker with a Linux daemon, Compose, Python, OpenSSH tools, and a browser |
+| Install, identify, or upgrade a release | [Release installation](installation.md) | A published release and Docker with a local Linux daemon |
 | Connect an MCP client | [Tested client walkthrough](clients.md) | A running demo; Node.js for MCP Inspector CLI |
 | Choose standalone or gateway access | [Authentication](operations.md#choose-authentication-explicitly) | An operator-controlled deployment |
 | Configure my own SSH host | [Add a host](operations.md#add-a-host) | A target account, its credential, and a verified host key |

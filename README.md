@@ -40,8 +40,9 @@ context and retrieve it through the configured byte channel.
 
 ## Try it locally
 
-The project is preparing its initial release; see the [changelog](CHANGELOG.md).
-The supported starting point builds from source on Docker with a local Linux
+This is an early 0.1 project; interfaces and configuration may change.
+For an identified container, use the [release installation guide](docs/installation.md).
+The demonstration below builds from source on Docker with a local Linux
 daemon and Compose v2 or newer. You also need Python 3.11 or newer,
 OpenSSH's `ssh-keygen`, and a browser. The first build downloads public
 dependencies and takes several minutes.
@@ -96,7 +97,8 @@ configuration each route needs.
 
 [Get help or report a bug](SUPPORT.md) ·
 [Contribute](CONTRIBUTING.md) · [Report a vulnerability](SECURITY.md) ·
-[Release notes](CHANGELOG.md)
+[Published releases](https://github.com/chrisbennight/mcp-ssh-rs/releases) ·
+[Changelog](CHANGELOG.md)
 
 ## License
 

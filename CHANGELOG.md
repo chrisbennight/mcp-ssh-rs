@@ -1,6 +1,11 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0
+
+This entry describes the initial release contents. Check
+[published releases](https://github.com/chrisbennight/mcp-ssh-rs/releases) for
+availability; an entry here does not publish an artifact. A published release
+identifies its source revision, tested image digest, and compatibility evidence.
 
 Initial public release:
 
