@@ -238,6 +238,7 @@ impl StreamOut {
 /// What an agent is told about a command it asked to run.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[schemars(extend("type" = "object"))]
 pub enum ExecResult {
     /// It ran, and it is over.
     ///
@@ -1803,11 +1804,18 @@ mod tests {
     /// refusal as well as the shape of a result.
     #[test]
     fn every_tool_declares_what_it_returns() {
-        for tool in &catalog().tools {
-            assert!(
-                tool.output_schema.is_some(),
-                "{} does not say what it returns",
-                tool.name
+        let files = crate::transfer::Transfers::new(
+            Arc::new(ssh_core::clock::TestClock::at(0)),
+            "https://ssh.example",
+        )
+        .unwrap();
+        for tool in &catalog_with_files(Some(&files)).tools {
+            let schema = tool.output_schema.as_ref().expect("tool output schema");
+            assert_eq!(
+                schema.get("type"),
+                Some(&serde_json::json!("object")),
+                "{} must declare the MCP output object's root type",
+                tool.name,
             );
         }
     }

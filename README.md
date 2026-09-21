@@ -1,57 +1,102 @@
 # mcp-ssh-rs
 
-An MCP service that runs SSH commands through configured accounts, with
-a reviewable execution record and optional human approval. MCP (Model
-Context Protocol) lets an AI client call these operations as tools.
+**SSH commands and file transfers for AI agents, with optional human approval.**
 
-## Try it
+Connect an MCP client to your configured SSH accounts. Review proposed commands
+in a browser, collect their results, and inspect the execution record.
+MCP (Model Context Protocol) lets an AI client use these operations as tools.
 
-Follow the [local Quickstart](docs/quickstart.md). It builds the service and a
-disposable SSH target, generates credentials, and shows this sequence:
+**[Try the local demo](#try-it-locally)** ·
+**[Explore the documentation](docs/README.md)** ·
+**[Contribute](CONTRIBUTING.md)** · **[Get help](SUPPORT.md)**
 
-1. A client opens a session on an account configured for human review.
-2. The operator reviews the file-creation request in the browser.
-3. The client collects the approved result.
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/images/approval-mobile.png">
+  <img src="docs/images/approval.png" alt="A pending command to create a tutorial file on the demo host. The review queue shows its arguments, purpose, target account, and Approve once and Refuse controls.">
+</picture>
 
-No gateway, identity provider, or private lab service is required for standalone
-mode. The tutorial uses public build dependencies and a small Python MCP client.
+Review the proposed command and its purpose before choosing **Approve once**.
+The client then collects the decision and result. This is the actual
+[disposable demo](docs/quickstart.md), with a non-root SSH account.
+[View the screenshot at full size](docs/images/approval.png).
 
-## What is available
+## Things to try
 
-- Host and role discovery, bounded sessions, command execution, result polling,
-  and session closure through stdio or stateless MCP HTTP behind a TLS proxy.
-- Explicit account access classes, checked against configuration and session
-  ownership on MCP session operations.
-- Binary SFTP upload/download by file reference, with HTTP byte transfer or
-  local stdio files; bulk command output stays outside model context.
-- Optional account-based human review and a browser queue for held commands.
-- Verified SSH host keys and target credentials supplied by the operator.
-- Required audit and diagnostic sinks configured independently, with optional
-  Loki history and notification adapters.
-- Explicit standalone authentication, or the existing gateway integration with
-  signed identity assertions.
+**Inspect a configured server.** Let an agent discover the available hosts and
+accounts, open a session, and collect a command's output.
+[Configure your first host](docs/operations.md#add-a-host).
 
-OAuth login, independent tenants, and active replicas
-are outside the initial supported setup. The service does not provision target
-accounts or their permissions. Read the [design's non-goals and preconditions](docs/design.md#non-goals-and-preconditions)
-before connecting real hosts.
+**Review a proposed change.** See the target, exact command arguments, and
+agent's stated purpose together in the browser. Try creating a file on a
+disposable target and collecting the approved result.
+[Follow the approval walkthrough](docs/quickstart.md#request-approval).
 
-## Documentation
+**Move files over SFTP.** Upload a file or retrieve a binary artifact using file
+references. [Set up file transfers](docs/file-transfers.md).
 
-- [Quickstart](docs/quickstart.md): a disposable setup and first commands.
-- [Operating the service](docs/operations.md): authentication, hosts, policy,
-  credential rotation, approvals, and recovery.
-- [Design](docs/design.md): intent, trust boundaries, and architectural decisions.
-- [Dependency security](docs/dependency-security.md): advisory assessment and RSA compatibility.
-- [Contributing](CONTRIBUTING.md): development checks, pull requests, and image publication.
-- [File transfers](docs/file-transfers.md): byte channels, file tools, bounds, and recovery.
-- [Outbound connections](docs/outbound-connections.md): HTTPS and certificate trust.
-- [Security reports](SECURITY.md): how to request a private reporting channel.
-- [Preparing a public release](docs/releases.md): snapshot and distribution checks.
+**Collect large command results as files.** Keep bulk output outside the model's
+context and retrieve it through the configured byte channel.
+[Choose a file channel](docs/file-transfers.md).
 
-Use GitHub issues for reproducible bugs and feature requests. Include the
-revision, relevant configuration **names**, and a minimal example. Remove
-credentials and private deployment details from reports.
+## Try it locally
+
+The project is preparing its initial release; see the [changelog](CHANGELOG.md).
+The supported starting point builds from source on Docker with a local Linux
+daemon and Compose v2 or newer. You also need Python 3.11 or newer,
+OpenSSH's `ssh-keygen`, and a browser. The first build downloads public
+dependencies and takes several minutes.
+
+```sh
+git clone https://github.com/chrisbennight/mcp-ssh-rs.git
+cd mcp-ssh-rs
+python3 examples/quickstart/demo.py start
+python3 examples/quickstart/demo.py request
+```
+
+The request reports `outcome: "awaiting_approval"`. Open the dashboard URL
+printed at startup. Sign in as `operator`, reading the generated password
+locally from `.quickstart/operator-password`. Review the marker-file request
+and choose **Approve once**, then collect the result:
+
+```sh
+python3 examples/quickstart/demo.py collect
+```
+
+The completed result includes:
+
+```json
+{"outcome": "ran", "exit": 0}
+```
+
+This excerpt omits the generated identifiers and other result fields. If you
+have not approved yet, the request remains waiting. Approval alone does not
+execute the command; collection is part of the workflow.
+
+The demo runs against a disposable SSH target on your computer. It needs no
+gateway, identity provider, model account, or private infrastructure. The full
+[tutorial](docs/quickstart.md) covers the execution record, other MCP clients,
+and [common failures](docs/quickstart.md#common-failures).
+
+When finished, remove the demo containers and generated files:
+
+```sh
+python3 examples/quickstart/demo.py stop
+```
+
+Downloaded and built images remain cached. Before connecting real hosts, read
+the [operating guide](docs/operations.md) and the
+[design's non-goals and preconditions](docs/design.md#non-goals-and-preconditions).
+
+## Go further
+
+Use [the documentation guide](docs/README.md) to connect a client, configure
+hosts, transfer files, and operate the service. The service supports standalone
+stdio or HTTP, with optional gateway integration; the guide explains the
+configuration each route needs.
+
+[Get help or report a bug](SUPPORT.md) ·
+[Contribute](CONTRIBUTING.md) · [Report a vulnerability](SECURITY.md) ·
+[Release notes](CHANGELOG.md)
 
 ## License
 

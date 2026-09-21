@@ -3,14 +3,11 @@
 Security fixes target `main`. There are no maintained stable release branches
 or promised response times.
 
-Use **Security → Advisories → Report a vulnerability** if that option is
-available in the repository. It sends a private report to the maintainers.
-Availability depends on repository settings; this file does not enable it.
-
-If the option is absent and you do not already have a private maintainer
-contact, open an issue titled **Request for private security contact**. Include
-only the request for a contact route. Wait for a private channel before sending
-vulnerability details, affected hostnames, credentials, logs, or exploit code.
+Use [GitHub's private vulnerability report form](https://github.com/chrisbennight/mcp-ssh-rs/security/advisories/new).
+Private vulnerability reporting is enabled for this repository. Sign in to
+GitHub and choose **Security → Advisories → Report a vulnerability** to send
+the report privately to the repository maintainers. Do not post vulnerability
+details in public issues or pull requests.
 
 In the private report, include the commit or image digest, affected deployment
 mode, expected behavior, observed behavior, and a minimal reproduction using

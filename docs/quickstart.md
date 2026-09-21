@@ -91,8 +91,9 @@ production retention setup.
 
 ## Use another MCP client
 
-The tested client is the small Python implementation in
-[`demo.py`](../examples/quickstart/demo.py). A compatible non-browser client
+The supplied client is the small Python implementation in
+[`demo.py`](../examples/quickstart/demo.py). For a tested external client, follow
+the [MCP Inspector CLI walkthrough](clients.md). A compatible non-browser client
 uses Streamable HTTP at `http://127.0.0.1:8080/mcp`, with an
 `Authorization: Bearer ...` header supplied from `.quickstart/mcp-token` through
 its credential configuration. Use your selected port if different. The service
