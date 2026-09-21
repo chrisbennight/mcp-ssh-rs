@@ -16,7 +16,7 @@ struct Args {
     healthcheck: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<std::process::ExitCode> {
     let args = Args::parse();
     let config = Config::from_env().context("reading configuration")?;
 
@@ -26,7 +26,9 @@ fn main() -> anyhow::Result<()> {
         .context("starting the async runtime")?;
 
     if args.healthcheck {
-        return runtime.block_on(healthcheck(&config));
+        return runtime
+            .block_on(healthcheck(&config))
+            .map(|()| std::process::ExitCode::SUCCESS);
     }
 
     let settings = ssh_server::settings::Settings::from_env().context("reading settings")?;
@@ -46,7 +48,13 @@ fn main() -> anyhow::Result<()> {
     let result = runtime.block_on(ssh_server::serve(&config, settings, outputs.audit));
     // Tokio's stdin reader can remain blocked after a signal-driven shutdown.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-    result
+    match result {
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
+        Err(error) => {
+            tracing::error!(%error, "service stopped with an error");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Asks the local instance whether it is serving.
