@@ -557,7 +557,7 @@ mod tests {
                 IdentityVerifier::new(crate::ingress::IdentitySettings {
                     jwks_url: url::Url::parse("http://mcp-gateway:8080/.well-known/jwks.json")
                         .unwrap(),
-                    issuer: "https://mcp.cacahuate.org".to_owned(),
+                    issuer: "https://gateway.example".to_owned(),
                 })
                 .unwrap(),
             ),
@@ -680,7 +680,7 @@ mod tests {
     ];
     const PUBLIC_KEY_X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const KEY_ID: &str = "gateway-1";
-    const ISSUER: &str = "https://mcp.cacahuate.org";
+    const ISSUER: &str = "https://gateway.example";
     const BEARER: &str = "0123456789abcdef0123456789abcdef";
     // Named here rather than imported from ingress so a change to either the
     // wire contract or the header name fails this test instead of silently

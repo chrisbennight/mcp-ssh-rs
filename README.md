@@ -4,9 +4,9 @@ An MCP service that runs SSH commands on configured hosts, with command policy,
 a reviewable execution record, and human approval when required. MCP (Model
 Context Protocol) lets an AI client call these operations as tools.
 
-**Status: preparing the first public release.** Development currently takes
-place in this private GitHub repository. The initial supported setup is a
-personal Linux/container deployment in one administrative domain.
+**Status: preparing the first release.** Development takes place on GitHub.
+The initial supported setup is a personal Linux/container deployment in one
+administrative domain.
 
 ## Try it
 
@@ -44,6 +44,8 @@ before connecting real hosts.
 - [Dependency security](docs/dependency-security.md): advisory assessment and RSA compatibility.
 - [Contributing](CONTRIBUTING.md): development checks, pull requests, and image publication.
 - [Outbound connections](docs/outbound-connections.md): HTTPS and certificate trust.
+- [Security reports](SECURITY.md): how to request a private reporting channel.
+- [Preparing a public release](docs/releases.md): snapshot and distribution checks.
 
 Use GitHub issues for reproducible bugs and feature requests. Include the
 revision, relevant configuration **names**, and a minimal example. Remove

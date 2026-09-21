@@ -615,7 +615,7 @@ mod tests {
                 Settings::JWKS_VAR,
                 "http://mcp-gateway:8080/.well-known/jwks.json".to_owned(),
             ),
-            (Settings::ISSUER_VAR, "https://mcp.cacahuate.org".to_owned()),
+            (Settings::ISSUER_VAR, "https://gateway.example".to_owned()),
         ])
     }
 
@@ -635,7 +635,7 @@ mod tests {
         );
         assert!(settings.bearers.accepts(BEARER.as_bytes()));
         assert!(
-            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://mcp.cacahuate.org")
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://gateway.example")
         );
     }
 
@@ -857,10 +857,7 @@ mod tests {
 
         let mut vars = complete();
         vars.insert(Settings::NOTIFY_VAR, "http://ntfy/mcp-ssh".to_owned());
-        vars.insert(
-            Settings::DASHBOARD_VAR,
-            "https://ssh.cacahuate.org/".to_owned(),
-        );
+        vars.insert(Settings::DASHBOARD_VAR, "https://ssh.example/".to_owned());
         let settings = Settings::from_lookup(read(&vars)).unwrap();
         assert!(settings.notify.is_some());
         assert!(settings.dashboard.is_some());
@@ -908,11 +905,11 @@ mod tests {
         let mut vars = complete();
         vars.insert(
             Settings::ISSUER_VAR,
-            "  https://mcp.cacahuate.org  ".to_owned(),
+            "  https://gateway.example  ".to_owned(),
         );
         let settings = Settings::from_lookup(read(&vars)).unwrap();
         assert!(
-            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://mcp.cacahuate.org")
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://gateway.example")
         );
     }
 

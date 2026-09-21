@@ -678,7 +678,7 @@ mod tests {
     ];
     const PUBLIC_KEY_X: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const KEY_ID: &str = "gateway-1";
-    const ISSUER: &str = "https://mcp.cacahuate.org";
+    const ISSUER: &str = "https://gateway.example";
     const BEARER: &str = "0123456789abcdef0123456789abcdef";
 
     #[derive(Serialize)]

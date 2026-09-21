@@ -1,7 +1,7 @@
 # mcp-ssh-rs — design
 
 An MCP service that gives AI agents constrained, audited, on-demand SSH access
-to homelab hosts, with policy-based authorization and human-in-the-loop
+to configured hosts, with policy-based authorization and human-in-the-loop
 approval for what policy flags.
 
 **What this document is.** Intent, trust boundaries, component
@@ -88,7 +88,7 @@ today, where a human currently SSHes in and relays output.
   loop here, and currently the most human-relayed.
 - **Act on a diagnosis** — create directories for a new service, restart a
   unit, reclaim disk. Mutating, and gated accordingly.
-- **Work on the remote family site**, where existing policy already requires
+- **Work on a remote site**, where deployment policy requires
   human confirmation for anything host-level.
 
 Anti-use-cases, and what actually holds each one. Destructive primitives and

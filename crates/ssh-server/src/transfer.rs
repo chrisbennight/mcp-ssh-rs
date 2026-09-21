@@ -381,7 +381,7 @@ mod tests {
     use ssh_core::clock::TestClock;
 
     fn transfers() -> Transfers<TestClock> {
-        Transfers::new(TestClock::at(1_000), "https://ssh.cacahuate.org".to_owned())
+        Transfers::new(TestClock::at(1_000), "https://ssh.example".to_owned())
     }
 
     fn principal(name: &str) -> PrincipalId {
@@ -437,7 +437,7 @@ mod tests {
         assert!(
             descriptor
                 .url
-                .starts_with("https://ssh.cacahuate.org/files/download/")
+                .starts_with("https://ssh.example/files/download/")
         );
         // The credential is in a header of its own, never in the URL.
         assert!(!descriptor.url.contains(&credential(&descriptor)));

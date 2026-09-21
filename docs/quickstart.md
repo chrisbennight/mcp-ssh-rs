@@ -13,9 +13,15 @@ sudo access. Nothing connects to your existing SSH hosts.
   dependencies during the first build. Building from source takes several minutes.
 - A current browser for the approval page.
 
-Run the commands below from the repository root. The repository is private
-during preparation, so obtaining the checkout currently requires repository
-access. No published binary or anonymous image pull is assumed here.
+Clone the public repository, then run the commands below from its root:
+
+```sh
+git clone https://github.com/chrisbennight/mcp-ssh-rs.git
+cd mcp-ssh-rs
+```
+
+This tutorial builds from source; it does not require a published binary or
+access to a prebuilt service image.
 
 ## Start
 

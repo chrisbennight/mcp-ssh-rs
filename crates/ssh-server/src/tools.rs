@@ -1501,7 +1501,7 @@ mod tests {
             Executed::AwaitingApproval { decision, asked }
         };
 
-        let page = url::Url::parse("https://ssh.cacahuate.org/dashboard/approvals").unwrap();
+        let page = url::Url::parse("https://ssh.example/dashboard/approvals").unwrap();
         let told = serde_json::to_value(exec_result(held(), Some(&page))).unwrap();
         let request = told
             .get("request")
@@ -1510,7 +1510,7 @@ mod tests {
             .to_owned();
         assert_eq!(
             told.get("decide_at").and_then(|value| value.as_str()),
-            Some(format!("https://ssh.cacahuate.org/dashboard/approvals#{request}").as_str()),
+            Some(format!("https://ssh.example/dashboard/approvals#{request}").as_str()),
             "the page is not the configured address with the request as fragment"
         );
 
@@ -1597,7 +1597,7 @@ mod tests {
             other => panic!("expected a waiting request, got {other:?}"),
         };
 
-        let page = url::Url::parse("https://ssh.cacahuate.org/dashboard/approvals").unwrap();
+        let page = url::Url::parse("https://ssh.example/dashboard/approvals").unwrap();
         let told = serde_json::to_value(exec_result(
             Executed::ApprovalLapsed {
                 decision,
@@ -1622,7 +1622,7 @@ mod tests {
             .to_owned();
         assert_eq!(
             told.get("decide_at").and_then(serde_json::Value::as_str),
-            Some(format!("https://ssh.cacahuate.org/dashboard/approvals#{request}").as_str()),
+            Some(format!("https://ssh.example/dashboard/approvals#{request}").as_str()),
             "the new request is not where the caller is sent"
         );
         let why = told
@@ -1712,7 +1712,7 @@ mod tests {
         }
 
         let notes = Recording(Mutex::new(Vec::new()));
-        let dashboard = url::Url::parse("https://ssh.cacahuate.org/").unwrap();
+        let dashboard = url::Url::parse("https://ssh.example/").unwrap();
 
         announce_ask(
             &notes,
