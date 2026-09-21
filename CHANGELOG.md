@@ -2,9 +2,10 @@
 
 ## 0.1.0
 
-Publication status, the source revision, tested image digest, and compatibility
-evidence are recorded in the
-[GitHub release](https://github.com/chrisbennight/mcp-ssh-rs/releases/tag/v0.1.0).
+This entry describes the initial release contents. Check
+[published releases](https://github.com/chrisbennight/mcp-ssh-rs/releases) for
+availability; an entry here does not publish an artifact. A published release
+identifies its source revision, tested image digest, and compatibility evidence.
 
 Initial public release:
 
