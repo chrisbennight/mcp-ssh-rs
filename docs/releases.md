@@ -23,8 +23,11 @@ compatibility limits, the source commit, and tested image digest.
 
 ## Distribution
 
-The pipeline publishes a container after successful checks on `main`. It does
-not create release tags, standalone binary downloads, or crates.io packages.
+The pipeline publishes a container after successful checks on `main` or a
+maintainer-created version tag. Tag the selected commit as `v<workspace-version>`;
+the release reference check refuses a tag that disagrees with `Cargo.toml`.
+The image uses the same full-commit SHA tag and verified digest on either path.
+The pipeline does not create release tags, standalone binary downloads, or crates.io packages.
 The workspace crates have `publish = false`. See
 [image publication](../CONTRIBUTING.md#github-checks-and-images) for naming and
 validation.
