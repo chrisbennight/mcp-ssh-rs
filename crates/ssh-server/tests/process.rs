@@ -17,8 +17,7 @@ impl Fixture {
         Self(path)
     }
     fn command(&self) -> tokio::process::Command {
-        let executable = std::env::var_os("CARGO_BIN_EXE_mcp-ssh-rs")
-            .expect("Cargo must provide the service executable when running integration tests");
+        let executable = env!("CARGO_BIN_EXE_mcp-ssh-rs");
         let mut command = tokio::process::Command::new(executable);
         command
             .env_clear()
