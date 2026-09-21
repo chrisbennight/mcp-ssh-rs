@@ -5,5 +5,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y openssh-server 
     && passwd -d demo \
     && mkdir -p /run/sshd
 COPY sshd_config /etc/ssh/sshd_config
+COPY --chmod=755 entrypoint.sh /usr/local/bin/start-demo-sshd
 EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/start-demo-sshd"]
 CMD ["/usr/sbin/sshd", "-D", "-e"]

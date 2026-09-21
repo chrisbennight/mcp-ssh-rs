@@ -4,7 +4,7 @@ services:
       context: .
     volumes:
       - ${DEMO_DATA_DIR}/host_key:/etc/ssh/ssh_host_ed25519_key:ro
-      - ${DEMO_DATA_DIR}/client_key.pub:/etc/ssh/demo_authorized_keys:ro
+      - ${DEMO_DATA_DIR}/client_key.pub:/run/demo_authorized_keys:ro
     networks: [demo]
     healthcheck:
       test: [CMD-SHELL, 'test -s /run/sshd.pid && kill -0 "$$(cat /run/sshd.pid)"']
