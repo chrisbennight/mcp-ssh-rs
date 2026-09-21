@@ -21,17 +21,6 @@ base64 = "0.22"
 cedar-policy = "4.12"
 clap = { version = "4", features = ["derive"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
-# No TLS backend. Every reqwest request is plaintext on the internal network:
-# the healthcheck's GET to itself over loopback, the ingress fetching the
-# gateway's signing keys from a sibling container, and the notifier posting a
-# note to a deployment-configured webhook, which refuses a non-http endpoint
-# at startup. Enabling
-# TLS would link a second native crypto library into the image for connections
-# that do not cross an untrusted network — and the ingress refuses an `https`
-# key set URL at startup rather than accepting one it could not fetch. What that
-# fetch is trusted for is bounded: the keys are used to verify signatures, and a
-# key set that answers with anything unexpected is refused, not believed.
-# russh brings its own crypto, because SSH is cryptography and that one is used.
 rand = "0.10"
 rsa = "0.10.0-rc.18"
 rmcp = { version = "=2.2.0", default-features = false, features = [
@@ -40,7 +29,8 @@ rmcp = { version = "=2.2.0", default-features = false, features = [
     # the surface crate so the version and its features stay one decision.
     "transport-streamable-http-server",
 ] }
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+# Rustls uses the AWS-LC provider already used for RSA authentication.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 russh = "0.62"
 russh-sftp = "2.4"
 schemars = "1"

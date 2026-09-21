@@ -36,6 +36,7 @@ and OpenSSH's `ssh-keygen`, then run:
 ```sh
 docker build --tag mcp-ssh-ci .
 python3 .ci/smoke_image.py mcp-ssh-ci
+python3 .ci/verify_https.py --image mcp-ssh-ci
 python3 .ci/verify_quickstart.py mcp-ssh-ci
 ```
 
@@ -43,6 +44,14 @@ The smoke test uses a generated key, a disposable registry, and an isolated
 container. It checks non-root execution, the built-in healthcheck, and liveness
 with a read-only filesystem and no external network. It does not test an
 authenticated MCP session or a real SSH target.
+
+The HTTPS check also needs the `openssl` command. It generates local certificate
+authorities and loopback peers, and builds a disposable SSH account that refuses
+command execution. It checks gateway key discovery, notification delivery, and
+Loki reads with trusted, untrusted, expired, and wrong-host certificates, and
+checks that redirects are not followed. Its container mode requires a local
+Linux Docker daemon. Generated credentials and containers are removed; the
+small target image remains cached.
 
 The separate Quickstart check starts a disposable SSH target and exercises the
 real MCP route, a permitted command, a held command, the separate operator

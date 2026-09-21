@@ -57,6 +57,8 @@ jobs:
         run: docker build --tag mcp-ssh-ci .
       - name: Check the container
         run: python3 .ci/smoke_image.py mcp-ssh-ci
+      - name: Verify outbound TLS
+        run: python3 .ci/verify_https.py --image mcp-ssh-ci
       - name: Exercise the standalone Quickstart
         run: python3 .ci/verify_quickstart.py mcp-ssh-ci
 

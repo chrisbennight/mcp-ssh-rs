@@ -136,11 +136,8 @@ pub struct Webhook {
 
 impl Webhook {
     pub fn new(endpoint: Url) -> Result<Self, NotifierError> {
-        // Same reason as the gateway's key set: this image carries no TLS
-        // backend, so an https endpoint would be accepted and then fail on
-        // every send, silently, since nothing waits for the result.
-        if endpoint.scheme() != "http" {
-            return Err(NotifierError::NotPlainHttp);
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            return Err(NotifierError::NotHttp);
         }
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -189,10 +186,8 @@ impl Notifier for Webhook {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NotifierError {
-    #[error(
-        "the notifier endpoint must be plain http; this image carries no TLS backend, so an https endpoint would fail on every send"
-    )]
-    NotPlainHttp,
+    #[error("the notifier endpoint must use http or https")]
+    NotHttp,
     #[error("the notifier's http client could not be built")]
     Client,
 }
@@ -384,8 +379,8 @@ mod tests {
     #[test]
     fn an_endpoint_that_could_never_be_reached_is_refused_at_startup() {
         assert!(matches!(
-            Webhook::new(Url::parse("https://notify.invalid/hook").unwrap()),
-            Err(NotifierError::NotPlainHttp)
+            Webhook::new(Url::parse("ftp://notify.invalid/hook").unwrap()),
+            Err(NotifierError::NotHttp)
         ));
         assert!(Webhook::new(Url::parse("http://ntfy/mcp-ssh").unwrap()).is_ok());
     }

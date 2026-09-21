@@ -123,8 +123,9 @@ The current reader assumes the container label `mcp-ssh` and stdout stream;
 adapting labels and authenticated remote Loki access remains deployment work.
 `MCP_SSH_NOTIFY_URL`, together with `MCP_SSH_DASHBOARD_URL`, enables an optional
 approval-notification webhook. Neither integration is required for the tutorial.
-These outbound integrations and gateway key discovery currently accept internal
-HTTP URLs only. Verified HTTPS support is still a portability task.
+These outbound integrations and gateway key discovery support verified HTTPS
+as well as protected internal HTTP. See [outbound connections](outbound-connections.md)
+for certificate trust and private CA configuration.
 
 An optional evaluator may append advisory evidence using
 `MCP_SSH_EVALUATOR_BEARER_CURRENT` and `MCP_SSH_EVALUATOR_NAME`, with an optional

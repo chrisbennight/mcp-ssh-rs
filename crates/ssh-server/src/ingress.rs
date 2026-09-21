@@ -169,10 +169,9 @@ pub struct IdentitySettings {
 impl IdentitySettings {
     /// Refuses settings this image cannot use before a verifier is built.
     pub fn validate(&self) -> Result<(), IngressError> {
-        // The gateway is a sibling container on an internal network and this
-        // image deliberately carries no TLS backend.
-        if self.jwks_url.scheme() != "http" {
-            return Err(IngressError::JwksNotPlainHttp);
+        // HTTP is for a protected internal hop; HTTPS verifies the remote peer.
+        if !matches!(self.jwks_url.scheme(), "http" | "https") {
+            return Err(IngressError::JwksNotHttp);
         }
         if self.jwks_url.host().is_none()
             || !self.jwks_url.username().is_empty()
@@ -226,6 +225,7 @@ impl IdentityVerifier {
             // The gateway is reached directly. A proxy discovered from the
             // environment would send key fetches somewhere else entirely.
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|_| IngressError::HttpClient)?;
@@ -507,10 +507,8 @@ pub enum IngressError {
     BearersSharedAcrossSurfaces,
     #[error("the identity issuer must not be blank")]
     IssuerBlank,
-    #[error(
-        "the identity key set must be plain http; this image carries no TLS backend, because the gateway is a sibling on the internal network"
-    )]
-    JwksNotPlainHttp,
+    #[error("the identity key set must use http or https")]
+    JwksNotHttp,
     #[error("the identity key set URL must have a host and no credentials, query, or fragment")]
     JwksUrlUnusable,
     #[error("the identity key fetcher could not be built")]
@@ -1309,8 +1307,8 @@ mod tests {
             issuer: ISSUER.to_owned(),
         };
         assert!(matches!(
-            IdentityVerifier::new(settings("https://gateway.invalid/jwks.json")),
-            Err(IngressError::JwksNotPlainHttp)
+            IdentityVerifier::new(settings("ftp://gateway.invalid/jwks.json")),
+            Err(IngressError::JwksNotHttp)
         ));
         // Both halves of userinfo, because a URL carrying a password and no
         // user name is still a URL with a credential in it.

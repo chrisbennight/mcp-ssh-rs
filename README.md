@@ -43,6 +43,7 @@ before connecting real hosts.
 - [Design](docs/design.md): intent, trust boundaries, and architectural decisions.
 - [Dependency security](docs/dependency-security.md): advisory assessment and RSA compatibility.
 - [Contributing](CONTRIBUTING.md): development checks, pull requests, and image publication.
+- [Outbound connections](docs/outbound-connections.md): HTTPS and certificate trust.
 
 Use GitHub issues for reproducible bugs and feature requests. Include the
 revision, relevant configuration **names**, and a minimal example. Remove

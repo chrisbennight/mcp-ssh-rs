@@ -375,16 +375,10 @@ impl Settings {
             bearers,
             proxy_bearers,
             evaluator,
-            // The runtime image deliberately has no TLS backend. Loki query
-            // access is internal-only in this deployment, on a shared Docker
-            // network, so a configured reader must name that plaintext hop.
             audit_query: optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?,
             identity,
-            // Refused here by variable name rather than later by whatever
-            // consumes them: an endpoint this image could never reach (it
-            // carries no TLS backend) and a dashboard link that is not a web
-            // address would each fail after startup, silently or in a note.
-            notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http"])?,
+            // Reject unsupported endpoints by variable name before serving.
+            notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
             dashboard: optional_url(&lookup, Self::DASHBOARD_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
             policy: optional(&lookup, Self::POLICY_VAR)?.map(PathBuf::from),
@@ -522,7 +516,7 @@ fn optional_base_url<F>(lookup: &F, var: &'static str) -> Result<Option<Url>, Se
 where
     F: Fn(&'static str) -> Result<String, VarError>,
 {
-    let Some(url) = optional_url(lookup, var, &["http"])? else {
+    let Some(url) = optional_url(lookup, var, &["http", "https"])? else {
         return Ok(None);
     };
     if url.username() != ""
@@ -738,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_audit_reader_is_optional_and_accepts_only_an_internal_http_base() {
+    fn durable_audit_reader_is_optional_and_requires_a_web_base() {
         let vars = complete();
         assert!(
             Settings::from_lookup(read(&vars))
@@ -759,7 +753,7 @@ mod tests {
         );
 
         for value in [
-            "https://loki:3100/",
+            "ftp://loki:3100/",
             "http://user:secret@loki:3100/",
             "http://loki:3100/a/path",
             "http://loki:3100/?token=secret",
@@ -843,14 +837,11 @@ mod tests {
         assert!(rendered.contains("notify_configured"));
     }
 
-    /// The notifier settings are optional, but a present value has to name a
-    /// place on the network this image can reach: a `mailto:` dashboard or an
-    /// `https` webhook (this image has no TLS backend) would each fail after
-    /// startup instead of at it, under nobody's name.
+    /// Optional endpoints must use a supported web scheme before serving.
     #[test]
     fn a_notifier_setting_that_could_never_work_is_refused_by_name() {
         for (var, value) in [
-            (Settings::NOTIFY_VAR, "https://ntfy/mcp-ssh"),
+            (Settings::NOTIFY_VAR, "ftp://ntfy/mcp-ssh"),
             (Settings::NOTIFY_VAR, "not a url"),
             (Settings::DASHBOARD_VAR, "mailto:chris@example.org"),
             (Settings::DASHBOARD_VAR, "data:text/plain,hello"),
@@ -873,6 +864,29 @@ mod tests {
         let settings = Settings::from_lookup(read(&vars)).unwrap();
         assert!(settings.notify.is_some());
         assert!(settings.dashboard.is_some());
+    }
+
+    #[test]
+    fn outbound_integrations_accept_https() {
+        let mut vars = complete();
+        vars.insert(
+            Settings::JWKS_VAR,
+            "https://gateway.example/keys".to_owned(),
+        );
+        vars.insert(
+            Settings::NOTIFY_VAR,
+            "https://notify.example/hook".to_owned(),
+        );
+        vars.insert(
+            Settings::AUDIT_QUERY_VAR,
+            "https://loki.example/".to_owned(),
+        );
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(
+            matches!(settings.identity, Authentication::Gateway(identity) if identity.jwks_url.scheme() == "https")
+        );
+        assert_eq!(settings.notify.unwrap().scheme(), "https");
+        assert_eq!(settings.audit_query.unwrap().scheme(), "https");
     }
 
     /// The previous bearer is the one setting that is genuinely optional: it
@@ -923,7 +937,7 @@ mod tests {
             (
                 Settings::JWKS_VAR,
                 Settings::JWKS_VAR,
-                "https://mcp-gateway.invalid/jwks.json".to_owned(),
+                "ftp://mcp-gateway.invalid/jwks.json".to_owned(),
             ),
         ];
         for (changed, expected, value) in cases {
