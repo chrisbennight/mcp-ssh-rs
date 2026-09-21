@@ -28,11 +28,10 @@ git checkout v0.1.0
 MCP_SSH_IMAGE='ghcr.io/chrisbennight/mcp-ssh-rs@sha256:<digest-from-release>'
 docker pull "$MCP_SSH_IMAGE"
 python3 examples/quickstart/demo.py start --service-image "$MCP_SSH_IMAGE"
-python3 examples/quickstart/demo.py request
 ```
 
-Follow [request approval](quickstart.md#request-approval) to approve the marker
-command, collect its result, and stop the demonstration. Startup uses the pulled
+Follow [request approval](quickstart.md#request-approval) to create the request,
+approve the marker command, collect its result, and stop the demonstration. Startup uses the pulled
 service image and builds only the disposable target. For real hosts, follow
 [the operating guide](operations.md) and the
 [design's preconditions](design.md#non-goals-and-preconditions).
