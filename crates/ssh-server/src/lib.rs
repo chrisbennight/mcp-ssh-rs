@@ -193,13 +193,16 @@ pub async fn serve(
     use rmcp::ServiceExt as _;
     let registry = std::fs::read_to_string(&settings.registry).context("reading the registry")?;
     let registry = Registry::from_json(&registry).context("parsing the registry")?;
-    let credentials = EnvCredentials::from_env();
-    let unusable = credentials.unusable(&registry);
+    let mut credentials = EnvCredentials::from_env();
+    let diagnostics = credentials.check_registry(&registry);
     anyhow::ensure!(
-        unusable.is_empty(),
-        "configured SSH credentials are unusable: {}",
-        unusable.join("; ")
+        diagnostics.collisions.is_empty(),
+        "configured SSH credential references collide: {}",
+        diagnostics.collisions.join("; ")
     );
+    for unavailable in diagnostics.unavailable {
+        tracing::warn!("{unavailable}; accounts using this credential are unavailable");
+    }
     let bastion = Arc::new(Bastion::recording_to(
         Arc::new(SystemClock::new().context("reading the boot clock")?),
         registry,

@@ -1,4 +1,4 @@
-FROM rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS build
+FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
 WORKDIR /src
 
 # Optional operator-supplied Cargo mirror. Without it, builds use crates.io.
@@ -22,7 +22,7 @@ RUN if [ -n "${CRATES_INDEX_URL}" ]; then \
 RUN cargo build --release --locked --bin mcp-ssh-rs
 
 # The non-root runtime image contains the service and its shared libraries.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/target/release/mcp-ssh-rs /mcp-ssh-rs
 COPY LICENSE NOTICE /usr/share/doc/mcp-ssh-rs/
 LABEL org.opencontainers.image.licenses="Apache-2.0"

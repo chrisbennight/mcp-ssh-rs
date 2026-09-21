@@ -30,6 +30,15 @@ pub struct EnvCredentials {
     held: HashMap<String, Secret<String>>,
 }
 
+/// Startup diagnostics contain credential identifiers, never key material.
+#[derive(Default)]
+pub struct CredentialDiagnostics {
+    /// Ambiguous mappings could select another account's key and prevent startup.
+    pub collisions: Vec<String>,
+    /// Unavailable keys affect only the accounts that reference them.
+    pub unavailable: Vec<String>,
+}
+
 impl EnvCredentials {
     /// Collects every credential the environment offers.
     #[must_use]
@@ -62,7 +71,7 @@ impl EnvCredentials {
     /// operator has to type recognisable, at the cost of not being injective:
     /// `dns1/readonly` and `dns1-readonly` fold together.
     ///
-    /// Which is why nothing relies on it being injective. [`Self::unusable`]
+    /// Which is why nothing relies on it being injective. [`Self::check_registry`]
     /// checks the registry at startup and refuses to run if two of *its*
     /// references share a variable — the collision that matters is between
     /// references a deployment actually configured, and that is decidable
@@ -83,22 +92,14 @@ impl EnvCredentials {
             .collect()
     }
 
-    /// Everything wrong with this deployment's credentials, before it serves.
+    /// Reject ambiguous mappings and report unavailable account credentials.
     ///
-    /// Three things make a registry unusable, and each is silent until somebody
-    /// tries to reach the host in question: a reference with no credential
-    /// behind it, a credential that is not a key this service could
-    /// authenticate with, and two references that read one credential. The
-    /// last is the dangerous one — it means a host authenticating with a key
-    /// issued for another — and none of them is worth discovering from an
-    /// agent's failed command.
-    ///
-    /// What it does not attempt is whether a key that parses is the *right*
-    /// key: only the target can answer that, and a check that cannot be
-    /// complete is better bounded at what is decidable here than extended
-    /// until it looks like one.
+    /// Missing, empty, malformed, or encrypted keys do not prevent other
+    /// accounts from serving. Unusable values are removed so fetching them
+    /// fails before any target is dialled. Only the target can establish
+    /// whether a usable key is authorized for its account.
     #[must_use]
-    pub fn unusable(&self, registry: &Registry) -> Vec<String> {
+    pub fn check_registry(&mut self, registry: &Registry) -> CredentialDiagnostics {
         let mut by_variable: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for host in registry.hosts() {
             for role in registry.roles(host) {
@@ -113,32 +114,33 @@ impl EnvCredentials {
             }
         }
 
-        let mut wrong = Vec::new();
+        let mut diagnostics = CredentialDiagnostics::default();
         for (variable, references) in by_variable {
             let named: Vec<&str> = references.iter().map(String::as_str).collect();
             // Reported with the prefix, because what an operator does about
             // this is set that variable, and a name they cannot paste is a
             // message that tells them to go and work it out.
             if named.len() > 1 {
-                wrong.push(format!(
+                diagnostics.collisions.push(format!(
                     "{PREFIX}{variable} would be read for more than one credential: {}",
                     named.join(", ")
                 ));
             } else if let Some(held) = self.held.get(&variable) {
                 if !usable_credential(held) {
-                    wrong.push(format!(
+                    self.held.remove(&variable);
+                    diagnostics.unavailable.push(format!(
                         "{} names {PREFIX}{variable}, which is not a private key this service can use",
                         named.join(", ")
                     ));
                 }
             } else {
-                wrong.push(format!(
+                diagnostics.unavailable.push(format!(
                     "{} names {PREFIX}{variable}, which this deployment does not hold",
                     named.join(", ")
                 ));
             }
         }
-        wrong
+        diagnostics
     }
 }
 
@@ -154,7 +156,8 @@ impl CredentialSource for EnvCredentials {
                 // value, so recording it costs nothing.
                 tracing::warn!(
                     reference = reference.as_str(),
-                    "a registry entry names a credential this deployment does not hold"
+                    variable = format!("{PREFIX}{}", Self::variable(reference)),
+                    "the credential for the requested account is unavailable"
                 );
                 CredentialError::NotFound
             })
@@ -252,10 +255,10 @@ mod tests {
     /// It is decidable before anything is served, so it is decided there.
     #[test]
     fn a_registry_whose_references_share_a_credential_is_refused() {
-        let source = source(&[("MCP_SSH_CREDENTIAL_DNS1_READONLY", "the-key-material")]);
+        let mut source = source(&[("MCP_SSH_CREDENTIAL_DNS1_READONLY", "the-key-material")]);
         let collides = registry_naming(&[("dns1", "dns1/readonly"), ("dns2", "dns1-readonly")]);
 
-        let wrong = source.unusable(&collides);
+        let wrong = source.check_registry(&collides).collisions;
         let said = wrong.join("; ");
         assert_eq!(wrong.len(), 1, "{said}");
         assert!(
@@ -264,25 +267,26 @@ mod tests {
         );
     }
 
-    /// A reference with nothing behind it is a deployment that will fail the
-    /// first time somebody reaches that host. Saying so at startup is the
-    /// difference between a configuration mistake and an incident.
+    /// Missing credentials are diagnosed at startup without rejecting the registry.
     #[test]
-    fn a_registry_naming_a_credential_nobody_holds_is_refused() {
+    fn a_missing_credential_is_reported_without_a_fatal_error() {
         let key = a_key();
-        let source = source(&[("MCP_SSH_CREDENTIAL_MCP_SSH_DNS1_READONLY", &key)]);
+        let mut source = source(&[("MCP_SSH_CREDENTIAL_MCP_SSH_DNS1_READONLY", &key)]);
 
         assert!(
             source
-                .unusable(&registry_naming(&[("dns1", "mcp-ssh/dns1/readonly")]))
+                .check_registry(&registry_naming(&[("dns1", "mcp-ssh/dns1/readonly")]))
+                .unavailable
                 .is_empty(),
             "a registry every credential of which is held was refused"
         );
 
-        let wrong = source.unusable(&registry_naming(&[
+        let report = source.check_registry(&registry_naming(&[
             ("dns1", "mcp-ssh/dns1/readonly"),
             ("dns2", "mcp-ssh/dns2/readonly"),
         ]));
+        assert!(report.collisions.is_empty());
+        let wrong = report.unavailable;
         let said = wrong.join("; ");
         assert_eq!(wrong.len(), 1, "{said}");
         assert!(
@@ -296,14 +300,23 @@ mod tests {
     /// configured for can never be reached. That is decidable here, unlike
     /// whether it is the *right* key, which only the target can say — so this
     /// is where the checking stops.
-    #[test]
-    fn a_credential_that_is_not_a_key_is_refused() {
-        let source = source(&[(
+    #[tokio::test]
+    async fn a_credential_that_is_not_a_key_is_refused() {
+        let mut source = source(&[(
             "MCP_SSH_CREDENTIAL_MCP_SSH_DNS1_READONLY",
             "definitely-not-a-private-key",
         )]);
 
-        let wrong = source.unusable(&registry_naming(&[("dns1", "mcp-ssh/dns1/readonly")]));
+        let report = source.check_registry(&registry_naming(&[("dns1", "mcp-ssh/dns1/readonly")]));
+        assert!(report.collisions.is_empty());
+        assert_eq!(
+            source
+                .fetch(&reference("mcp-ssh/dns1/readonly"))
+                .await
+                .unwrap_err(),
+            CredentialError::NotFound
+        );
+        let wrong = report.unavailable;
         let said = wrong.join("; ");
         assert_eq!(wrong.len(), 1, "{said}");
         assert!(
