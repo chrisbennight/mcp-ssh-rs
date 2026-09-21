@@ -33,14 +33,14 @@ use crate::credentials::EnvCredentials;
 use crate::dashboard::{DASHBOARD_PATH, Proxy};
 use crate::ingress::{IdentityVerifier, Ingress};
 use crate::mcp::SshMcp;
-use crate::settings::{EvaluatorSettings, Settings};
+use crate::settings::{Authentication, EvaluatorSettings, Settings};
 
 pub struct OptionalSurfaces {
     pub evaluator: Option<EvaluatorSettings>,
     pub audit_reader: Arc<dyn crate::audit_history::ReadsAudit>,
 }
 
-/// Path the gateway sends MCP requests to.
+/// Path clients or the gateway send MCP requests to.
 pub const MCP_PATH: &str = "/mcp";
 
 /// Path the container healthcheck and any external probe use.
@@ -131,12 +131,10 @@ where
     Router::new()
         .route(HEALTH_PATH, get(health))
         .merge(Router::new().nest_service(MCP_PATH, mcp).layer(
-            axum::middleware::from_fn_with_state(ingress, crate::ingress::require_gateway),
+            axum::middleware::from_fn_with_state(ingress, crate::ingress::require_mcp),
         ))
-        // The approval surface is admitted by the proxy's credential and an
-        // operator's name, never by the gateway's. The two layers are separate
-        // so that reaching the tools confers nothing on the page that decides
-        // whether a held command runs.
+        // Separate operator authentication keeps MCP access from conferring
+        // permission to approve a held command.
         .merge(
             Router::new()
                 // Somebody who typed the deployment's name and nothing else —
@@ -173,10 +171,9 @@ async fn health() -> &'static str {
 
 /// Serves until the process is asked to stop.
 ///
-/// Everything the service needs is resolved before the socket is bound: an
-/// unreadable registry, a credential set that does not parse, or a gateway it
-/// cannot verify are all reasons not to start. A service that comes up and then
-/// refuses every request looks healthy to everything except the caller.
+/// Local configuration and SSH credentials are validated before binding.
+/// In gateway mode, unavailable signing keys cause requests to be refused;
+/// the service can start while the gateway is restarting.
 pub async fn serve(config: &Config) -> anyhow::Result<()> {
     let settings = Settings::from_env().context("reading settings")?;
     let registry = std::fs::read_to_string(&settings.registry)
@@ -225,16 +222,24 @@ pub async fn serve(config: &Config) -> anyhow::Result<()> {
                 .context("starting the audit output writer")?,
         )),
     ));
-    let verifier =
-        Arc::new(IdentityVerifier::new(settings.identity).context("configuring identity")?);
-    // Read before serving, so an unreachable or misconfigured key set is said
-    // once at boot rather than discovered by whoever is refused first. Not a
-    // reason to refuse to start: this service and the gateway restart
-    // independently, and a service that will not come up until the gateway has
-    // is a crash loop that outlasts what caused it.
-    verifier.warm().await;
-    let ingress = Ingress::new(Arc::new(settings.bearers), verifier);
-    let proxy = Proxy::new(Arc::new(settings.proxy_bearers));
+    let (ingress, proxy) = match settings.identity {
+        Authentication::Gateway(identity) => {
+            let verifier =
+                Arc::new(IdentityVerifier::new(identity).context("configuring identity")?);
+            verifier.warm().await;
+            (
+                Ingress::new(Arc::new(settings.bearers), verifier),
+                Proxy::new(Arc::new(settings.proxy_bearers)),
+            )
+        }
+        Authentication::Standalone {
+            principal,
+            operator,
+        } => (
+            Ingress::standalone(Arc::new(settings.bearers), principal),
+            Proxy::standalone(Arc::new(settings.proxy_bearers), operator),
+        ),
+    };
     // Silence is a configuration, not a failure: the dashboard still holds
     // every waiting request, and a deployment that has not chosen a channel is
     // told to look there.

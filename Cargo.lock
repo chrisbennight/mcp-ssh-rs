@@ -3281,6 +3281,7 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64",
  "clap",
  "jsonwebtoken",
  "rand",

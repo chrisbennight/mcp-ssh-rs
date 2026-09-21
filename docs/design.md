@@ -57,14 +57,16 @@ These are properties of the environment, not deliverables of this service, and
 the design is unsound without them:
 
 - Agent sandboxes cannot reach port 22 except through this service.
-- **Each authenticated surface is reachable only through its named peer.** The
-  agent-facing MCP route admits the gateway's bearer and verifies the signed
-  principal assertion it supplies. The dashboard admits a different bearer
-  from the authenticating reverse proxy and records the operator identity that
-  proxy supplies. An optional evaluator route admits only its third,
-  deployment-owned credential. Network policy must not provide a bypass around
-  those peers, and credentials for one surface must never be shared with
-  another.
+- **Authentication mode is explicit.** Gateway deployments admit MCP through
+  the gateway's bearer and signed principal assertion, and the dashboard
+  through a separately authenticated reverse proxy. Network policy must not
+  provide a bypass around those peers. Personal standalone deployments admit
+  an MCP bearer as one configured principal and authenticate the human
+  separately. Clients sharing the MCP credential share that identity, session
+  ownership, and quotas. Neither mode isolates independent administrative
+  tenants. Credentials for MCP, human approval, and optional evaluation must
+  remain separate. Plain HTTP standalone access is limited to a local setup;
+  remote credential-bearing connections require protected transport.
 - Roles are provisioned with different privilege on the target, demonstrated by
   an operation that succeeds under one and is refused under another. If every
   role is effectively root, role separation buys nothing and non-goal 2 has no
@@ -107,7 +109,7 @@ Properties the system must hold. They are stated here because violating one
 means the design failed, not because this document defines how they are
 enforced — tests own that.
 
-1. **The agent never holds a credential or an SSH endpoint.** It names a host
+1. **The agent never holds an SSH credential or an SSH endpoint.** It names a host
    and at most a role.
 2. **Every execution is attributable and pre-recorded.** A complete audit entry
    is written and flushed to the service's standard output before a command
@@ -149,16 +151,17 @@ enforced — tests own that.
 Five responsibilities, deliberately separated so that the failure of any one
 degrades safely.
 
-**Front doors.** The agent-facing MCP route is an upstream behind the fleet's
-MCP gateway. It authenticates the gateway with a rotating shared bearer and
-verifies the gateway's signed principal assertion before a request reaches a
-tool. It still enforces authorization itself, because the gateway has no
-visibility into session state, command classification, or command arguments.
-The human dashboard is behind an authenticating reverse proxy and uses a
-separate proxy credential plus the operator identity that proxy established.
-The optional evaluator ingestion route has a third credential and no authority
-to execute or approve. Only the liveness probe is unauthenticated, and it
-reveals no inventory or policy state.
+**Front doors.** The MCP route supports a gateway integration and an explicit
+personal standalone mode. Gateway mode authenticates a shared bearer and a
+signed principal assertion. Standalone mode maps a separate configured bearer
+to a fixed principal; a missing assertion or unavailable gateway never enables
+this mode implicitly. Both modes use the same session and command authorization.
+The human dashboard uses either an authenticated proxy identity or a separate
+standalone operator login. An operator administers the configured service as a
+whole; per-team approval isolation is not promised. The optional evaluator
+ingestion route has its own credential and no authority to execute or approve.
+Only the liveness probe is unauthenticated, and it reveals no inventory or
+policy state.
 
 **Session.** The unit of work, audit, and approval: one host, one role, a
 declared purpose, a scope ceiling, and a bounded lifetime. The session exists
