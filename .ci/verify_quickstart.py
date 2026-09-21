@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -73,6 +74,12 @@ def main():
     if demo.DATA.exists():
         parser.error("An existing .quickstart directory must be stopped before this isolated test")
     try:
+        demo.initialize(18080, arguments.image)
+        public_key = demo.DATA / "client_key.pub"
+        public_key.chmod(0o600)
+        if os.geteuid() == 0:
+            # Exercise a host owner different from both root and the demo account.
+            os.chown(public_key, 1001, 1001)
         subprocess.run([sys.executable, demo.__file__, "start", "--port", "18080",
                         "--service-image", arguments.image], check=True)
         verify_live()
