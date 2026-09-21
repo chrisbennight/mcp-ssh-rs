@@ -133,6 +133,7 @@ def service(binary, fixture, roots, jwks_url, endpoint, token, image):
     environment = {name: value for name, value in os.environ.items()
                    if not name.startswith(("MCP_SSH_", "SSL_CERT_"))}
     configured = {
+        "MCP_SSH_AUTH_MODE": "gateway",
         "MCP_SSH_LISTEN": f"127.0.0.1:{port}",
         "MCP_SSH_REGISTRY": str(fixture / "registry.json"),
         "MCP_SSH_REVIEW": "all",

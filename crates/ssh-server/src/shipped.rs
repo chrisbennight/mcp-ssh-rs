@@ -1,26 +1,9 @@
-//! The process boundary for audit entries.
+//! Required audit recording, independent of diagnostic logging.
 //!
-//! The ledger's chain is process-local and disappears on restart. It does not
-//! claim to be the durable copy.
-//!
-//! Production gives every entry to one process-scoped writer as a structured
-//! stdout line and waits, within a fixed deadline, for that line to be written
-//! and flushed. Success means that the complete entry left this service before
-//! an authorized effect began.
-//!
-//! The fleet log pipeline owns collection, storage, retention, and queryability
-//! after stdout. This service does not wait for collector acknowledgement and
-//! owns no durable audit storage. A downstream failure can therefore lose an
-//! entry without this service knowing.
-//!
-//! Entries go straight to the output rather than through the log framework. A
-//! filter is configuration, and configuration that can silently turn the audit
-//! record off is configuration that can turn the service into an unaudited one
-//! while every other sign says it is fine. The record is not a diagnostic.
-//!
-//! This boundary is deliberate: collector health is not acknowledged or
-//! queried. Local output backpressure is bounded and fails closed rather than
-//! hanging mediation.
+//! A bounded writer acknowledges a complete JSON line only after write and
+//! flush succeed. Failure or backpressure prevents new effects. A file flush
+//! does not promise disk synchronization, remote collection, or retention;
+//! those remain deployment responsibilities.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +17,7 @@ use ssh_core::audit::{Entry, NotRecorded, Records};
 /// Memory stays bounded under a burst, and a full queue fails closed rather
 /// than turning audit pressure into unbounded process growth.
 const OUTPUT_QUEUE: usize = 8;
-/// Long enough for an ordinary pipe write, short enough that stdout
+/// Long enough for an ordinary write, short enough that output
 /// backpressure cannot consume the service's shutdown window.
 const WRITE_WITHIN: Duration = Duration::from_millis(250);
 
@@ -45,7 +28,7 @@ struct Line {
 
 /// Writes complete audit lines through one bounded process-scoped worker.
 ///
-/// The worker is the only stdout producer. A caller receives success only after
+/// The worker exclusively owns its sink. A caller receives success only after
 /// its complete line was written and flushed, and never waits indefinitely for
 /// a pipe or logging consumer that stopped draining.
 pub struct ToAuditOutput {
@@ -55,10 +38,6 @@ pub struct ToAuditOutput {
 }
 
 impl ToAuditOutput {
-    pub fn to_output() -> io::Result<Self> {
-        Self::to(std::io::stdout())
-    }
-
     pub fn to<W>(sink: W) -> io::Result<Self>
     where
         W: Write + Send + 'static,

@@ -2,9 +2,9 @@
 //!
 //! # Identity
 //!
-//! The HTTP ingress establishes a principal using the configured authentication
-//! mode. This module reads that principal from request extensions before listing
-//! or dispatching tools. Tool arguments cannot supply it.
+//! HTTP reads the authenticated principal from request extensions. Stdio uses
+//! the fixed launch identity supplied when its handler is created. Tool arguments
+//! cannot supply either identity.
 //!
 //! `get_info` has no error return, so HTTP authentication covers the handshake
 //! and protocol liveness traffic as well. The unauthenticated `/healthz` probe
@@ -44,7 +44,7 @@ applies by account rather than command content. A command may run, be refused, \
 or await approval. A refusal is not permission to retry unchanged. Poll a \
 running command and investigate an unknown outcome before submitting it again.";
 
-/// The principal established by HTTP authentication.
+/// A principal established by HTTP authentication or stdio launch authority.
 ///
 /// A distinct type so it cannot be confused with a principal a caller named,
 /// and constructible only inside this crate: the ingress layer makes one after
@@ -78,6 +78,7 @@ pub struct SshMcp<C: Clock, S: CredentialSource> {
     /// link goes nowhere looks like the way to answer and is not.
     notifier: Arc<dyn Notifier>,
     dashboard: Option<Url>,
+    launch_principal: Option<AuthenticatedPrincipal>,
 }
 
 impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
@@ -91,6 +92,23 @@ impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
             bastion,
             notifier,
             dashboard,
+            launch_principal: None,
+        }
+    }
+
+    /// The launcher owns the stdio process and its configured account access.
+    pub(crate) fn with_launch_principal(mut self, principal: PrincipalId) -> Self {
+        self.launch_principal = Some(AuthenticatedPrincipal::new(principal));
+        self
+    }
+
+    fn principal<'a>(
+        &'a self,
+        extensions: &'a Extensions,
+    ) -> Result<&'a AuthenticatedPrincipal, McpError> {
+        match &self.launch_principal {
+            Some(principal) => Ok(principal),
+            None => acting_for(extensions),
         }
     }
 }
@@ -101,6 +119,7 @@ impl<C: Clock, S: CredentialSource> Clone for SshMcp<C, S> {
             bastion: Arc::clone(&self.bastion),
             notifier: Arc::clone(&self.notifier),
             dashboard: self.dashboard.clone(),
+            launch_principal: self.launch_principal.clone(),
         }
     }
 }
@@ -121,7 +140,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
         // Discovery is a request like any other. Answering it for a caller the
         // gateway did not vouch for would tell something that should not have
         // reached this service what it could try next.
-        acting_for(&context.extensions)?;
+        self.principal(&context.extensions)?;
         Ok(tools::catalog())
     }
 
@@ -130,7 +149,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let principal = acting_for(&context.extensions)?.clone();
+        let principal = self.principal(&context.extensions)?.clone();
         tools::dispatch(
             &self.bastion,
             self.notifier.as_ref(),
@@ -233,37 +252,85 @@ mod tests {
         );
     }
 
-    /// The check above is only worth having if every handler performs it, and
-    /// the risk is a handler added later that quietly does not.
-    ///
-    /// Calling the handlers would be the better test and is not available: a
-    /// `RequestContext` needs a `Peer`, which rmcp only constructs internally,
-    /// so there is no way to hand one to `list_tools` from here. What can be
-    /// checked is that each handler that *can* refuse does ask — `get_info`
-    /// returns server information rather than a result and has no request to
-    /// read, which is why it is not among them and why the module says so.
-    #[test]
-    fn every_handler_that_can_refuse_asks_who_is_calling() {
-        let source = include_str!("mcp.rs");
-        let (_, handlers) = source
-            .split_once("impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler")
-            .expect("the handler implementation is where the requests arrive");
-        let handlers = handlers
-            .split_once("\n}\n")
-            .expect("the implementation block ends")
-            .0;
-
-        let asked: Vec<&str> = handlers.split("\n    async fn ").skip(1).collect();
-        assert!(
-            !asked.is_empty(),
-            "no request handlers found; this test has stopped reading what it thinks it reads"
-        );
-        for handler in asked {
-            let name = handler.split('(').next().unwrap_or(handler);
-            assert!(
-                handler.contains("acting_for("),
-                "{name} answers a request without asking who is calling"
-            );
+    #[tokio::test]
+    async fn stdio_uses_launch_identity_without_http_extensions() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        struct NoCredentials;
+        impl CredentialSource for NoCredentials {
+            async fn fetch(
+                &self,
+                _: &ssh_core::registry::CredentialRef,
+            ) -> Result<ssh_core::secret::Secret<String>, ssh_core::connect::CredentialError>
+            {
+                panic!("discovery must not fetch credentials")
+            }
         }
+        let bastion = Arc::new(Bastion::new(
+            Arc::new(ssh_core::clock::TestClock::at(0)),
+            ssh_core::registry::Registry::from_json("{}").unwrap(),
+            ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Disabled),
+            NoCredentials,
+            crate::settings::bounds(),
+        ));
+        let handler = SshMcp::new(bastion, Arc::new(crate::notify::Silence), None)
+            .with_launch_principal(PrincipalId::parse("launcher").unwrap());
+        let (client, server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            handler
+                .serve(server)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = BufReader::new(reader);
+        for (request, expect_error) in [
+            (
+                serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-11-25", "capabilities":{}, "clientInfo":{"name":"test", "version":"test"}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}}),
+                false,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"ssh_hosts", "arguments":{}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{"name":"ssh_hosts", "arguments":{"principal":"someone-else"}}}),
+                true,
+            ),
+        ] {
+            let mut bytes = serde_json::to_vec(&request).unwrap();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).await.unwrap();
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response.get("id").unwrap(), request.get("id").unwrap());
+            assert_eq!(response.get("error").is_some(), expect_error, "{response}");
+            if request.get("id").and_then(serde_json::Value::as_u64) == Some(1) {
+                writer
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                    .await
+                    .unwrap();
+            }
+        }
+        drop(writer);
+        drop(reader);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

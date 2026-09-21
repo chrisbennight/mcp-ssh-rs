@@ -14,6 +14,7 @@ pub mod evaluation;
 pub mod ingress;
 pub mod mcp;
 pub mod notify;
+pub mod process;
 pub mod settings;
 pub mod shipped;
 pub mod tools;
@@ -90,8 +91,8 @@ fn allowed_hosts(trusted_hosts: &[String]) -> Vec<String> {
 /// exposes without a credential is that a process is listening.
 pub fn router<C, S>(
     bastion: Arc<Bastion<C, S>>,
-    ingress: Ingress,
-    proxy: Proxy,
+    ingress: impl Into<Option<Ingress>>,
+    proxy: impl Into<Option<Proxy>>,
     notifier: Arc<dyn crate::notify::Notifier>,
     dashboard: Option<url::Url>,
     optional: OptionalSurfaces,
@@ -123,18 +124,24 @@ where
             .with_allowed_hosts(allowed_hosts(trusted_hosts)),
     );
 
+    let mcp_routes = ingress.into().map_or_else(Router::new, |ingress| {
+        Router::new()
+            .nest_service(MCP_PATH, mcp)
+            .layer(axum::middleware::from_fn_with_state(
+                ingress,
+                crate::ingress::require_mcp,
+            ))
+    });
     let evaluator_routes = optional.evaluator.map_or_else(Router::new, |settings| {
         crate::evaluation::routes(Arc::clone(&bastion), settings)
     });
 
     Router::new()
         .route(HEALTH_PATH, get(health))
-        .merge(Router::new().nest_service(MCP_PATH, mcp).layer(
-            axum::middleware::from_fn_with_state(ingress, crate::ingress::require_mcp),
-        ))
+        .merge(mcp_routes)
         // Separate operator authentication keeps MCP access from conferring
         // permission to approve a held command.
-        .merge(
+        .merge(proxy.into().map_or_else(Router::new, |proxy| {
             Router::new()
                 // Somebody who typed the deployment's name and nothing else —
                 // which is what an identity provider hands back after a sign-in
@@ -151,8 +158,8 @@ where
                 .layer(axum::middleware::from_fn_with_state(
                     proxy,
                     crate::dashboard::require_operator,
-                )),
-        )
+                ))
+        }))
         // Evaluators append evidence through their own credential boundary.
         // This surface is outside both the agent and human-review layers, and
         // is absent unless a deployment explicitly configures it.
@@ -168,129 +175,145 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Serves until the process is asked to stop.
-///
-/// Local configuration and SSH credentials are validated before binding.
-/// In gateway mode, unavailable signing keys cause requests to be refused;
-/// the service can start while the gateway is restarting.
-pub async fn serve(config: &Config) -> anyhow::Result<()> {
-    let settings = Settings::from_env().context("reading settings")?;
-    let registry = std::fs::read_to_string(&settings.registry)
-        .with_context(|| format!("reading the registry at {}", settings.registry.display()))?;
+/// Serve configured transports with one SSH core and required audit output.
+pub async fn serve(
+    config: &Config,
+    settings: Settings,
+    audit: Box<dyn std::io::Write + Send>,
+) -> anyhow::Result<()> {
+    use crate::process::Transport;
+    use rmcp::ServiceExt as _;
+    let registry = std::fs::read_to_string(&settings.registry).context("reading the registry")?;
     let registry = Registry::from_json(&registry).context("parsing the registry")?;
-    let hosts = registry.hosts().count();
-
-    // Every credential the registry names, resolved before anything is served.
-    // A reference with nothing behind it, or two that read one credential, is a
-    // deployment mistake that would otherwise wait for somebody to reach that
-    // host — and the second means authenticating with a key issued for a
-    // different one, which is not something to find out that way.
     let credentials = EnvCredentials::from_env();
     let unusable = credentials.unusable(&registry);
-    if !unusable.is_empty() {
-        anyhow::bail!(
-            "this deployment's credentials cannot be used: {}",
-            unusable.join("; ")
-        );
-    }
-
-    let engine = Engine::new(settings.review);
-
+    anyhow::ensure!(
+        unusable.is_empty(),
+        "configured SSH credentials are unusable: {}",
+        unusable.join("; ")
+    );
     let bastion = Arc::new(Bastion::recording_to(
         Arc::new(SystemClock::new().context("reading the boot clock")?),
         registry,
-        engine,
+        Engine::new(settings.review),
         credentials,
         settings::bounds(),
-        // A complete entry must cross the selected boundary — flushed stdout —
-        // before it joins the ledger and before an authorized command can run.
-        // The ledger remains process-local; the fleet log pipeline owns
-        // collection, storage, and retention beyond this point.
         Some(Arc::new(
-            crate::shipped::ToAuditOutput::to_output()
-                .context("starting the audit output writer")?,
+            crate::shipped::ToAuditOutput::to(audit).context("starting the audit writer")?,
         )),
     ));
-    let (ingress, proxy) = match settings.identity {
+    let (ingress, proxy, launch_principal) = match settings.identity {
         Authentication::Gateway(identity) => {
             let verifier =
                 Arc::new(IdentityVerifier::new(identity).context("configuring identity")?);
             verifier.warm().await;
+            let bearers = settings
+                .bearers
+                .context("HTTP authentication requires a bearer")?;
             (
-                Ingress::new(Arc::new(settings.bearers), verifier),
-                Proxy::new(Arc::new(settings.proxy_bearers)),
+                Some(Ingress::new(Arc::new(bearers), verifier)),
+                settings.proxy_bearers.map(|b| Proxy::new(Arc::new(b))),
+                None,
             )
         }
         Authentication::Standalone {
             principal,
             operator,
+        } => {
+            let bearers = settings
+                .bearers
+                .context("HTTP authentication requires a bearer")?;
+            (
+                Some(Ingress::standalone(Arc::new(bearers), principal)),
+                settings
+                    .proxy_bearers
+                    .map(|b| Proxy::standalone(Arc::new(b), operator)),
+                None,
+            )
+        }
+        Authentication::Stdio {
+            principal,
+            operator,
         } => (
-            Ingress::standalone(Arc::new(settings.bearers), principal),
-            Proxy::standalone(Arc::new(settings.proxy_bearers), operator),
+            None,
+            settings
+                .proxy_bearers
+                .map(|b| Proxy::standalone(Arc::new(b), operator)),
+            Some(principal),
         ),
     };
-    // Silence is a configuration, not a failure: the dashboard still holds
-    // every waiting request, and a deployment that has not chosen a channel is
-    // told to look there.
     let notifier: Arc<dyn crate::notify::Notifier> = match settings.notify {
         Some(endpoint) => {
-            Arc::new(crate::notify::Webhook::new(endpoint).context("configuring the notifier")?)
+            Arc::new(crate::notify::Webhook::new(endpoint).context("configuring notifications")?)
         }
         None => Arc::new(crate::notify::Silence),
     };
-    let dashboard = settings.dashboard;
-    let evaluator = settings.evaluator;
     let audit_reader: Arc<dyn crate::audit_history::ReadsAudit> = match settings.audit_query {
         Some(endpoint) => Arc::new(
-            crate::audit_history::Loki::new(endpoint)
-                .context("configuring the durable audit reader")?,
+            crate::audit_history::Loki::new(endpoint).context("configuring audit history")?,
         ),
         None => Arc::new(crate::audit_history::Unavailable),
     };
-    let trusted_hosts = settings.trusted_hosts;
-
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    // Hosts are counted, not named: this line goes to the fleet's log store,
-    // and an inventory of what the service can reach does not need to be there.
-    tracing::info!(listen = %config.listen, hosts, "serving");
-    // The server is asked to drain by a message rather than by holding the
-    // signal itself, so the clock on draining starts when the signal arrives.
-    // Bounding the whole of serving instead would stop a healthy service after
-    // the bound; bounding nothing hands the length of the stop to whoever holds
-    // a stream open, and what runs out meanwhile is the container's patience.
-    // Being killed there is the outcome worth avoiding: it takes the readers
-    // with it, and they are what write down what commands did.
-    let (drain, asked_to_drain) = tokio::sync::oneshot::channel::<()>();
-    let mut serving = tokio::spawn({
-        let bastion = Arc::clone(&bastion);
-        async move {
-            axum::serve(
-                listener,
-                router(
-                    bastion,
-                    ingress,
-                    proxy,
-                    notifier,
-                    dashboard,
-                    OptionalSurfaces {
-                        evaluator,
-                        audit_reader,
-                    },
-                    &trusted_hosts,
-                ),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = asked_to_drain.await;
-            })
-            .await
-        }
-    });
-
-    // Reclaiming is what lets go of a lapsed session's connection, and the
-    // service is its own scheduler for that: a deployment that had to arrange
-    // it separately would hold connections open for as long as it forgot to.
-    // Idle is exactly when nothing else triggers it and exactly when the
-    // sessions holding connections are lapsing.
+    let needs_http = settings.process.transport == Transport::Http
+        || proxy.is_some()
+        || settings.evaluator.is_some();
+    let listener = if needs_http {
+        Some(tokio::net::TcpListener::bind(config.listen).await?)
+    } else {
+        None
+    };
+    let (drain, draining) = tokio::sync::watch::channel(false);
+    let mut serving = tokio::task::JoinSet::<anyhow::Result<()>>::new();
+    if let Some(principal) = launch_principal {
+        let handler = SshMcp::new(
+            Arc::clone(&bastion),
+            Arc::clone(&notifier),
+            settings.dashboard.clone(),
+        )
+        .with_launch_principal(principal);
+        let mut draining = draining.clone();
+        serving.spawn(async move {
+            let running = tokio::select! {
+                result = handler.serve(rmcp::transport::stdio()) => result.context("initializing stdio")?,
+                _ = draining.changed() => return Ok(()),
+            };
+            let cancellation = running.cancellation_token();
+            let waiting = running.waiting();
+            tokio::pin!(waiting);
+            tokio::select! {
+                result = &mut waiting => { result.context("serving stdio")?; }
+                _ = draining.changed() => {
+                    cancellation.cancel();
+                    waiting.await.context("draining stdio")?;
+                }
+            }
+            Ok(())
+        });
+    }
+    if let Some(listener) = listener {
+        let app = router(
+            Arc::clone(&bastion),
+            ingress,
+            proxy,
+            notifier,
+            settings.dashboard,
+            OptionalSurfaces {
+                evaluator: settings.evaluator,
+                audit_reader,
+            },
+            &settings.trusted_hosts,
+        );
+        let mut draining = draining.clone();
+        serving.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = draining.changed().await;
+                })
+                .await
+                .context("serving HTTP")
+        });
+    }
+    tracing::info!(transport = ?settings.process.transport, "serving");
     let housekeeping = tokio::spawn({
         let bastion = Arc::clone(&bastion);
         async move {
@@ -300,41 +323,38 @@ pub async fn serve(config: &Config) -> anyhow::Result<()> {
             }
         }
     });
-
-    // Either the service is asked to stop, or the server stops on its own —
-    // and the second must not go unnoticed. A process still alive with no
-    // listener answers nothing and tells its supervisor nothing, which is the
-    // one failure a healthcheck cannot report because the healthcheck is what
-    // stopped answering.
-    tokio::select! {
-        () = stopped() => {}
-        joined = &mut serving => {
-            housekeeping.abort();
-            settled(&bastion).await;
-            joined.context("serving")??;
-            anyhow::bail!("the server stopped without being asked to");
-        }
-    }
-    housekeeping.abort();
-    // Before the drain, not after: aborting the server later stops it
-    // accepting, but a request already accepted is still being handled and
-    // could otherwise start a command that nothing waits for.
+    let first = tokio::select! {
+        () = stopped() => None,
+        joined = serving.join_next() => joined,
+    };
+    // Stop new effects before draining accepted requests and recording outcomes.
     bastion.stop();
-    drop(drain);
-    match tokio::time::timeout(DRAIN_WITHIN, &mut serving).await {
-        Ok(joined) => joined.context("serving")??,
-        Err(_elapsed) => {
-            // Aborted rather than left running. A handler still in flight can
-            // start a command, and one that starts after the wait below has
-            // seen nothing outstanding is a command the record would never
-            // finish. Stopping the server first makes what is outstanding a
-            // number that only goes down.
-            tracing::warn!("requests still open; stopping anyway to record what commands did");
-            serving.abort();
-            let _ = serving.await;
+    housekeeping.abort();
+    let _ = drain.send(true);
+    let mut failure = first.and_then(|joined| match joined {
+        Ok(result) => result.err(),
+        Err(error) => Some(anyhow::Error::new(error)),
+    });
+    let draining = async {
+        while let Some(joined) = serving.join_next().await {
+            let error = match joined {
+                Ok(result) => result.err(),
+                Err(error) => Some(anyhow::Error::new(error)),
+            };
+            if failure.is_none() {
+                failure = error;
+            }
         }
+    };
+    if tokio::time::timeout(DRAIN_WITHIN, draining).await.is_err() {
+        tracing::warn!("request drain timed out; recording outstanding command outcomes");
+        serving.abort_all();
+        while serving.join_next().await.is_some() {}
     }
     settled(&bastion).await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -566,6 +586,42 @@ mod tests {
             },
             &[],
         )
+    }
+
+    #[tokio::test]
+    async fn unconfigured_http_surfaces_are_absent() {
+        let bastion = Arc::new(Bastion::new(
+            Arc::new(ssh_core::clock::TestClock::at(1_000)),
+            Registry::from_json("{}").unwrap(),
+            Engine::new(ssh_core::policy::ReviewMode::Disabled),
+            NoCredentials,
+            settings::bounds(),
+        ));
+        let app = router(
+            bastion,
+            None,
+            None,
+            Arc::new(crate::notify::Silence),
+            None,
+            OptionalSurfaces {
+                evaluator: None,
+                audit_reader: Arc::new(crate::audit_history::Unavailable),
+            },
+            &[],
+        );
+        for path in [
+            MCP_PATH,
+            DASHBOARD_PATH,
+            "/dashboard/approvals",
+            crate::evaluation::EVALUATION_API_PATH,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     async fn get_path(path: &str) -> StatusCode {

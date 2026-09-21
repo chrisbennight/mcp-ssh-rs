@@ -23,12 +23,13 @@ mode. The tutorial uses public build dependencies and a small Python MCP client.
 ## What is available
 
 - Host and role discovery, bounded sessions, command execution, result polling,
-  and session closure through MCP.
+  and session closure through stdio or stateless MCP HTTP behind a TLS proxy.
 - Explicit account access classes, checked against configuration and session
   ownership on MCP session operations.
 - Optional account-based human review and a browser queue for held commands.
 - Verified SSH host keys and target credentials supplied by the operator.
-- Structured execution logs, with optional Loki history and notification adapters.
+- Required audit and diagnostic sinks configured independently, with optional
+  Loki history and notification adapters.
 - Explicit standalone authentication, or the existing gateway integration with
   signed identity assertions.
 

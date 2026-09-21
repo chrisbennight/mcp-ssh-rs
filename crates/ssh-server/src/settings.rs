@@ -22,6 +22,10 @@ use crate::ingress::{IdentitySettings, IngressError, SharedBearer};
 #[derive(Clone, Debug)]
 pub enum Authentication {
     Gateway(IdentitySettings),
+    Stdio {
+        principal: PrincipalId,
+        operator: String,
+    },
     Standalone {
         principal: PrincipalId,
         operator: String,
@@ -43,17 +47,18 @@ pub struct EvaluatorSettings {
 /// embed a credential in its path, the way webhook services commonly issue
 /// them, so only its presence is shown.
 pub struct Settings {
+    pub process: crate::process::ProcessOptions,
     /// Where the host and role registry is read from.
     pub registry: PathBuf,
     /// The MCP credential, current and optional previous value.
-    pub bearers: SharedBearer,
+    pub bearers: Option<SharedBearer>,
     /// The dashboard proxy credential, or standalone operator password.
     ///
     /// Deliberately a different value from the gateway's. The dashboard decides
     /// whether a flagged command runs, and the gateway is how the agent that
     /// asked reaches this service - so one credential for both surfaces would
     /// let a caller that reached the tools approve its own requests.
-    pub proxy_bearers: SharedBearer,
+    pub proxy_bearers: Option<SharedBearer>,
     /// Optional, separately authenticated advisory-evaluation writer.
     ///
     /// It is neither the agent gateway nor the human review proxy: accepting
@@ -138,24 +143,32 @@ impl Settings {
         Self::from_lookup(std::env::var)
     }
 
-    /// Taking the lookup as a parameter lets tests exercise the real rules
-    /// without mutating the process environment, which is shared by every test
-    /// in the binary.
+    /// Validate only configured surfaces, including credential separation.
     pub fn from_lookup<F>(lookup: F) -> Result<Self, SettingsError>
     where
         F: Fn(&'static str) -> Result<String, VarError>,
     {
+        use crate::process::{ProcessOptions, Transport};
+        let process = ProcessOptions::from_lookup(&lookup)?;
         let registry = PathBuf::from(required(&lookup, Self::REGISTRY_VAR)?);
-        let standalone = match optional(&lookup, Self::AUTH_MODE_VAR)?.as_deref() {
-            None | Some("gateway") => false,
-            Some("standalone") => true,
-            Some(_) => {
+        let stdio = process.transport == Transport::Stdio;
+        let gateway = match optional(&lookup, Self::AUTH_MODE_VAR)?.as_deref() {
+            None | Some("standalone") => false,
+            Some("gateway") if !stdio => true,
+            _ => {
                 return Err(SettingsError::Unusable {
                     var: Self::AUTH_MODE_VAR,
                 });
             }
         };
-        let incompatible: &[&'static str] = if standalone {
+        let incompatible: &[&'static str] = if gateway {
+            &[
+                Self::STANDALONE_BEARER_VAR,
+                Self::PRINCIPAL_VAR,
+                Self::OPERATOR_PASSWORD_VAR,
+                Self::OPERATOR_NAME_VAR,
+            ]
+        } else {
             &[
                 Self::BEARER_VAR,
                 Self::PREVIOUS_BEARER_VAR,
@@ -164,58 +177,63 @@ impl Settings {
                 Self::JWKS_VAR,
                 Self::ISSUER_VAR,
             ]
-        } else {
-            &[
-                Self::STANDALONE_BEARER_VAR,
-                Self::PRINCIPAL_VAR,
-                Self::OPERATOR_PASSWORD_VAR,
-                Self::OPERATOR_NAME_VAR,
-            ]
         };
         for &var in incompatible {
             if optional(&lookup, var)?.is_some() {
                 return Err(SettingsError::Unusable { var });
             }
         }
-        let current_var = if standalone {
-            Self::STANDALONE_BEARER_VAR
-        } else {
+        let current_var = if gateway {
             Self::BEARER_VAR
-        };
-        let proxy_current_var = if standalone {
-            Self::OPERATOR_PASSWORD_VAR
         } else {
-            Self::PROXY_BEARER_VAR
+            Self::STANDALONE_BEARER_VAR
         };
-        let current = required(&lookup, current_var)?;
-        SharedBearer::new(current.clone(), None).map_err(|source| SettingsError::Invalid {
-            var: current_var,
-            source,
-        })?;
-        let previous = optional(&lookup, Self::PREVIOUS_BEARER_VAR)?;
-        let bearer_error_var = if previous.is_some() {
-            Self::PREVIOUS_BEARER_VAR
-        } else {
-            current_var
-        };
-        let proxy_current = required(&lookup, proxy_current_var)?;
-        if standalone && proxy_current.len() > 1024 {
-            return Err(SettingsError::Unusable {
-                var: proxy_current_var,
-            });
-        }
-        SharedBearer::new(proxy_current.clone(), None).map_err(|source| {
-            SettingsError::Invalid {
-                var: proxy_current_var,
-                source,
+        let current = if stdio {
+            if optional(&lookup, current_var)?.is_some() {
+                return Err(SettingsError::Unusable { var: current_var });
             }
-        })?;
-        let proxy_previous = optional(&lookup, Self::PREVIOUS_PROXY_BEARER_VAR)?;
-        let proxy_error_var = if proxy_previous.is_some() {
-            Self::PREVIOUS_PROXY_BEARER_VAR
+            None
         } else {
-            proxy_current_var
+            Some(required(&lookup, current_var)?)
         };
+        let previous = optional(&lookup, Self::PREVIOUS_BEARER_VAR)?;
+        let proxy_var = if gateway {
+            Self::PROXY_BEARER_VAR
+        } else {
+            Self::OPERATOR_PASSWORD_VAR
+        };
+        let proxy_current = optional(&lookup, proxy_var)?;
+        let proxy_previous = optional(&lookup, Self::PREVIOUS_PROXY_BEARER_VAR)?;
+        if !gateway
+            && proxy_current
+                .as_ref()
+                .is_some_and(|value| value.len() > 1024)
+        {
+            return Err(SettingsError::Unusable { var: proxy_var });
+        }
+        if proxy_current.is_none()
+            && (proxy_previous.is_some() || optional(&lookup, Self::OPERATOR_NAME_VAR)?.is_some())
+        {
+            return Err(SettingsError::Missing { var: proxy_var });
+        }
+        let review = optional(&lookup, Self::REVIEW_VAR)?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|_| SettingsError::Unusable {
+                var: Self::REVIEW_VAR,
+            })?
+            .unwrap_or_default();
+        let dashboard = optional_url(&lookup, Self::DASHBOARD_VAR, &["http", "https"])?;
+        if review != ssh_core::policy::ReviewMode::Disabled {
+            if proxy_current.is_none() {
+                return Err(SettingsError::Missing { var: proxy_var });
+            }
+            if dashboard.is_none() {
+                return Err(SettingsError::Missing {
+                    var: Self::DASHBOARD_VAR,
+                });
+            }
+        }
         let evaluator_current = optional(&lookup, Self::EVALUATOR_BEARER_VAR)?;
         let evaluator_previous = optional(&lookup, Self::PREVIOUS_EVALUATOR_BEARER_VAR)?;
         let evaluator_name = optional(&lookup, Self::EVALUATOR_NAME_VAR)?;
@@ -235,34 +253,19 @@ impl Settings {
                 var: Self::EVALUATOR_NAME_VAR,
             });
         }
-
-        // The dashboard and the MCP surface are separated *by* these
-        // credentials: a value accepted on both would let whoever reaches the
-        // tools also open the page that approves their held commands. A
-        // deployment that configures that has removed the boundary, so startup
-        // refuses it, naming the proxy-side variable carrying the shared
-        // value.
-        let gateway_values = [Some(current.as_str()), previous.as_deref()];
-        for (proxy_value, var) in [
-            (Some(proxy_current.as_str()), proxy_current_var),
+        let agent_values = [current.as_deref(), previous.as_deref()];
+        let operator_values = [proxy_current.as_deref(), proxy_previous.as_deref()];
+        for (value, var) in [
+            (proxy_current.as_deref(), proxy_var),
             (proxy_previous.as_deref(), Self::PREVIOUS_PROXY_BEARER_VAR),
         ] {
-            let Some(proxy_value) = proxy_value else {
-                continue;
-            };
-            if gateway_values.iter().flatten().any(|v| *v == proxy_value) {
+            if value.is_some_and(|value| agent_values.iter().flatten().any(|held| *held == value)) {
                 return Err(SettingsError::Invalid {
                     var,
                     source: IngressError::BearersSharedAcrossSurfaces,
                 });
             }
         }
-        let protected_values = [
-            Some(current.as_str()),
-            previous.as_deref(),
-            Some(proxy_current.as_str()),
-            proxy_previous.as_deref(),
-        ];
         for (value, var) in [
             (evaluator_current.as_deref(), Self::EVALUATOR_BEARER_VAR),
             (
@@ -270,49 +273,67 @@ impl Settings {
                 Self::PREVIOUS_EVALUATOR_BEARER_VAR,
             ),
         ] {
-            let Some(value) = value else { continue };
-            if protected_values.iter().flatten().any(|held| *held == value) {
+            if value.is_some_and(|value| {
+                agent_values
+                    .iter()
+                    .chain(&operator_values)
+                    .flatten()
+                    .any(|held| *held == value)
+            }) {
                 return Err(SettingsError::Invalid {
                     var,
                     source: IngressError::BearersSharedAcrossSurfaces,
                 });
             }
         }
-
-        let bearers =
-            SharedBearer::new(current, previous).map_err(|source| SettingsError::Invalid {
-                var: bearer_error_var,
-                source,
-            })?;
-        let proxy_bearers = SharedBearer::new(proxy_current, proxy_previous).map_err(|source| {
-            SettingsError::Invalid {
-                var: proxy_error_var,
-                source,
-            }
-        })?;
-        let evaluator = match (evaluator_current, evaluator_name) {
-            (Some(current), Some(name)) => {
-                let error_var = if evaluator_previous.is_some() {
-                    Self::PREVIOUS_EVALUATOR_BEARER_VAR
-                } else {
-                    Self::EVALUATOR_BEARER_VAR
-                };
-                let bearers = SharedBearer::new(current, evaluator_previous).map_err(|source| {
-                    SettingsError::Invalid {
-                        var: error_var,
-                        source,
-                    }
-                })?;
-                Some(EvaluatorSettings {
-                    bearers: Arc::new(bearers),
-                    name,
-                })
-            }
+        let bearers = bearer_pair(current, previous, current_var, Self::PREVIOUS_BEARER_VAR)?;
+        let proxy_bearers = bearer_pair(
+            proxy_current,
+            proxy_previous,
+            proxy_var,
+            Self::PREVIOUS_PROXY_BEARER_VAR,
+        )?;
+        let evaluator = match (
+            bearer_pair(
+                evaluator_current,
+                evaluator_previous,
+                Self::EVALUATOR_BEARER_VAR,
+                Self::PREVIOUS_EVALUATOR_BEARER_VAR,
+            )?,
+            evaluator_name,
+        ) {
+            (Some(bearers), Some(name)) => Some(EvaluatorSettings {
+                bearers: Arc::new(bearers),
+                name,
+            }),
             (None, None) => None,
-            _ => unreachable!("partial evaluator settings were refused above"),
+            _ => {
+                return Err(SettingsError::Unusable {
+                    var: Self::EVALUATOR_BEARER_VAR,
+                });
+            }
         };
-
-        let identity = if standalone {
+        let identity = if gateway {
+            let identity = IdentitySettings {
+                jwks_url: Url::parse(&required(&lookup, Self::JWKS_VAR)?).map_err(|_| {
+                    SettingsError::Unusable {
+                        var: Self::JWKS_VAR,
+                    }
+                })?,
+                issuer: required(&lookup, Self::ISSUER_VAR)?,
+            };
+            identity
+                .validate()
+                .map_err(|source| SettingsError::Invalid {
+                    var: if matches!(source, IngressError::IssuerBlank) {
+                        Self::ISSUER_VAR
+                    } else {
+                        Self::JWKS_VAR
+                    },
+                    source,
+                })?;
+            Authentication::Gateway(identity)
+        } else {
             let principal =
                 optional(&lookup, Self::PRINCIPAL_VAR)?.unwrap_or_else(|| "local".to_owned());
             let principal =
@@ -330,61 +351,70 @@ impl Settings {
                 (principal.as_str(), Self::PRINCIPAL_VAR),
                 (operator.as_str(), Self::OPERATOR_NAME_VAR),
             ] {
-                if bearers.accepts(name.as_bytes())
-                    || proxy_bearers.accepts(name.as_bytes())
+                if bearers.as_ref().is_some_and(|b| b.accepts(name.as_bytes()))
+                    || proxy_bearers
+                        .as_ref()
+                        .is_some_and(|b| b.accepts(name.as_bytes()))
                     || evaluator
                         .as_ref()
-                        .is_some_and(|settings| settings.bearers.accepts(name.as_bytes()))
+                        .is_some_and(|e| e.bearers.accepts(name.as_bytes()))
                 {
                     return Err(SettingsError::Unusable { var });
                 }
             }
-            Authentication::Standalone {
-                principal,
-                operator,
+            if stdio {
+                Authentication::Stdio {
+                    principal,
+                    operator,
+                }
+            } else {
+                Authentication::Standalone {
+                    principal,
+                    operator,
+                }
             }
-        } else {
-            let raw_jwks = required(&lookup, Self::JWKS_VAR)?;
-            let jwks_url = Url::parse(&raw_jwks).map_err(|_| SettingsError::Unusable {
-                var: Self::JWKS_VAR,
-            })?;
-            let identity = IdentitySettings {
-                jwks_url,
-                issuer: required(&lookup, Self::ISSUER_VAR)?,
-            };
-            identity
-                .validate()
-                .map_err(|source| SettingsError::Invalid {
-                    var: if matches!(source, IngressError::IssuerBlank) {
-                        Self::ISSUER_VAR
-                    } else {
-                        Self::JWKS_VAR
-                    },
-                    source,
-                })?;
-            Authentication::Gateway(identity)
         };
-
         Ok(Self {
+            process,
             registry,
             bearers,
             proxy_bearers,
             evaluator,
-            audit_query: optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?,
             identity,
-            // Reject unsupported endpoints by variable name before serving.
+            review,
+            dashboard,
+            audit_query: optional_base_url(&lookup, Self::AUDIT_QUERY_VAR)?,
             notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
-            dashboard: optional_url(&lookup, Self::DASHBOARD_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
-            review: optional(&lookup, Self::REVIEW_VAR)?
-                .map(|value| value.parse())
-                .transpose()
-                .map_err(|_| SettingsError::Unusable {
-                    var: Self::REVIEW_VAR,
-                })?
-                .unwrap_or_default(),
         })
     }
+}
+
+fn bearer_pair(
+    current: Option<String>,
+    previous: Option<String>,
+    current_var: &'static str,
+    previous_var: &'static str,
+) -> Result<Option<SharedBearer>, SettingsError> {
+    let Some(current) = current else {
+        return if previous.is_none() {
+            Ok(None)
+        } else {
+            Err(SettingsError::Missing { var: current_var })
+        };
+    };
+    SharedBearer::new(current.clone(), None).map_err(|source| SettingsError::Invalid {
+        var: current_var,
+        source,
+    })?;
+    let var = if previous.is_some() {
+        previous_var
+    } else {
+        current_var
+    };
+    SharedBearer::new(current, previous)
+        .map(Some)
+        .map_err(|source| SettingsError::Invalid { var, source })
 }
 
 /// What the service will not exceed, until a deployment says otherwise.
@@ -533,6 +563,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
+    #[error(transparent)]
+    Process(#[from] crate::process::ProcessError),
     #[error("{var} must be set; the service cannot mediate access without it")]
     Missing { var: &'static str },
     #[error("{var} is set to something this service cannot read")]
@@ -571,21 +603,27 @@ mod tests {
             matches!(settings.identity, Authentication::Standalone { principal, operator }
             if principal.as_str() == "local" && operator == "operator")
         );
-        assert!(settings.bearers.accepts(BEARER.as_bytes()));
-        assert!(!settings.proxy_bearers.accepts(BEARER.as_bytes()));
+        assert!(
+            settings
+                .bearers
+                .as_ref()
+                .unwrap()
+                .accepts(BEARER.as_bytes())
+        );
+        assert!(
+            !settings
+                .proxy_bearers
+                .as_ref()
+                .unwrap()
+                .accepts(BEARER.as_bytes())
+        );
     }
 
     #[test]
     fn standalone_configuration_is_explicit_and_credentials_are_separate() {
-        for missing in [
-            Settings::AUTH_MODE_VAR,
-            Settings::STANDALONE_BEARER_VAR,
-            Settings::OPERATOR_PASSWORD_VAR,
-        ] {
-            let mut vars = standalone();
-            vars.remove(missing);
-            assert!(Settings::from_lookup(read(&vars)).is_err());
-        }
+        let mut vars = standalone();
+        vars.remove(Settings::STANDALONE_BEARER_VAR);
+        assert!(Settings::from_lookup(read(&vars)).is_err());
         for (var, value) in [
             (Settings::AUTH_MODE_VAR, "automatic"),
             (Settings::BEARER_VAR, BEARER),
@@ -606,6 +644,7 @@ mod tests {
 
     fn complete() -> HashMap<&'static str, String> {
         HashMap::from([
+            (Settings::AUTH_MODE_VAR, "gateway".to_owned()),
             (
                 Settings::REGISTRY_VAR,
                 "/etc/mcp-ssh/registry.json".to_owned(),
@@ -634,7 +673,13 @@ mod tests {
             settings.registry,
             PathBuf::from("/etc/mcp-ssh/registry.json")
         );
-        assert!(settings.bearers.accepts(BEARER.as_bytes()));
+        assert!(
+            settings
+                .bearers
+                .as_ref()
+                .unwrap()
+                .accepts(BEARER.as_bytes())
+        );
         assert!(
             matches!(settings.identity, Authentication::Gateway(identity) if identity.issuer == "https://gateway.example")
         );
@@ -649,7 +694,6 @@ mod tests {
         for var in [
             Settings::REGISTRY_VAR,
             Settings::BEARER_VAR,
-            Settings::PROXY_BEARER_VAR,
             Settings::JWKS_VAR,
             Settings::ISSUER_VAR,
         ] {
@@ -897,8 +941,20 @@ mod tests {
 
         vars.insert(Settings::PREVIOUS_BEARER_VAR, previous.to_owned());
         let settings = Settings::from_lookup(read(&vars)).unwrap();
-        assert!(settings.bearers.accepts(BEARER.as_bytes()));
-        assert!(settings.bearers.accepts(previous.as_bytes()));
+        assert!(
+            settings
+                .bearers
+                .as_ref()
+                .unwrap()
+                .accepts(BEARER.as_bytes())
+        );
+        assert!(
+            settings
+                .bearers
+                .as_ref()
+                .unwrap()
+                .accepts(previous.as_bytes())
+        );
     }
 
     #[test]
@@ -1010,6 +1066,10 @@ mod tests {
 
         let mut vars = complete();
         vars.insert(Settings::REVIEW_VAR, "privileged".to_owned());
+        vars.insert(
+            Settings::DASHBOARD_VAR,
+            "https://review.example/dashboard".to_owned(),
+        );
         assert_eq!(
             Settings::from_lookup(read(&vars)).unwrap().review,
             ssh_core::policy::ReviewMode::Privileged
@@ -1055,6 +1115,69 @@ mod tests {
             bounds.lifetime.idle
                 >= bounds.approval.decide_within + 2 * bounds.approval.redeem_within,
             "a lapse could become reportable only after its session had gone"
+        );
+    }
+    #[test]
+    fn standalone_http_needs_no_optional_integration() {
+        let mut vars = standalone();
+        vars.remove(Settings::AUTH_MODE_VAR);
+        vars.remove(Settings::OPERATOR_PASSWORD_VAR);
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(settings.proxy_bearers.is_none());
+        assert!(settings.evaluator.is_none());
+        assert!(settings.audit_query.is_none());
+        assert!(matches!(
+            settings.identity,
+            Authentication::Standalone { .. }
+        ));
+        vars.insert(Settings::REVIEW_VAR, "all".to_owned());
+        assert!(matches!(
+            Settings::from_lookup(read(&vars)),
+            Err(SettingsError::Missing {
+                var: Settings::OPERATOR_PASSWORD_VAR
+            })
+        ));
+        vars.insert(Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned());
+        vars.insert(
+            Settings::DASHBOARD_VAR,
+            "http://localhost:8080/dashboard".to_owned(),
+        );
+        assert!(Settings::from_lookup(read(&vars)).is_ok());
+    }
+
+    #[test]
+    fn stdio_uses_launch_authority_and_can_enable_separate_human_review() {
+        let mut vars = HashMap::from([
+            (Settings::REGISTRY_VAR, "registry.json".to_owned()),
+            (
+                crate::process::ProcessOptions::TRANSPORT_VAR,
+                "stdio".to_owned(),
+            ),
+            (
+                crate::process::ProcessOptions::AUDIT_VAR,
+                "file:audit.jsonl".to_owned(),
+            ),
+        ]);
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        assert!(settings.bearers.is_none());
+        assert!(settings.proxy_bearers.is_none());
+        assert!(
+            matches!(settings.identity, Authentication::Stdio { principal, .. } if principal.as_str() == "local")
+        );
+        vars.insert(Settings::STANDALONE_BEARER_VAR, BEARER.to_owned());
+        assert!(Settings::from_lookup(read(&vars)).is_err());
+        vars.remove(Settings::STANDALONE_BEARER_VAR);
+        vars.insert(Settings::REVIEW_VAR, "all".to_owned());
+        vars.insert(Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned());
+        vars.insert(
+            Settings::DASHBOARD_VAR,
+            "http://localhost:8080/dashboard".to_owned(),
+        );
+        assert!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .proxy_bearers
+                .is_some()
         );
     }
 }
