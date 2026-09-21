@@ -26,6 +26,8 @@ mode. The tutorial uses public build dependencies and a small Python MCP client.
   and session closure through stdio or stateless MCP HTTP behind a TLS proxy.
 - Explicit account access classes, checked against configuration and session
   ownership on MCP session operations.
+- Binary SFTP upload/download by file reference, with HTTP byte transfer or
+  local stdio files; bulk command output stays outside model context.
 - Optional account-based human review and a browser queue for held commands.
 - Verified SSH host keys and target credentials supplied by the operator.
 - Required audit and diagnostic sinks configured independently, with optional
@@ -33,7 +35,7 @@ mode. The tutorial uses public build dependencies and a small Python MCP client.
 - Explicit standalone authentication, or the existing gateway integration with
   signed identity assertions.
 
-File-transfer integration, OAuth login, independent tenants, and active replicas
+OAuth login, independent tenants, and active replicas
 are outside the initial supported setup. The service does not provision target
 accounts or their permissions. Read the [design's non-goals and preconditions](docs/design.md#non-goals-and-preconditions)
 before connecting real hosts.
@@ -46,6 +48,7 @@ before connecting real hosts.
 - [Design](docs/design.md): intent, trust boundaries, and architectural decisions.
 - [Dependency security](docs/dependency-security.md): advisory assessment and RSA compatibility.
 - [Contributing](CONTRIBUTING.md): development checks, pull requests, and image publication.
+- [File transfers](docs/file-transfers.md): byte channels, file tools, bounds, and recovery.
 - [Outbound connections](docs/outbound-connections.md): HTTPS and certificate trust.
 - [Security reports](SECURITY.md): how to request a private reporting channel.
 - [Preparing a public release](docs/releases.md): snapshot and distribution checks.

@@ -49,6 +49,7 @@ async fn stdio_exchanges_protocol_only_and_exits_on_eof_without_an_http_listener
     let mut child = fixture
         .command()
         .env("MCP_SSH_LISTEN", occupied.local_addr().unwrap().to_string())
+        .env("MCP_SSH_FILE_ROOT", &fixture.0)
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();

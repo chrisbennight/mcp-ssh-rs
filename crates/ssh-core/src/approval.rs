@@ -31,6 +31,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::action::{Action, ActionKind};
 use crate::audit::Intended;
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandIntent};
@@ -164,6 +165,7 @@ impl Approver {
 /// hosts, under different roles, in work opened for different reasons.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Asked {
+    pub operation: ActionKind,
     pub id: RequestId,
     pub session: SessionId,
     /// Whom the work is being done for, as the caller was authenticated.
@@ -590,7 +592,7 @@ impl<C: Clock> Approvals<C> {
         // record can prove about it rests on them having arrived together.
         let decided = held.deliberation().sequence;
         let decided_digest = held.deliberation().digest.as_str().to_owned();
-        let action = digest_of(command, &agent_intent);
+        let action = digest_action(held.decision().action(), &agent_intent);
         let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         requests.retain(|_, held| !held.forgettable(now));
@@ -706,6 +708,7 @@ impl<C: Clock> Approvals<C> {
         }
 
         let asked = Asked {
+            operation: held.decision().action().kind(),
             id: RequestId(new_identifier()),
             session: session.id.clone(),
             principal: session.principal.clone(),
@@ -819,6 +822,21 @@ impl<C: Clock> Approvals<C> {
         command: &Command,
         agent_intent: &CommandIntent,
     ) -> Result<Grant, ApprovalError> {
+        self.redeem_action(
+            id,
+            principal,
+            &Action::execute(command.clone()),
+            agent_intent,
+        )
+    }
+
+    pub fn redeem_action(
+        &self,
+        id: &RequestId,
+        principal: &PrincipalId,
+        action: &Action,
+        agent_intent: &CommandIntent,
+    ) -> Result<Grant, ApprovalError> {
         let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         let held = requests
@@ -850,7 +868,7 @@ impl<C: Clock> Approvals<C> {
         }
         // The approval names one action. Anything else is a different decision
         // than the one that was made.
-        if held.action != digest_of(command, agent_intent) {
+        if held.action != digest_action(action, agent_intent) {
             return Err(ApprovalError::DifferentAction);
         }
 
@@ -999,9 +1017,20 @@ impl Held {
 /// commands and produce different digests, where any flattening would make them
 /// the same. The intent is length-delimited and domain-separated for the same
 /// reason.
+#[cfg(test)]
 pub(crate) fn digest_of(command: &Command, agent_intent: &CommandIntent) -> String {
+    digest_parts(ActionKind::Execute, command, agent_intent)
+}
+
+pub(crate) fn digest_action(action: &Action, agent_intent: &CommandIntent) -> String {
+    digest_parts(action.kind(), action.command(), agent_intent)
+}
+
+fn digest_parts(kind: ActionKind, command: &Command, agent_intent: &CommandIntent) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"mcp-ssh-action-v2");
+    hasher.update(b"mcp-ssh-action-v3");
+    hasher.update(kind.as_str().len().to_le_bytes());
+    hasher.update(kind.as_str().as_bytes());
     hasher.update(agent_intent.as_str().len().to_le_bytes());
     hasher.update(agent_intent.as_str().as_bytes());
     for argument in command.argv() {
@@ -1893,5 +1922,49 @@ mod tests {
         approvals.clock.advance(WINDOWS.decide_within);
         approvals.sweep(|_| true);
         assert!(approvals.is_empty(), "lapsed requests were retained");
+    }
+    #[test]
+    fn upload_approval_binds_content_and_replacement_choice() {
+        let path = crate::files::RemotePath::parse("/tmp/report").unwrap();
+        let input =
+            crate::transfer::PreparedUpload::new("mcp-file://input/one".to_owned(), vec![1, 2])
+                .unwrap();
+        let changed =
+            crate::transfer::PreparedUpload::new("mcp-file://input/one".to_owned(), vec![1, 3])
+                .unwrap();
+        let original = Action::upload(path.clone(), input.identity().clone(), false).unwrap();
+        let remapped = crate::transfer::PreparedUpload::new(
+            "mcp-file://input/remapped".to_owned(),
+            vec![1, 2],
+        )
+        .unwrap();
+        let remapped = Action::upload(path.clone(), remapped.identity().clone(), false).unwrap();
+        let replacement = Action::upload(path.clone(), input.identity().clone(), true).unwrap();
+        let changed = Action::upload(path, changed.identity().clone(), false).unwrap();
+        let intent = CommandIntent::parse("place the report").unwrap();
+        assert_eq!(
+            digest_action(&original, &intent),
+            digest_action(&remapped, &intent)
+        );
+        assert_ne!(
+            digest_action(&original, &intent),
+            digest_action(&replacement, &intent)
+        );
+        assert_ne!(
+            digest_action(&original, &intent),
+            digest_action(&changed, &intent)
+        );
+    }
+
+    #[test]
+    fn file_transfer_and_execution_have_distinct_approval_identity() {
+        let transfer =
+            Action::download(crate::files::RemotePath::parse("/tmp/report").unwrap()).unwrap();
+        let execution = Action::execute(transfer.command().clone());
+        let intent = CommandIntent::parse("inspect the report").unwrap();
+        assert_ne!(
+            digest_action(&transfer, &intent),
+            digest_action(&execution, &intent)
+        );
     }
 }

@@ -34,6 +34,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::action::{Action, ActionKind};
 use crate::approval::{Answer, Approver, Asked, Grant};
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandIntent};
@@ -264,6 +265,7 @@ pub enum Event {
     },
     /// A command was submitted, and this is what was decided before any run.
     Decided {
+        operation: ActionKind,
         /// The calling agent's own explanation, not authenticated user intent.
         agent_intent: String,
         argv: Vec<String>,
@@ -340,12 +342,15 @@ pub enum Event {
         state: String,
         stdout: Recorded,
         stderr: Recorded,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file: Option<crate::action::FileIdentity>,
     },
     SessionClosed,
     /// An external, advisory assessment of a recorded decision.
     ///
     /// This entry authorizes nothing and cannot change an earlier verdict.
     Evaluated {
+        operation: ActionKind,
         artifact: EvaluationArtifact,
         /// The exact decision sequence and bounded context copied when the
         /// artifact joins the chain. Keeping this with the evaluation makes
@@ -532,7 +537,7 @@ impl Held {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Receipt {
     authorization: Authorization,
-    command: Command,
+    action: Action,
 }
 
 impl Receipt {
@@ -550,7 +555,11 @@ impl Receipt {
     /// or skipped, and there is no second command here to disagree with.
     #[must_use]
     pub const fn command(&self) -> &Command {
-        &self.command
+        self.action.command()
+    }
+
+    pub const fn action(&self) -> &Action {
+        &self.action
     }
 
     #[must_use]
@@ -664,6 +673,7 @@ struct EvaluationIndex {
 
 #[derive(Clone, Debug)]
 struct ReadableDecision {
+    operation: ActionKind,
     sequence: u64,
     attribution: Attribution,
     argv: Vec<String>,
@@ -753,6 +763,7 @@ impl<C: Clock> Ledger<C> {
             &mut entries,
             attribution.clone(),
             Event::Decided {
+                operation: decision.action().kind(),
                 argv: argv.clone(),
                 agent_intent: recorded_agent_intent.clone(),
                 program: command.program().to_owned(),
@@ -768,6 +779,7 @@ impl<C: Clock> Ledger<C> {
         evaluations.readable_decisions.insert(
             entry.digest.as_str().to_owned(),
             ReadableDecision {
+                operation: decision.action().kind(),
                 sequence: entry.sequence,
                 attribution,
                 argv,
@@ -786,7 +798,7 @@ impl<C: Clock> Ledger<C> {
                 digest: entry.digest.clone(),
                 who: Attribution::of(decision.session()),
             },
-            command: command.clone(),
+            action: decision.action().clone(),
         });
         Ok(Intended {
             entry,
@@ -822,7 +834,8 @@ impl<C: Clock> Ledger<C> {
         if decision.verdict() != Verdict::NeedsApproval {
             return Err(AuditError::NotHeldForApproval { sequence: decided });
         }
-        if grant.action() != crate::approval::digest_of(decision.command(), intended.agent_intent())
+        if grant.action()
+            != crate::approval::digest_action(decision.action(), intended.agent_intent())
         {
             return Err(AuditError::NotItsApproval { sequence: decided });
         }
@@ -877,7 +890,7 @@ impl<C: Clock> Ledger<C> {
                     digest: entry.digest.clone(),
                     who: Attribution::of(session),
                 },
-                command: decision.command().clone(),
+                action: decision.action().clone(),
             },
             approver,
         ))
@@ -1026,6 +1039,7 @@ impl<C: Clock> Ledger<C> {
                 state: format!("{:?}", outcome.state()),
                 stdout: record_output(outcome.stdout()),
                 stderr: record_output(outcome.stderr()),
+                file: outcome.file().cloned(),
             },
         )?;
         completed.insert(outcome.run().as_str().to_owned());
@@ -1073,6 +1087,7 @@ impl<C: Clock> Ledger<C> {
             &mut entries,
             decision.attribution.clone(),
             Event::Evaluated {
+                operation: decision.operation,
                 artifact,
                 decided: decision.sequence,
                 argv: decision.argv.clone(),
@@ -2145,6 +2160,7 @@ mod tests {
             .unwrap();
 
         let asked = Asked {
+            operation: ActionKind::Execute,
             id: crate::approval::RequestId::from_raw("a-request"),
             session: session.id.clone(),
             principal: session.principal.clone(),

@@ -1,6 +1,7 @@
 //! Optional local human review, independent of upstream account authorization.
 
 use crate::AccessClass;
+use crate::action::Action;
 use crate::command::Command;
 use crate::session::Session;
 
@@ -41,7 +42,7 @@ pub struct Decision {
     verdict: Verdict,
     policies: Vec<String>,
     explanation: String,
-    command: Command,
+    action: Action,
     session: Session,
 }
 
@@ -63,7 +64,11 @@ impl Decision {
 
     #[must_use]
     pub const fn command(&self) -> &Command {
-        &self.command
+        self.action.command()
+    }
+
+    pub const fn action(&self) -> &Action {
+        &self.action
     }
 
     #[must_use]
@@ -86,6 +91,10 @@ impl Engine {
     /// A review decision cannot grant a different account or change its class.
     #[must_use]
     pub fn decide(&self, session: &Session, command: Command) -> Decision {
+        self.decide_action(session, Action::execute(command))
+    }
+
+    pub fn decide_action(&self, session: &Session, action: Action) -> Decision {
         let held = match self.review {
             ReviewMode::Disabled => false,
             ReviewMode::All => true,
@@ -108,7 +117,7 @@ impl Engine {
             verdict,
             policies: vec![policy.to_owned()],
             explanation: reason.to_owned(),
-            command,
+            action,
             session: session.clone(),
         }
     }

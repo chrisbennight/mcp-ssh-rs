@@ -1,39 +1,10 @@
-//! Reading and writing files on a target, as operations rather than commands.
-//!
-//! A file can be reached by running `cat`, and that is how the execution path
-//! would do it. Doing it as an operation instead buys three things:
-//!
-//! - **No shell.** There is no command line, so there is nothing to quote and
-//!   no login shell parsing anything. The whole class of defects the command
-//!   path spends its care on does not arise here.
-//! - **A path policy can bind to.** A decision about `cat /etc/shadow` has to
-//!   find the path among a command's arguments; a decision about reading
-//!   `/etc/shadow` is about the path itself.
-//! - **A bounded answer.** A read says how much it will return before it
-//!   returns it, rather than discovering that a log file was a gigabyte.
-//!
-//! What this does *not* change is who the service is on the target. The role's
-//! account is still what the target's own permissions apply to, and it remains
-//! the boundary that holds when everything here is wrong.
-//!
-//! The executor itself is deliberately private until the mediated path can
-//! require a recorded policy decision. The compiler keeps dependent crates
-//! from reaching the target through this raw layer in the meantime:
-//!
-//! ```compile_fail
-//! use ssh_core::files::perform;
-//! ```
+//! Bounded binary SFTP operations, reachable only through recorded mediation.
 
-#![expect(
-    dead_code,
-    reason = "the raw executor becomes reachable only through the mediated file surface"
-)]
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use russh_sftp::client::SftpSession;
-use russh_sftp::client::rawsession::RawSftpSession;
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
@@ -41,57 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use crate::connect::Connection;
 
 // Enough for the result tag, field names, byte count, quotes, and punctuation.
-const READ_ENVELOPE_BYTES: usize = 64;
-
-/// Most encoded bytes any single operation answer can occupy.
-const MAX_ANSWER_BYTES: usize = (1 << 20) + READ_ENVELOPE_BYTES;
-
-/// Most bytes a single read returns.
-///
-/// A file operation answers in one piece, so this is also how much a caller can
-/// make the service hold at once. Larger files are what the out-of-band channel
-/// is for; until that exists, a read that would exceed this is refused rather
-/// than silently truncated, because a truncated configuration file read as if
-/// it were whole is worse than no answer.
-pub const MAX_READ_BYTES: u64 = 1 << 20;
-
-/// Most bytes a single write accepts.
-pub const MAX_WRITE_BYTES: usize = 1 << 20;
-
-/// Most entries a single listing returns.
-///
-/// Generous for a directory somebody is reading deliberately, and far short of
-/// what it takes to make this service hold a directory that is being used as a
-/// queue.
-pub const MAX_LISTED_ENTRIES: usize = 4096;
-
-/// Most encoded bytes a single listing answer can occupy.
-pub const MAX_LISTED_BYTES: usize = MAX_ANSWER_BYTES;
 
 // Fixed entry keys, the largest u64, punctuation, and the list envelope fit
 // below these deliberately rounded charges. Counting an upper bound avoids
 // allocating the serialized answer merely to learn that it is too large.
-const LIST_ENTRY_OVERHEAD: usize = 96;
-const LIST_ENVELOPE_BYTES: usize = 64;
-
-/// Bytes this string occupies inside JSON, conservatively.
-///
-/// Control characters may become `\u00xx`; quote and backslash gain one
-/// escape byte; every other scalar stays no larger than its UTF-8 spelling.
-fn json_string_weight(value: &str) -> usize {
-    value.chars().fold(0_usize, |total, character| {
-        let encoded = match character {
-            '"' | '\\' => 2,
-            '\u{0000}'..='\u{001f}' => 6,
-            _ => character.len_utf8(),
-        };
-        total.saturating_add(encoded)
-    })
-}
-
-fn listed_weight(name: &str) -> usize {
-    json_string_weight(name).saturating_add(LIST_ENTRY_OVERHEAD)
-}
 
 // russh-sftp 2.4 accepts response lengths up to u32::MAX and allocates the
 // declared length before reading the body. Nothing a bounded operation needs
@@ -338,75 +262,13 @@ pub enum PathError {
     NotOneSpelling,
 }
 
-/// What is being done to a file.
-///
-/// Named as its own type rather than passed as a boolean, because this is what
-/// a policy decision and an audit record are *about*: "wrote to /etc/hosts" and
-/// "read /etc/hosts" are different events and must not be one event with a flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileOp {
-    Read,
-    Write,
-    List,
-    Stat,
-}
+/// Upper bound for one binary transfer, enforced again while reading.
+pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
 
-impl FileOp {
-    /// The name this operation is recorded and decided under.
-    ///
-    /// The prefix distinguishes file operations in the audit record.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Read => "file.read",
-            Self::Write => "file.write",
-            Self::List => "file.list",
-            Self::Stat => "file.stat",
-        }
-    }
-}
-
-/// What a file was found to be.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Entry {
-    pub name: String,
-    pub directory: bool,
-    /// Absent when the target did not say.
-    ///
-    /// Not zero. A target is allowed to omit it, and reporting an empty file
-    /// where the answer was "no answer" is the kind of confident wrongness a
-    /// caller cannot detect — it would read a file it was told was empty and
-    /// conclude the file was empty.
-    pub size: Option<u64>,
-}
-
-/// The result of an operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum FileOutcome {
-    /// File contents, as text.
-    Read { text: String, bytes: u64 },
-    /// Bytes written.
-    Written { bytes: u64 },
-    /// A directory's entries.
-    Listed { entries: Vec<Entry> },
-    /// What a path is.
-    Stated { entry: Entry },
-}
-
-/// Performs one file operation over an established connection.
-///
-/// A fresh SFTP session per operation rather than one held open: a session is
-/// cheap next to the SSH handshake the connection already paid for, and holding
-/// one means owning its lifetime against a connection that can drop underneath
-/// it.
-pub(crate) async fn perform(
+async fn binary_session(
     connection: &Connection,
-    op: FileOp,
     path: &RemotePath,
-    content: Option<&str>,
-) -> Result<FileOutcome, FileError> {
+) -> Result<SftpSession, FileError> {
     let channel = connection
         .handle()
         .channel_open_session()
@@ -420,128 +282,90 @@ pub(crate) async fn perform(
         .map_err(|source| FileError::Unavailable {
             detail: source.to_string(),
         })?;
-    let stream = BoundedSftpStream::new(channel.into_stream());
-    // Listing runs on the raw protocol rather than the convenience wrapper.
-    // The wrapper's `read_dir` reads a directory to its end before returning,
-    // so a bound applied to its result bounds only what is copied out of it —
-    // the service has already taken the whole directory into memory by then,
-    // which is the thing the bound exists to prevent.
-    if op == FileOp::List {
-        return list(stream, path).await;
-    }
-
-    let sftp = SftpSession::new(stream)
+    let sftp = SftpSession::new(BoundedSftpStream::new(channel.into_stream()))
         .await
         .map_err(|source| FileError::Unavailable {
             detail: source.to_string(),
         })?;
-    resolves_to_itself(&sftp, path).await?;
-
-    let outcome = match op {
-        FileOp::Read => read(&sftp, path).await,
-        FileOp::Write => write(&sftp, path, content.ok_or(FileError::NothingToWrite)?).await,
-        FileOp::Stat => stat(&sftp, path).await,
-        // Answered above, on the raw protocol, and returned before this point.
-        FileOp::List => Err(FileError::Unavailable {
-            detail: "listing does not run here".to_owned(),
-        }),
-    };
-    // Closed whichever way the operation went, so a failed operation does not
-    // leave a channel open on the target for the life of the session.
-    let _ = sftp.close().await;
-    outcome
+    if let Err(error) = resolves_to_itself(&sftp, path).await {
+        let _ = sftp.close().await;
+        return Err(error);
+    }
+    Ok(sftp)
 }
 
-async fn read(sftp: &SftpSession, path: &RemotePath) -> Result<FileOutcome, FileError> {
-    // Asked about before opened. A read that discovers the size by running out
-    // of memory is not a bounded read.
-    let metadata = sftp
-        .metadata(path.as_str())
-        .await
-        .map_err(|source| failed(path, &source))?;
-    let size = metadata.size.unwrap_or_default();
-    if size > MAX_READ_BYTES {
-        return Err(FileError::TooLarge {
-            size,
-            max: MAX_READ_BYTES,
-        });
-    }
-
-    let mut file = sftp
-        .open(path.as_str())
-        .await
-        .map_err(|source| failed(path, &source))?;
-    let mut bytes = Vec::new();
-    // Bounded again while reading: the size was read a moment ago and the file
-    // may have grown since, and this is the limit that actually holds.
-    let mut reader = (&mut file).take(MAX_READ_BYTES.saturating_add(1));
-    reader
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|source| FileError::Failed {
-            path: path.as_str().to_owned(),
-            detail: source.to_string(),
-        })?;
-    let read = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if read > MAX_READ_BYTES {
-        return Err(FileError::TooLarge {
-            size: read,
-            max: MAX_READ_BYTES,
-        });
-    }
-
-    // Text, because the answer travels in a tool result. Binary content is what
-    // the out-of-band channel is for, and refusing here is better than emitting
-    // replacement characters that read as if the file contained them.
-    let text = String::from_utf8(bytes).map_err(|_| FileError::NotText {
-        path: path.as_str().to_owned(),
-    })?;
-    let answer_bytes = READ_ENVELOPE_BYTES.saturating_add(json_string_weight(text.as_str()));
-    if answer_bytes > MAX_ANSWER_BYTES {
-        return Err(FileError::AnswerTooLarge {
-            path: path.as_str().to_owned(),
-            max: MAX_ANSWER_BYTES,
-        });
-    }
-    Ok(FileOutcome::Read { bytes: read, text })
-}
-
-async fn write(
-    sftp: &SftpSession,
+/// Bytes remain outside the MCP result and are published only after a complete read.
+pub(crate) async fn download(
+    connection: &Connection,
     path: &RemotePath,
-    content: &str,
-) -> Result<FileOutcome, FileError> {
-    if content.len() > MAX_WRITE_BYTES {
+) -> Result<Vec<u8>, FileError> {
+    let sftp = binary_session(connection, path).await?;
+    let result = async {
+        let mut file = sftp
+            .open(path.as_str())
+            .await
+            .map_err(|source| failed(path, &source))?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take((MAX_TRANSFER_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|source| FileError::Failed {
+                path: path.as_str().to_owned(),
+                detail: source.to_string(),
+            })?;
+        if bytes.len() > MAX_TRANSFER_BYTES {
+            return Err(FileError::TooLarge {
+                size: bytes.len() as u64,
+                max: MAX_TRANSFER_BYTES as u64,
+            });
+        }
+        Ok(bytes)
+    }
+    .await;
+    let _ = sftp.close().await;
+    result
+}
+
+/// A failed upload may have changed the remote file; callers must never replay it automatically.
+pub(crate) async fn upload(
+    connection: &Connection,
+    path: &RemotePath,
+    bytes: &[u8],
+    overwrite: bool,
+) -> Result<(), FileError> {
+    if bytes.len() > MAX_TRANSFER_BYTES {
         return Err(FileError::TooLarge {
-            size: u64::try_from(content.len()).unwrap_or(u64::MAX),
-            max: u64::try_from(MAX_WRITE_BYTES).unwrap_or(u64::MAX),
+            size: bytes.len() as u64,
+            max: MAX_TRANSFER_BYTES as u64,
         });
     }
-    let mut file = sftp
-        .open_with_flags(
-            path.as_str(),
-            // Truncating rather than appending: a write replaces the file's
-            // contents, which is what was decided about. An append would make
-            // the result depend on what was already there.
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-        )
-        .await
-        .map_err(|source| failed(path, &source))?;
-    file.write_all(content.as_bytes())
-        .await
-        .map_err(|source| FileError::Failed {
+    let sftp = binary_session(connection, path).await?;
+    let result = async {
+        let mode = if overwrite {
+            OpenFlags::TRUNCATE
+        } else {
+            OpenFlags::EXCLUDE
+        };
+        let mut file = sftp
+            .open_with_flags(path.as_str(), OpenFlags::CREATE | OpenFlags::WRITE | mode)
+            .await
+            .map_err(|source| failed(path, &source))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|source| FileError::Failed {
+                path: path.as_str().to_owned(),
+                detail: source.to_string(),
+            })?;
+        file.shutdown().await.map_err(|source| FileError::Failed {
             path: path.as_str().to_owned(),
             detail: source.to_string(),
         })?;
-    // Flushed explicitly: dropping the handle would end the operation without
-    // anything having established that the bytes arrived.
-    file.flush().await.map_err(|source| FileError::Failed {
-        path: path.as_str().to_owned(),
-        detail: source.to_string(),
-    })?;
-    Ok(FileOutcome::Written {
-        bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
-    })
+        Ok(())
+    }
+    .await;
+    let _ = sftp.close().await;
+    result
 }
 
 /// Whether the target reaches this path without following a link.
@@ -600,116 +424,18 @@ fn said(source: &russh_sftp::client::error::Error, code: StatusCode) -> bool {
     )
 }
 
-async fn list<S>(stream: S, path: &RemotePath) -> Result<FileOutcome, FileError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let session = RawSftpSession::new(stream);
-    session
-        .init()
-        .await
-        .map_err(|source| FileError::Unavailable {
-            detail: source.to_string(),
-        })?;
-
-    // The same question the other operations ask, in the raw protocol's words.
-    let resolved = session
-        .realpath(path.parent())
-        .await
-        .map_err(|source| failed(path, &source))?;
-    let names_itself = resolved
-        .files
-        .first()
-        .is_some_and(|file| file.filename == path.parent());
-    if !names_itself {
-        return Err(elsewhere(path));
-    }
-    match session.lstat(path.as_str()).await {
-        Ok(attributes) if attributes.attrs.is_symlink() => return Err(elsewhere(path)),
-        Ok(_) => {}
-        Err(source) if said(&source, StatusCode::NoSuchFile) => {}
-        Err(source) => return Err(failed(path, &source)),
-    }
-
-    let handle = session
-        .opendir(path.as_str())
-        .await
-        .map_err(|source| failed(path, &source))?
-        .handle;
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut listed_bytes = LIST_ENVELOPE_BYTES;
-    let outcome = loop {
-        // Read a batch at a time, and stop reading when the answer is full.
-        // This is the difference from the convenience wrapper: it reads to the
-        // end of the directory before anything can look at what it has, so a
-        // bound on its result bounds only the copy.
-        match session.readdir(handle.as_str()).await {
-            Ok(names) => {
-                if names.files.is_empty() {
-                    break Err(FileError::ListingMadeNoProgress {
-                        path: path.as_str().to_owned(),
-                    });
-                }
-                if entries.len().saturating_add(names.files.len()) > MAX_LISTED_ENTRIES {
-                    break Err(FileError::TooManyEntries {
-                        path: path.as_str().to_owned(),
-                        max: MAX_LISTED_ENTRIES,
-                    });
-                }
-                let batch_bytes = names.files.iter().fold(0_usize, |total, file| {
-                    total.saturating_add(listed_weight(file.filename.as_str()))
-                });
-                let after_batch = listed_bytes.saturating_add(batch_bytes);
-                if after_batch > MAX_LISTED_BYTES {
-                    break Err(FileError::ListingTooLarge {
-                        path: path.as_str().to_owned(),
-                        max: MAX_LISTED_BYTES,
-                    });
-                }
-                listed_bytes = after_batch;
-                entries.extend(names.files.into_iter().map(|file| Entry {
-                    directory: file.attrs.is_dir(),
-                    size: file.attrs.size,
-                    name: file.filename,
-                }));
-            }
-            // The end of a directory arrives as a status of its own. Anything
-            // else the target says is a refusal, and breaking on it as though
-            // it were the end would hand back a partial directory that reads
-            // as a whole one — the caller acts on what is missing.
-            Err(source) if said(&source, StatusCode::Eof) => break Ok(()),
-            Err(source) => break Err(failed(path, &source)),
-        }
-    };
-    let _ = session.close(handle).await;
-    outcome?;
-    // Ordered, so two listings of an unchanged directory are the same answer.
-    // A caller comparing them should be told what changed on the target, not
-    // what order the target happened to report.
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(FileOutcome::Listed { entries })
-}
-
-async fn stat(sftp: &SftpSession, path: &RemotePath) -> Result<FileOutcome, FileError> {
-    let metadata = sftp
-        .metadata(path.as_str())
-        .await
-        .map_err(|source| failed(path, &source))?;
-    Ok(FileOutcome::Stated {
-        entry: Entry {
-            name: path.as_str().to_owned(),
-            directory: metadata.is_dir(),
-            size: metadata.size,
-        },
-    })
-}
-
 /// One shape of failure for anything the target refused.
 ///
 /// The path is named because the caller supplied it, and the target's own words
 /// are carried because "permission denied" and "no such file" are different
 /// facts an operator needs. Nothing here reads the file to say more.
 fn failed(path: &RemotePath, source: &russh_sftp::client::error::Error) -> FileError {
+    if said(source, StatusCode::NoSuchFile) {
+        return FileError::NotFound;
+    }
+    if said(source, StatusCode::PermissionDenied) {
+        return FileError::PermissionDenied;
+    }
     FileError::Failed {
         path: path.as_str().to_owned(),
         detail: source.to_string(),
@@ -718,29 +444,17 @@ fn failed(path: &RemotePath, source: &russh_sftp::client::error::Error) -> FileE
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FileError {
-    #[error("the target's file service could not be reached: {detail}")]
+    #[error("the remote file or directory was not found")]
+    NotFound,
+    #[error("the remote account was denied file access")]
+    PermissionDenied,
+    #[error("SFTP is unavailable: {detail}")]
     Unavailable { detail: String },
-    #[error("a write needs content")]
-    NothingToWrite,
     #[error("{path} could not be operated on: {detail}")]
     Failed { path: String, detail: String },
-    #[error("{size} bytes exceeds the {max} a single operation carries")]
+    #[error("{size} bytes exceeds the transfer limit of {max}")]
     TooLarge { size: u64, max: u64 },
-    #[error("{path} is not text; bulk and binary content need the out-of-band channel")]
-    NotText { path: String },
-    #[error("{path} holds more than the {max} entries a single listing carries")]
-    TooManyEntries { path: String, max: usize },
-    #[error("{path} returned a successful listing batch without entries or EOF")]
-    ListingMadeNoProgress { path: String },
-    #[error("{path} would make a listing larger than the {max} bytes one answer carries")]
-    ListingTooLarge { path: String, max: usize },
-    #[error(
-        "{path} would make an answer larger than the {max} encoded bytes one operation carries"
-    )]
-    AnswerTooLarge { path: String, max: usize },
-    #[error(
-        "{path} is not what the target resolves it to; a link makes it name one file and open another"
-    )]
+    #[error("{path} resolves through a symbolic link")]
     ResolvesElsewhere { path: String },
 }
 
@@ -827,7 +541,6 @@ mod tests {
                 Files {
                     root: self.root.clone(),
                     open: HashMap::new(),
-                    listed: HashMap::new(),
                 },
             )
             .await;
@@ -843,7 +556,6 @@ mod tests {
     struct Files {
         root: PathBuf,
         open: HashMap<String, PathBuf>,
-        listed: HashMap<String, bool>,
     }
 
     impl Files {
@@ -888,6 +600,9 @@ mod tests {
         ) -> Result<Handle, Self::Error> {
             let path = self.resolve(&filename);
             let exists = path.exists();
+            if exists && pflags.contains(OpenFlags::EXCLUDE) {
+                return Err(StatusCode::Failure);
+            }
             if !exists && !pflags.contains(OpenFlags::CREATE) {
                 return Err(StatusCode::NoSuchFile);
             }
@@ -904,7 +619,6 @@ mod tests {
 
         async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
             self.open.remove(&handle);
-            self.listed.remove(&handle);
             Ok(Status {
                 id,
                 status_code: StatusCode::Ok,
@@ -984,58 +698,6 @@ mod tests {
                 id,
                 attrs: Files::attributes(&path).ok_or(StatusCode::NoSuchFile)?,
             })
-        }
-
-        async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-            let resolved = self.resolve(&path);
-            if !resolved.is_dir() {
-                return Err(StatusCode::NoSuchFile);
-            }
-            let handle = format!("d{id}:{path}");
-            self.listed.insert(handle.clone(), false);
-            Ok(Handle { id, handle })
-        }
-
-        async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-            let path = handle.split_once(':').map(|(_, p)| p).unwrap_or("/");
-            // A malicious or broken target can say success without names and
-            // without EOF for ever. This fixture never advances its state.
-            if path.ends_with("/endless-empty") {
-                return Ok(Name {
-                    id,
-                    files: Vec::new(),
-                });
-            }
-            // A second call must report the end of the directory, or the client
-            // reads for ever.
-            if self.listed.get(&handle).copied().unwrap_or(true) {
-                return Err(StatusCode::Eof);
-            }
-            self.listed.insert(handle.clone(), true);
-            // A directory the target refuses partway through. Real causes are a
-            // permission change or a connection dropped mid-listing; what
-            // matters to the client is that a refusal is not the end.
-            if path.ends_with("/unreadable") {
-                return Err(StatusCode::Failure);
-            }
-            // Fewer entries than the count ceiling, but each expands sixfold
-            // when JSON escapes its control bytes. The wire batch stays small
-            // enough to arrive; the answer it would produce does not.
-            if path.ends_with("/wide") {
-                let name = "\u{0001}".repeat(255);
-                let files = (0..(MAX_LISTED_ENTRIES / 4))
-                    .map(|_| File::dummy(name.clone()))
-                    .collect();
-                return Ok(Name { id, files });
-            }
-            let resolved = self.resolve(path);
-            let mut files = Vec::new();
-            for entry in std::fs::read_dir(&resolved).map_err(|_| StatusCode::Failure)? {
-                let entry = entry.map_err(|_| StatusCode::Failure)?;
-                let attrs = Files::attributes(&entry.path()).ok_or(StatusCode::Failure)?;
-                files.push(File::new(entry.file_name().to_string_lossy(), attrs));
-            }
-            Ok(Name { id, files })
         }
 
         async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
@@ -1127,328 +789,116 @@ mod tests {
         dir
     }
 
+    #[tokio::test]
+    async fn transfer_failures_preserve_remote_and_publication_causes() {
+        use crate::audit::Ledger;
+        use crate::clock::TestClock;
+        use crate::policy::{Engine, ReviewMode};
+        use crate::run::{Limits, RunState, Runs};
+        use crate::session::{Lifetime, Purpose, SessionStore};
+        use crate::transfer::{DownloadSink, Failure, Payload};
+
+        struct Unavailable;
+        impl DownloadSink for Unavailable {
+            fn publish(&self, _: Vec<u8>) -> Result<crate::action::FileIdentity, String> {
+                Err("private storage detail must not escape".to_owned())
+            }
+        }
+        let root = scratch();
+        std::fs::write(root.join("present"), b"bytes").unwrap();
+        let large = std::fs::File::create(root.join("large")).unwrap();
+        large.set_len(MAX_TRANSFER_BYTES as u64 + 1).unwrap();
+        let connection = Arc::new(served(&root).await);
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 10000,
+                max: 60000,
+                grace: 5000,
+            },
+            1,
+        )
+        .open(
+            crate::PrincipalId::parse("alice").unwrap(),
+            HostId::parse("testhost").unwrap(),
+            RoleId::parse("readonly").unwrap(),
+            Purpose::parse("verify file failures").unwrap(),
+            crate::AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        let runs = Runs::new(Limits::default());
+        for (remote, cause) in [
+            ("/missing", Failure::NotFound),
+            ("/large", Failure::TooLarge),
+            ("/present", Failure::PublicationUnavailable),
+        ] {
+            let action = crate::action::Action::download(path(remote)).unwrap();
+            let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
+            let receipt = ledger
+                .record_intent(
+                    decision,
+                    crate::command::CommandIntent::parse("verify file failures").unwrap(),
+                )
+                .unwrap()
+                .into_parts()
+                .1
+                .unwrap();
+            let mut outcome = runs
+                .transfer(
+                    connection.clone(),
+                    receipt,
+                    Payload::Download(Arc::new(Unavailable)),
+                )
+                .await
+                .unwrap();
+            if outcome.still_running() {
+                outcome = runs
+                    .wait(outcome.run(), Duration::from_secs(10))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                outcome.state(),
+                RunState::TransferFailed {
+                    cause,
+                    remote_write_may_be_partial: false
+                }
+            );
+            assert!(outcome.file().is_none());
+            assert!(!outcome.stderr().text.contains("private storage"));
+            let later = runs.wait(outcome.run(), Duration::ZERO).await.unwrap();
+            assert_eq!(later.state(), outcome.state());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_transfer_preserves_bytes_and_requires_explicit_replacement() {
+        let root = scratch();
+        let connection = served(&root).await;
+        let remote = path("/binary");
+        let bytes = [0_u8, 255, 254, 128, 10].repeat(15000);
+        upload(&connection, &remote, &bytes, false).await.unwrap();
+        assert_eq!(download(&connection, &remote).await.unwrap(), bytes);
+        assert!(
+            upload(&connection, &remote, b"replacement", false)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(root.join("binary")).unwrap(), bytes);
+        upload(&connection, &remote, b"replacement", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            download(&connection, &remote).await.unwrap(),
+            b"replacement"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn path(raw: &str) -> RemotePath {
         RemotePath::parse(raw).unwrap()
-    }
-
-    /// The round trip that matters: bytes written through the protocol are the
-    /// bytes read back through it, and a listing sees what was written.
-    #[tokio::test]
-    async fn a_file_written_through_the_protocol_reads_back_the_same() {
-        let root = scratch();
-        let connection = served(&root).await;
-
-        let written = perform(
-            &connection,
-            FileOp::Write,
-            &path("/hosts"),
-            Some("127.0.0.1 localhost\n"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(written, FileOutcome::Written { bytes: 20 });
-
-        let read = perform(&connection, FileOp::Read, &path("/hosts"), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            read,
-            FileOutcome::Read {
-                text: "127.0.0.1 localhost\n".to_owned(),
-                bytes: 20
-            }
-        );
-
-        let FileOutcome::Stated { entry } =
-            perform(&connection, FileOp::Stat, &path("/hosts"), None)
-                .await
-                .unwrap()
-        else {
-            panic!("stat did not describe the file");
-        };
-        assert_eq!(entry.size, Some(20));
-        assert!(!entry.directory);
-
-        let FileOutcome::Listed { entries } = perform(&connection, FileOp::List, &path("/"), None)
-            .await
-            .unwrap()
-        else {
-            panic!("list did not return entries");
-        };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries.first().map(|e| e.name.as_str()), Some("hosts"));
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A write replaces the file rather than adding to it. Appending would make
-    /// the result depend on what was already there, which is not what a caller
-    /// asked for or what policy decided about.
-    #[tokio::test]
-    async fn a_write_replaces_what_was_there() {
-        let root = scratch();
-        let connection = served(&root).await;
-        let target = path("/motd");
-
-        perform(&connection, FileOp::Write, &target, Some("first"))
-            .await
-            .unwrap();
-        perform(&connection, FileOp::Write, &target, Some("second"))
-            .await
-            .unwrap();
-
-        let read = perform(&connection, FileOp::Read, &target, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            read,
-            FileOutcome::Read {
-                text: "second".to_owned(),
-                bytes: 6
-            }
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A path can name one file and open another without any `..` in it: a
-    /// link resolves on the target's side, where nothing the parser reads can
-    /// see it. What policy decided about is the path as written, so an
-    /// operation whose path resolves to something else is refused rather than
-    /// followed — on every operation, since a link in a directory's path is
-    /// the same problem as one in a file's.
-    #[tokio::test]
-    async fn a_path_the_target_resolves_elsewhere_is_refused() {
-        let root = scratch();
-        std::fs::write(root.join("hosts"), b"127.0.0.1 localhost\n").unwrap();
-        let connection = served(&root).await;
-
-        for op in [FileOp::Read, FileOp::Stat, FileOp::List] {
-            let refused = perform(&connection, op, &path("/link/hosts"), None)
-                .await
-                .expect_err("a path resolving elsewhere was operated on anyway");
-            assert!(
-                matches!(refused, FileError::ResolvesElsewhere { .. }),
-                "unexpected error for {op:?}: {refused:?}"
-            );
-        }
-
-        // And a link as the *last* component, which resolving the prefix does
-        // not cover: the path names one file and opens another just the same,
-        // and a write through one would land on the file it points at.
-        std::os::unix::fs::symlink(root.join("hosts"), root.join("shadow")).unwrap();
-        for op in [FileOp::Read, FileOp::Stat, FileOp::Write] {
-            let refused = perform(&connection, op, &path("/shadow"), Some("x"))
-                .await
-                .expect_err("a link as the last component was operated on anyway");
-            assert!(
-                matches!(refused, FileError::ResolvesElsewhere { .. }),
-                "unexpected error for {op:?}: {refused:?}"
-            );
-        }
-
-        // And a path the target resolves to itself is untouched by the check.
-        assert!(
-            perform(&connection, FileOp::Read, &path("/hosts"), None)
-                .await
-                .is_ok(),
-            "an ordinary path was refused"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A listing the target cuts short is not a short directory. Reporting a
-    /// refusal as a complete answer hands a caller something it reads as the
-    /// whole directory and acts on for what is missing — the same wrongness as
-    /// a truncated file read, arriving by a different route.
-    #[tokio::test]
-    async fn a_listing_the_target_cuts_short_is_refused_not_reported_as_complete() {
-        let root = scratch();
-        std::fs::create_dir(root.join("unreadable")).unwrap();
-        std::fs::write(root.join("unreadable").join("present"), b"x").unwrap();
-        let connection = served(&root).await;
-
-        let refused = perform(&connection, FileOp::List, &path("/unreadable"), None)
-            .await
-            .expect_err("a refused listing was reported as a complete one");
-        assert!(
-            matches!(refused, FileError::Failed { .. }),
-            "unexpected error: {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A listing is an answer, so it is bounded like one. A directory used as
-    /// a queue is a normal thing to find, and returning as much of it as fits
-    /// would hand back something a caller reads as the whole directory and
-    /// acts on for what is missing.
-    #[tokio::test]
-    async fn a_directory_larger_than_a_single_answer_is_refused_not_truncated() {
-        let root = scratch();
-        for which in 0..=MAX_LISTED_ENTRIES {
-            std::fs::write(root.join(format!("entry-{which:05}")), b"x").unwrap();
-        }
-        let connection = served(&root).await;
-
-        let refused = perform(&connection, FileOp::List, &path("/"), None)
-            .await
-            .expect_err("an oversized directory was listed anyway");
-        assert!(
-            matches!(
-                refused,
-                FileError::TooManyEntries {
-                    max: MAX_LISTED_ENTRIES,
-                    ..
-                }
-            ),
-            "unexpected error: {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A listing below the entry ceiling can still be too large to answer with.
-    /// The target's names expand when encoded, so counting vector slots alone
-    /// would accept an outcome beyond the same response budget reads observe.
-    #[tokio::test]
-    async fn a_listing_larger_than_one_answer_is_refused_below_the_entry_ceiling() {
-        let root = scratch();
-        std::fs::create_dir(root.join("wide")).unwrap();
-        let connection = served(&root).await;
-
-        let result = perform(&connection, FileOp::List, &path("/wide"), None).await;
-        let Err(refused) = result else {
-            panic!("an encoded listing beyond the answer budget was returned");
-        };
-        assert!(
-            matches!(
-                refused,
-                FileError::ListingTooLarge {
-                    max: MAX_LISTED_BYTES,
-                    ..
-                }
-            ),
-            "unexpected error: {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// Successful empty batches are not EOF and do not advance the entry or
-    /// answer-size counters. Refusing the first one means every successful
-    /// batch advances the entry bound, which then bounds the whole operation.
-    #[tokio::test]
-    async fn successful_empty_batches_do_not_keep_a_listing_alive() {
-        let root = scratch();
-        std::fs::create_dir(root.join("endless-empty")).unwrap();
-        let connection = served(&root).await;
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            perform(&connection, FileOp::List, &path("/endless-empty"), None),
-        )
-        .await
-        .expect("the listing did not stop within its round-trip budget");
-        let Err(refused) = result else {
-            panic!("empty successful batches produced a complete listing");
-        };
-        assert!(
-            matches!(refused, FileError::ListingMadeNoProgress { .. }),
-            "unexpected error: {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// Raw bytes are not the answer size: JSON expands control characters to
-    /// six bytes each. This file is below the read ceiling but its complete
-    /// encoded answer is not.
-    #[tokio::test]
-    async fn a_read_larger_only_after_encoding_is_refused() {
-        let root = scratch();
-        let control_bytes = vec![1_u8; (MAX_ANSWER_BYTES / 6).saturating_add(1)];
-        std::fs::write(root.join("escaped"), control_bytes).unwrap();
-        let connection = served(&root).await;
-
-        let result = perform(&connection, FileOp::Read, &path("/escaped"), None).await;
-        let Err(refused) = result else {
-            panic!("an answer beyond the encoded budget was returned");
-        };
-        assert!(
-            matches!(
-                refused,
-                FileError::AnswerTooLarge {
-                    max: MAX_ANSWER_BYTES,
-                    ..
-                }
-            ),
-            "unexpected error: {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A file too large to answer with is refused rather than truncated. A
-    /// configuration file read as though it were whole, when it was not, is
-    /// worse than no answer at all.
-    #[tokio::test]
-    async fn a_file_larger_than_a_single_answer_is_refused_not_truncated() {
-        let root = scratch();
-        std::fs::write(
-            root.join("huge"),
-            vec![b'x'; usize::try_from(MAX_READ_BYTES).unwrap() + 1],
-        )
-        .unwrap();
-        let connection = served(&root).await;
-
-        let refused = perform(&connection, FileOp::Read, &path("/huge"), None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(refused, FileError::TooLarge { .. }),
-            "got {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// Content that is not text is refused rather than mangled. Replacement
-    /// characters would read as though the file contained them.
-    #[tokio::test]
-    async fn content_that_is_not_text_is_refused_rather_than_mangled() {
-        let root = scratch();
-        std::fs::write(root.join("binary"), [0xff_u8, 0xfe, 0x00, 0x01]).unwrap();
-        let connection = served(&root).await;
-
-        let refused = perform(&connection, FileOp::Read, &path("/binary"), None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(refused, FileError::NotText { .. }),
-            "got {refused:?}"
-        );
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A path the target will not give up is a refusal naming the path, not a
-    /// silence and not an empty answer.
-    #[tokio::test]
-    async fn a_path_the_target_refuses_is_reported_as_such() {
-        let root = scratch();
-        let connection = served(&root).await;
-
-        let refused = perform(&connection, FileOp::Read, &path("/absent"), None)
-            .await
-            .unwrap_err();
-        let FileError::Failed { path: named, .. } = refused else {
-            panic!("expected a refusal naming the path, got {refused:?}");
-        };
-        assert_eq!(named, "/absent");
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// The length is rejected before it reaches the SFTP decoder. Testing only
@@ -1531,19 +981,5 @@ mod tests {
             serde_json::from_str::<RemotePath>(r#""../etc/passwd""#).is_err(),
             "a traversing path deserialized"
         );
-    }
-
-    /// Reading and writing are different events. A record that said "file
-    /// operation on /etc/hosts" with a flag would make an audit reader work out
-    /// which one happened.
-    #[test]
-    fn each_operation_is_named_as_itself() {
-        assert_eq!(FileOp::Read.name(), "file.read");
-        assert_eq!(FileOp::Write.name(), "file.write");
-
-        // File operations have a distinct audit namespace.
-        for op in [FileOp::Read, FileOp::Write, FileOp::List, FileOp::Stat] {
-            assert!(op.name().starts_with("file."), "{:?}", op);
-        }
     }
 }

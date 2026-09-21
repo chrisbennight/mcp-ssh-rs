@@ -80,8 +80,9 @@ impl Note {
             purpose: purpose.clone(),
             access_class: access_class.to_owned(),
             text: format!(
-                "{} is waiting to run a command on {} as {} (account class: {}) — {} — {}",
+                "{} is waiting for {} on {} as {} (account class: {}) — {} — {}",
                 principal,
+                asked.operation.as_str(),
                 asked.host.as_str(),
                 asked.role.as_str(),
                 access_class,
