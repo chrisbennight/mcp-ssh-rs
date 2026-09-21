@@ -1,9 +1,9 @@
 # Preparing a public release
 
-Development remains private while the initial release is prepared. Publishing
-the repository, publishing a package, and deploying it to a host are separate
-actions. This guide describes the checks before publication; it does not make
-the repository or its images public.
+The source repository is public while the initial release is prepared.
+Publishing a package and deploying it to a host are separate actions. This
+guide describes release checks; it does not change package visibility or deploy
+the service.
 
 ## Select the candidate
 
@@ -20,11 +20,11 @@ architectures or MCP clients from compilation alone.
 
 ## Review the publication snapshot
 
-The selected publication plan is a fresh history containing the current `main`
-snapshot. Existing private Git history and issues are not part of the import.
-Prepare and inspect an export of tracked files, rather than copying a working
-directory with its Git metadata, local configuration, or generated credentials.
-Do not delete or recreate the private repository as part of routine development.
+The GitHub repository was initialized from a source snapshot. Gitea history
+and issues were not imported. For a release, prepare and inspect an export of
+tracked files from the selected commit, rather than copying a working directory
+with its Git metadata, local configuration, or generated credentials. Do not
+delete or recreate the repository as part of routine release preparation.
 
 Review the exact export for credential material, private endpoints, deployment
 identifiers, internal links, personal data, and files whose redistribution rights
@@ -41,12 +41,12 @@ artifact, including its base image and installed packages.
 
 ## Verify the public entry points
 
-Before changing visibility, verify the maintainer can receive private security
+Before announcing a release, verify the maintainer can receive private security
 reports and update [SECURITY.md](../SECURITY.md) with the tested route. GitHub's
 [private vulnerability reporting](https://docs.github.com/code-security/security-advisories/working-with-repository-security-advisories/configuring-private-vulnerability-reporting-for-a-repository)
 is a repository setting, not something enabled by committing a policy file.
 Also verify repository rules, required CI checks, and the review installation
-after creating the publication repository.
+on the public repository.
 
 Update the README's preparation status and make sure its links and clone
 instructions resolve for a reader without lab access. Keep optional private
