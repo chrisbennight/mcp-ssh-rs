@@ -9,6 +9,10 @@ For suspected vulnerabilities, use [Security reports](SECURITY.md). Maintainers 
 
 ## Ways to help
 
+For branding or interface contributions, start with the
+[visual identity guide](docs/branding/README.md). It includes approved assets,
+font notices, and accessibility and screenshot guidance.
+
 Small fixes, clearer documentation, and reproducible bug reports are welcome.
 Discuss substantial features in an issue before implementation so maintainers
 can agree on scope and ongoing maintenance. Use [Get help](SUPPORT.md) for
