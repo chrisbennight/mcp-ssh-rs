@@ -42,7 +42,11 @@ listener, not a stdio-only process.
 ## File transfer
 
 Configure `MCP_SSH_FILE_ORIGIN` for the HTTP byte channel, or
-`MCP_SSH_FILE_ROOT` for local stdio file references. See
+`MCP_SSH_FILE_ROOT` for local stdio file references.
+Set `MCP_SSH_MAX_TRANSFER_BYTES` to override the 2,000,000,000-byte default.
+For network transfers, `MCP_SSH_FILE_STAGING` selects writable disk-backed staging
+storage; local mode uses the shared root. `MCP_SSH_TRANSFER_TIMEOUT_SECONDS`
+sets the transfer deadline (default 1800 seconds). See
 [file transfers](file-transfers.md) for tool arguments, gateway integration,
 storage bounds, and interrupted-write recovery.
 

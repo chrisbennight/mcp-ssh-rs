@@ -1489,7 +1489,10 @@ mod tests {
     async fn file_operations_require_session_ownership_and_configured_review() {
         struct MustNotPublish;
         impl crate::transfer::DownloadSink for MustNotPublish {
-            fn publish(&self, _: Vec<u8>) -> Result<crate::action::FileIdentity, String> {
+            fn receive<'a>(
+                &'a self,
+                _: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            ) -> crate::transfer::TransferFuture<'a> {
                 panic!("unapproved file effect")
             }
         }

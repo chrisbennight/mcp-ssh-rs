@@ -103,6 +103,8 @@ pub struct MalformedRunId;
 pub struct Limits {
     /// Bytes retained per stream before output is truncated.
     pub output_bytes: usize,
+    /// Maximum elapsed time for one file operation.
+    pub transfer_timeout: Duration,
     /// How long a caller waits before a run is handed back as still running.
     pub wait: Duration,
 }
@@ -111,6 +113,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             output_bytes: 1 << 20,
+            transfer_timeout: Duration::from_secs(1800),
             wait: Duration::from_secs(30),
         }
     }
@@ -567,16 +570,13 @@ impl Runs {
         };
         let watcher = self.watcher.clone();
         let settled_id = id.clone();
+        let transfer_timeout = self.limits.transfer_timeout;
         tokio::spawn(async move {
             let _reading = reading;
             let work = async {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
-                        let bytes = crate::files::download(&connection, &path)
-                            .await
-                            .map_err(Failure::from)?;
-                        sink.publish(bytes)
-                            .map_err(|_| Failure::PublicationUnavailable)
+                        crate::files::download(&connection, &path, &*sink).await
                     }
                     (
                         Operation::Upload {
@@ -584,9 +584,9 @@ impl Runs {
                             source: _,
                             overwrite,
                         },
-                        Payload::Upload(input),
+                        Payload::Upload(mut input),
                     ) => {
-                        crate::files::upload(&connection, &path, input.bytes(), overwrite)
+                        crate::files::upload(&connection, &path, &mut input, overwrite)
                             .await
                             .map_err(Failure::from)?;
                         Ok(input.identity().clone())
@@ -594,7 +594,7 @@ impl Runs {
                     _ => unreachable!("transfer payload was validated before registration"),
                 }
             };
-            let result = tokio::time::timeout(Duration::from_secs(120), work).await;
+            let result = tokio::time::timeout(transfer_timeout, work).await;
             {
                 let mut record = live
                     .record

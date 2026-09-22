@@ -1,26 +1,49 @@
 //! Bounded byte storage and the upstream Waygate file-transfer protocol.
 
+use crate::disk::{DiskFile, Snapshot};
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::TryStreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use ssh_core::{PrincipalId, clock::Clock, files::MAX_TRANSFER_BYTES, transfer::DownloadSink};
+use ssh_core::{
+    PrincipalId,
+    clock::Clock,
+    transfer::{DownloadSink, Failure, TransferFuture},
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq as _;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 pub const AUTHORIZE_UPLOAD: &str = "files/authorizeUpload";
 pub const AUTHORIZE_DOWNLOAD: &str = "files/authorizeDownload";
 const URI_PREFIX: &str = "mcp-file://mcp-ssh/";
 const HEADER: &str = "x-mcp-transfer-credential";
 const TTL: u64 = 300_000;
+
+#[derive(Clone, Debug)]
+pub struct TransferSettings {
+    pub max_bytes: u64,
+    pub timeout: std::time::Duration,
+    pub staging: std::path::PathBuf,
+}
+impl Default for TransferSettings {
+    fn default() -> Self {
+        Self {
+            max_bytes: 2_000_000_000,
+            timeout: std::time::Duration::from_secs(1800),
+            staging: std::env::temp_dir(),
+        }
+    }
+}
 const MAX_ITEMS: usize = 16;
 const OWNER_ITEMS: usize = 4;
 
@@ -78,7 +101,7 @@ pub struct DownloadResult {
 
 struct Ticketed {
     id: String,
-    bytes: Option<Arc<[u8]>>,
+    bytes: Option<Arc<Snapshot>>,
 }
 
 struct Ticket {
@@ -88,7 +111,7 @@ struct Ticket {
 enum Content {
     Pending,
     Receiving,
-    Ready(Arc<[u8]>),
+    Ready(Arc<Snapshot>),
 }
 struct Item {
     local_file: Option<crate::local_files::OwnedFile>,
@@ -97,6 +120,7 @@ struct Item {
     reference: Reference,
     content: Content,
     upload: bool,
+    active: Option<Arc<DiskFile>>,
     ticket: Option<Ticket>,
 }
 
@@ -106,6 +130,8 @@ pub struct Transfers {
     origin: String,
     local: Option<crate::local_files::LocalFiles>,
     items: Mutex<HashMap<String, Item>>,
+    settings: TransferSettings,
+    staging: Arc<std::fs::File>,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -122,10 +148,22 @@ pub enum TransferError {
         "file transfer origin must be an HTTP(S) origin without credentials, path, query, or fragment"
     )]
     Origin,
+    #[error("file storage is unavailable")]
+    Storage,
 }
 
 impl Transfers {
     pub fn new(clock: Arc<dyn Clock>, origin: &str) -> Result<Self, TransferError> {
+        Self::configured(clock, origin, TransferSettings::default())
+    }
+
+    pub fn configured(
+        clock: Arc<dyn Clock>,
+        origin: &str,
+        settings: TransferSettings,
+    ) -> Result<Self, TransferError> {
+        let staging =
+            crate::disk::directory(&settings.staging).map_err(|_| TransferError::Storage)?;
         let url = url::Url::parse(origin).map_err(|_| TransferError::Origin)?;
         if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
@@ -142,15 +180,31 @@ impl Transfers {
             origin: url.as_str().trim_end_matches('/').to_owned(),
             local: None,
             items: Mutex::new(HashMap::new()),
+            staging,
+            settings,
         })
     }
 
     pub fn local(clock: Arc<dyn Clock>, root: &std::path::Path) -> std::io::Result<Self> {
+        Self::local_configured(clock, root, TransferSettings::default())
+    }
+    pub fn local_configured(
+        clock: Arc<dyn Clock>,
+        root: &std::path::Path,
+        settings: TransferSettings,
+    ) -> std::io::Result<Self> {
+        let local = crate::local_files::LocalFiles::new(root)?;
+        let staging = local.staging()?;
+        // Local outputs share the publication filesystem for atomic rename without copying.
+        let probe = crate::disk::directory(root)?;
+        drop(probe);
         Ok(Self {
             clock,
             origin: String::new(),
-            local: Some(crate::local_files::LocalFiles::new(root)?),
+            local: Some(local),
             items: Mutex::new(HashMap::new()),
+            staging,
+            settings,
         })
     }
     pub const fn is_local(&self) -> bool {
@@ -165,7 +219,7 @@ impl Transfers {
     ) -> Result<String, TransferError> {
         if params
             .size
-            .is_some_and(|size| size > MAX_TRANSFER_BYTES as u64)
+            .is_some_and(|size| size > self.settings.max_bytes)
             || params.name.as_ref().is_some_and(|name| name.len() > 255)
             || params
                 .mime_type
@@ -186,11 +240,7 @@ impl Transfers {
         }
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         let now = self.clock.now();
-        items.retain(|_, item| {
-            now.saturating_sub(item.created) < TTL
-                || matches!(item.content, Content::Receiving)
-                || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1)
-        });
+        items.retain(|_, item| retained(item, now));
         if items.len() >= MAX_ITEMS
             || items.values().filter(|item| item.owner == *owner).count() >= OWNER_ITEMS
         {
@@ -205,6 +255,7 @@ impl Transfers {
                 created: now,
                 upload,
                 ticket: None,
+                active: None,
                 content: Content::Pending,
                 reference: Reference {
                     uri: match &self.local {
@@ -286,21 +337,29 @@ impl Transfers {
         Ok(item)
     }
 
-    pub fn input(
+    pub async fn input(
         &self,
         owner: &PrincipalId,
         uri: &str,
     ) -> Result<ssh_core::transfer::PreparedUpload, TransferError> {
         if let Some(local) = &self.local {
-            return local.read(uri).map_err(|_| TransferError::Unknown);
+            return tokio::time::timeout(
+                self.settings.timeout,
+                local.read(uri, Arc::clone(&self.staging), self.settings.max_bytes),
+            )
+            .await
+            .map_err(|_| TransferError::Storage)?
+            .map_err(|_| TransferError::Unknown);
         }
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         let item = self.owned(&mut items, owner, uri)?;
         let Content::Ready(bytes) = &item.content else {
             return Err(TransferError::Unknown);
         };
-        ssh_core::transfer::PreparedUpload::from_shared(uri.to_owned(), Arc::clone(bytes))
-            .map_err(|_| TransferError::Limit)
+        Ok(ssh_core::transfer::PreparedUpload::from_reader(
+            bytes.identity(uri.to_owned()),
+            bytes.reader(),
+        ))
     }
 
     pub fn destination(
@@ -322,52 +381,64 @@ impl Transfers {
         }))
     }
 
-    fn publish(
+    async fn receive(
         &self,
         id: &str,
-        bytes: Vec<u8>,
-        receiving: bool,
-    ) -> Result<ssh_core::action::FileIdentity, TransferError> {
-        if bytes.len() > MAX_TRANSFER_BYTES {
-            return Err(TransferError::Limit);
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> Result<ssh_core::action::FileIdentity, Failure> {
+        let disk = crate::disk::allocate(Arc::clone(&self.staging), None, self.local.is_some())
+            .await
+            .map_err(|_| Failure::PublicationUnavailable)?;
+        {
+            let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+            let item = items.get_mut(id).ok_or(Failure::PublicationUnavailable)?;
+            if !matches!(item.content, Content::Receiving) {
+                return Err(Failure::PublicationUnavailable);
+            }
+            item.active = Some(Arc::clone(&disk));
         }
+        let snapshot = crate::disk::receive(disk, reader, self.settings.max_bytes).await?;
         let digest = FileDigest {
             algorithm: "sha-256".to_owned(),
-            value: URL_SAFE_NO_PAD.encode(hash(&bytes)),
+            value: URL_SAFE_NO_PAD.encode(snapshot.digest),
+        };
+        {
+            let items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+            let item = items.get(id).ok_or(Failure::PublicationUnavailable)?;
+            if item
+                .reference
+                .size
+                .is_some_and(|size| size != snapshot.size)
+                || item
+                    .reference
+                    .digest
+                    .as_ref()
+                    .is_some_and(|expected| expected != &digest)
+            {
+                return Err(Failure::PublicationUnavailable);
+            }
+        }
+        let local_file = match &self.local {
+            Some(local) => Some(
+                local
+                    .publish(id, &snapshot)
+                    .map_err(|_| Failure::PublicationUnavailable)?,
+            ),
+            None => None,
         };
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
-        let item = items.get_mut(id).ok_or(TransferError::Unknown)?;
-        let expected_state = if receiving {
-            matches!(item.content, Content::Receiving)
-        } else {
-            matches!(item.content, Content::Pending) && !item.upload
-        };
-        if !expected_state || self.clock.now().saturating_sub(item.created) >= TTL {
-            return Err(TransferError::Unknown);
+        let item = items.get_mut(id).ok_or(Failure::PublicationUnavailable)?;
+        if !matches!(item.content, Content::Receiving) {
+            return Err(Failure::PublicationUnavailable);
         }
-        if item
-            .reference
-            .size
-            .is_some_and(|size| size != bytes.len() as u64)
-            || item
-                .reference
-                .digest
-                .as_ref()
-                .is_some_and(|expected| expected != &digest)
-        {
-            return Err(TransferError::Integrity);
-        }
-        let identity = ssh_core::transfer::identity(item.reference.uri.clone(), &bytes);
-        item.reference.size = Some(bytes.len() as u64);
+        let identity = snapshot.identity(item.reference.uri.clone());
+        item.reference.size = Some(snapshot.size);
         item.reference.digest = Some(digest);
-        if let Some(local) = &self.local {
-            item.local_file = Some(
-                local
-                    .publish(id, &bytes)
-                    .map_err(|_| TransferError::Limit)?,
-            );
-        }
-        item.content = Content::Ready(bytes.into());
+        item.local_file = local_file;
+        item.content = Content::Ready(snapshot);
+        item.active = None;
+        // Completed content gets the full delivery window, independently of transfer duration.
+        item.created = self.clock.now();
         Ok(identity)
     }
 
@@ -405,11 +476,19 @@ impl Transfers {
 
     fn abandon(&self, id: &str) {
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
-        if items
-            .get(id)
-            .is_some_and(|item| !matches!(item.content, Content::Ready(_)))
-        {
-            items.remove(id);
+        if let Some(item) = items.get_mut(id) {
+            if matches!(item.content, Content::Ready(_)) {
+                return;
+            }
+            item.content = Content::Pending;
+            item.created = 0;
+            if item
+                .active
+                .as_ref()
+                .is_none_or(|disk| Arc::strong_count(disk) == 1 && disk.remove().is_ok())
+            {
+                items.remove(id);
+            }
         }
     }
 
@@ -418,8 +497,34 @@ impl Transfers {
         self.items
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .retain(|_, item| now.saturating_sub(item.created) < TTL || matches!(item.content, Content::Receiving) || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1));
+            .retain(|_, item| retained(item, now));
     }
+}
+
+fn retained(item: &mut Item, now: u64) -> bool {
+    let in_use = now.saturating_sub(item.created) < TTL
+        || matches!(item.content, Content::Receiving)
+        || item
+            .active
+            .as_ref()
+            .is_some_and(|disk| Arc::strong_count(disk) > 1)
+        || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1 || Arc::strong_count(&bytes.disk) > 1);
+    if in_use {
+        return true;
+    }
+    if let Some(disk) = &item.active
+        && let Err(error) = disk.remove()
+    {
+        tracing::warn!(%error, "could not remove staging file; retaining its reservation");
+        return true;
+    }
+    if let Some(file) = &item.local_file
+        && let Err(error) = file.remove()
+    {
+        tracing::warn!(%error, "could not remove expired local output; retaining its reservation");
+        return true;
+    }
+    false
 }
 
 struct Destination {
@@ -427,10 +532,34 @@ struct Destination {
     id: String,
 }
 impl DownloadSink for Destination {
-    fn publish(&self, bytes: Vec<u8>) -> Result<ssh_core::action::FileIdentity, String> {
-        self.store
-            .publish(&self.id, bytes, false)
-            .map_err(|error| error.to_string())
+    fn receive<'a>(
+        &'a self,
+        reader: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> TransferFuture<'a> {
+        Box::pin(async move {
+            {
+                let mut items = self
+                    .store
+                    .items
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let item = items
+                    .get_mut(&self.id)
+                    .ok_or(Failure::PublicationUnavailable)?;
+                if !matches!(item.content, Content::Pending)
+                    || item.upload
+                    || self.store.clock.now().saturating_sub(item.created) >= TTL
+                {
+                    return Err(Failure::PublicationUnavailable);
+                }
+                item.content = Content::Receiving;
+            }
+            let receiving = Receiving {
+                store: Arc::clone(&self.store),
+                id: self.id.clone(),
+            };
+            receiving.store.receive(&receiving.id, reader).await
+        })
     }
 }
 impl Drop for Destination {
@@ -438,6 +567,7 @@ impl Drop for Destination {
         self.store.abandon(&self.id);
     }
 }
+
 struct Receiving {
     store: Arc<Transfers>,
     id: String,
@@ -473,7 +603,10 @@ async fn download(
                 ("content-type", "application/octet-stream"),
                 ("cache-control", "no-store"),
             ],
-            Body::from(Bytes::from_owner(bytes)),
+            Body::from_stream(ReaderStream::with_capacity(
+                bytes.reader(),
+                crate::disk::CHUNK,
+            )),
         )
             .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -493,17 +626,15 @@ async fn upload(
         return StatusCode::NOT_FOUND;
     };
     let receiving = Receiving { store, id };
-    let Ok(Ok(bytes)) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        axum::body::to_bytes(body, MAX_TRANSFER_BYTES),
+    let mut reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+    match tokio::time::timeout(
+        receiving.store.settings.timeout,
+        receiving.store.receive(&receiving.id, &mut reader),
     )
     .await
-    else {
-        return StatusCode::BAD_REQUEST;
-    };
-    match receiving.store.publish(&receiving.id, bytes.to_vec(), true) {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::BAD_REQUEST,
+    {
+        Ok(Ok(_)) => StatusCode::NO_CONTENT,
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -540,6 +671,137 @@ mod tests {
             .unwrap()
     }
 
+    async fn streamed_http_roundtrip(size: u64) {
+        use tokio::io::AsyncReadExt as _;
+        let store = plane();
+        let caller = owner("large-file");
+        let upload = store
+            .authorize_upload(
+                &caller,
+                UploadParams {
+                    size: Some(size),
+                    ..UploadParams::default()
+                },
+            )
+            .unwrap();
+        let source =
+            ReaderStream::with_capacity(tokio::io::repeat(173).take(size), crate::disk::CHUNK);
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&upload.upload, Body::from_stream(source)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let download = store.authorize_download(&caller, &upload.file.uri).unwrap();
+        assert_eq!(download.file.size, Some(size));
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&download.download, Body::empty()))
+            .await
+            .unwrap();
+        let mut reader = StreamReader::new(
+            response
+                .into_body()
+                .into_data_stream()
+                .map_err(std::io::Error::other),
+        );
+        let mut buffer = vec![0; crate::disk::CHUNK];
+        let mut seen = 0_u64;
+        let mut digest = Sha256::new();
+        loop {
+            let count = reader.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            let bytes = buffer.get(..count).unwrap();
+            assert!(bytes.iter().all(|byte| *byte == 173));
+            digest.update(bytes);
+            seen = seen.checked_add(count as u64).unwrap();
+        }
+        assert_eq!(seen, size);
+        assert_eq!(
+            download.file.digest.unwrap().value,
+            URL_SAFE_NO_PAD.encode(digest.finalize())
+        );
+    }
+
+    #[tokio::test]
+    async fn http_streams_files_larger_than_the_old_memory_limit() {
+        streamed_http_roundtrip(17 * 1024 * 1024).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "writes and reads 2 GB of temporary storage; run explicitly for large-file validation"]
+    async fn two_gigabyte_http_roundtrip() {
+        streamed_http_roundtrip(TransferSettings::default().max_bytes).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_length_uploads_enforce_the_configured_limit_and_release_failed_reservations() {
+        let store = Arc::new(
+            Transfers::configured(
+                Arc::new(TestClock::at(1000)),
+                "https://ssh.example",
+                TransferSettings {
+                    max_bytes: 8,
+                    ..TransferSettings::default()
+                },
+            )
+            .unwrap(),
+        );
+        let caller = owner("caller");
+        for (bytes, status) in [
+            ("12345678", StatusCode::NO_CONTENT),
+            ("123456789", StatusCode::BAD_REQUEST),
+        ] {
+            let upload = store
+                .authorize_upload(&caller, UploadParams::default())
+                .unwrap();
+            let response = routes(Arc::clone(&store))
+                .oneshot(request(&upload.upload, Body::from(bytes)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        let upload = store
+            .authorize_upload(&caller, UploadParams::default())
+            .unwrap();
+        let failed = futures_util::stream::iter([Err::<axum::body::Bytes, _>(
+            std::io::Error::other("disconnected"),
+        )]);
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&upload.upload, Body::from_stream(failed)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_uploads_release_their_reservations_at_the_configured_deadline() {
+        let store = Arc::new(
+            Transfers::configured(
+                Arc::new(TestClock::at(1000)),
+                "https://ssh.example",
+                TransferSettings {
+                    timeout: std::time::Duration::from_millis(10),
+                    ..TransferSettings::default()
+                },
+            )
+            .unwrap(),
+        );
+        let upload = store
+            .authorize_upload(&owner("caller"), UploadParams::default())
+            .unwrap();
+        let stalled = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&upload.upload, Body::from_stream(stalled)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        store.sweep();
+        assert!(store.items.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn bytes_cross_the_http_adapter_with_integrity_and_single_use_tickets() {
         let store = plane();
@@ -559,7 +821,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(upload.upload.transport, "http");
-        assert!(store.input(&caller, &upload.file.uri).is_err());
+        assert!(store.input(&caller, &upload.file.uri).await.is_err());
         assert_eq!(
             routes(Arc::clone(&store))
                 .oneshot(request(&upload.upload, Body::from(bytes.clone())))
@@ -576,10 +838,16 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        assert!(store.input(&owner("other"), &upload.file.uri).is_err());
+        assert!(
+            store
+                .input(&owner("other"), &upload.file.uri)
+                .await
+                .is_err()
+        );
         assert_eq!(
             store
                 .input(&caller, &upload.file.uri)
+                .await
                 .unwrap()
                 .identity()
                 .bytes,
@@ -632,7 +900,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(store.input(&caller, &upload.file.uri).is_err());
+        assert!(store.input(&caller, &upload.file.uri).await.is_err());
         assert!(
             store.items.lock().unwrap().is_empty(),
             "failed upload releases its reservation"
@@ -657,7 +925,7 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
-        assert!(store.input(&caller, &upload.file.uri).is_err());
+        assert!(store.input(&caller, &upload.file.uri).await.is_err());
     }
 
     #[test]
@@ -687,8 +955,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn receiving_uploads_remain_charged_after_reference_expiry() {
+    #[tokio::test]
+    async fn receiving_uploads_remain_charged_after_reference_expiry() {
         let clock = Arc::new(TestClock::at(1000));
         let store = Arc::new(Transfers::new(clock.clone(), "https://ssh.example").unwrap());
         let caller = owner("caller");
@@ -722,10 +990,16 @@ mod tests {
             store.authorize_upload(&caller, UploadParams::default()),
             Err(TransferError::Capacity)
         ));
+        store
+            .receive(&receiving.id, &mut std::io::Cursor::new(b"completed"))
+            .await
+            .unwrap();
         assert!(
-            store.publish(&receiving.id, Vec::new(), true).is_err(),
-            "expiry still prevents publication"
+            store.input(&caller, &upload.file.uri).await.is_ok(),
+            "completion starts a fresh delivery window"
         );
+        clock.advance(TTL);
+        store.sweep();
         drop(receiving);
         assert!(
             store
@@ -734,18 +1008,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expired_files_in_use_still_count_against_memory_capacity() {
+    #[tokio::test]
+    async fn expired_files_in_use_still_count_against_disk_capacity() {
         let clock = Arc::new(TestClock::at(1000));
         let store = Arc::new(Transfers::new(clock.clone(), "https://ssh.example").unwrap());
         let caller = owner("caller");
         let sink = store.destination(&caller, None).unwrap();
-        let file = sink.publish(vec![1, 2, 3]).unwrap();
-        let input = store.input(&caller, &file.uri).unwrap();
+        let file = sink
+            .receive(&mut std::io::Cursor::new(vec![1, 2, 3]))
+            .await
+            .unwrap();
+        let input = store.input(&caller, &file.uri).await.unwrap();
         clock.advance(TTL);
         store.sweep();
         assert_eq!(store.items.lock().unwrap().len(), 1);
-        assert!(store.input(&caller, &file.uri).is_err());
+        assert!(store.input(&caller, &file.uri).await.is_err());
         drop(input);
         store.sweep();
         assert!(store.items.lock().unwrap().is_empty());

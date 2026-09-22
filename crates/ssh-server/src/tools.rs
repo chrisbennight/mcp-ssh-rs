@@ -608,9 +608,7 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
             {
                 Ok(executed) => {
                     announce(notifier, dashboard, &executed);
-                    ok(&exec_result_with_files(
-                        executed, dashboard, files, principal,
-                    ))
+                    ok(&exec_result_with_files(executed, dashboard, files, principal).await)
                 }
                 Err(error) => without_an_outcome(&error),
             }
@@ -632,16 +630,17 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
             let store = files.ok_or_else(|| {
                 McpError::invalid_request("file transfer is not configured", None)
             })?;
-            let input = store.input(principal, &args.source).map_err(bad_request)?;
+            let input = store
+                .input(principal, &args.source)
+                .await
+                .map_err(bad_request)?;
             match bastion
                 .upload_intended(principal, &session, intent, path, input, args.overwrite)
                 .await
             {
                 Ok(executed) => {
                     announce(notifier, dashboard, &executed);
-                    ok(&exec_result_with_files(
-                        executed, dashboard, files, principal,
-                    ))
+                    ok(&exec_result_with_files(executed, dashboard, files, principal).await)
                 }
                 Err(error) => without_an_outcome(&error),
             }
@@ -720,9 +719,7 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
             {
                 Ok(executed) => {
                     announce(notifier, dashboard, &executed);
-                    ok(&exec_result_with_files(
-                        executed, dashboard, files, principal,
-                    ))
+                    ok(&exec_result_with_files(executed, dashboard, files, principal).await)
                 }
                 Err(error) => without_an_outcome(&error),
             }
@@ -747,12 +744,9 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
                 )
                 .await
             {
-                Ok(outcome) => ok(&ran_with_files(
-                    &outcome,
-                    "polled".to_owned(),
-                    files,
-                    principal,
-                )),
+                Ok(outcome) => {
+                    ok(&ran_with_files(&outcome, "polled".to_owned(), files, principal).await)
+                }
                 Err(error) => without_an_outcome(&error),
             }
         }
@@ -819,7 +813,7 @@ fn announce_ask(
     notifier.waiting(crate::notify::Note::about(asked.asked(), dashboard));
 }
 
-fn exec_result_with_files(
+async fn exec_result_with_files(
     executed: Executed,
     dashboard: Option<&url::Url>,
     files: Option<&Arc<crate::transfer::Transfers>>,
@@ -835,13 +829,13 @@ fn exec_result_with_files(
                 Some(who) => held_and(&self::approved_by(who)),
                 None => decision.explanation().to_owned(),
             };
-            ran_with_files(&outcome, why, files, principal)
+            ran_with_files(&outcome, why, files, principal).await
         }
         held => exec_result(held, dashboard),
     }
 }
 
-fn ran_with_files(
+async fn ran_with_files(
     outcome: &ssh_core::run::Outcome,
     why: String,
     files: Option<&Arc<crate::transfer::Transfers>>,
@@ -849,13 +843,15 @@ fn ran_with_files(
 ) -> ExecResult {
     let mut result = ran(outcome, why);
     if let ExecResult::Ran { stdout, stderr, .. } = &mut result {
-        *stdout = stream_with_files(outcome.stdout(), outcome.stdout_bytes(), files, principal);
-        *stderr = stream_with_files(outcome.stderr(), outcome.stderr_bytes(), files, principal);
+        *stdout =
+            stream_with_files(outcome.stdout(), outcome.stdout_bytes(), files, principal).await;
+        *stderr =
+            stream_with_files(outcome.stderr(), outcome.stderr_bytes(), files, principal).await;
     }
     result
 }
 
-fn stream_with_files(
+async fn stream_with_files(
     stream: &ssh_core::run::Stream,
     bytes: &[u8],
     files: Option<&Arc<crate::transfer::Transfers>>,
@@ -871,10 +867,13 @@ fn stream_with_files(
                 .to_owned(),
         };
     };
-    let published = store.destination(principal, None).and_then(|sink| {
-        sink.publish(bytes.to_vec())
-            .map_err(|_| crate::transfer::TransferError::Capacity)
-    });
+    let published = match store.destination(principal, None) {
+        Ok(sink) => sink
+            .receive(&mut std::io::Cursor::new(bytes))
+            .await
+            .map_err(|_| crate::transfer::TransferError::Storage),
+        Err(error) => Err(error),
+    };
     match published {
         Ok(file) => StreamOut::Reference {
             file: crate::transfer::Reference {
@@ -1679,8 +1678,8 @@ mod tests {
     /// so the second call does not answer like the first. A client told this is
     /// idempotent would treat a lost response as safe to re-request, and get an
     /// unknown-run error where the output used to be.
-    #[test]
-    fn bulk_and_binary_output_are_references_to_the_retained_bytes() {
+    #[tokio::test]
+    async fn bulk_and_binary_output_are_references_to_the_retained_bytes() {
         let store = Arc::new(
             crate::transfer::Transfers::new(
                 Arc::new(ssh_core::clock::TestClock::at(0)),
@@ -1700,7 +1699,7 @@ mod tests {
             file,
             truncated,
             bytes: seen,
-        } = stream_with_files(&stream, &bytes, Some(&store), &principal)
+        } = stream_with_files(&stream, &bytes, Some(&store), &principal).await
         else {
             panic!("bulk bytes were not referenced");
         };
@@ -1710,13 +1709,14 @@ mod tests {
         assert_eq!(
             store
                 .input(&principal, &file.uri)
+                .await
                 .unwrap()
                 .identity()
                 .sha256,
             ssh_core::transfer::identity(String::new(), &bytes).sha256
         );
         assert!(matches!(
-            stream_with_files(&stream, &bytes, None, &principal),
+            stream_with_files(&stream, &bytes, None, &principal).await,
             StreamOut::Unavailable { .. }
         ));
         let catalog = catalog_with_files(Some(&store));

@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 use crate::connect::Connection;
 
@@ -262,9 +262,6 @@ pub enum PathError {
     NotOneSpelling,
 }
 
-/// Upper bound for one binary transfer, enforced again while reading.
-pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
-
 async fn binary_session(
     connection: &Connection,
     path: &RemotePath,
@@ -294,33 +291,19 @@ async fn binary_session(
     Ok(sftp)
 }
 
-/// Bytes remain outside the MCP result and are published only after a complete read.
+/// Streams remote bytes directly into the caller's reserved storage.
 pub(crate) async fn download(
     connection: &Connection,
     path: &RemotePath,
-) -> Result<Vec<u8>, FileError> {
+    sink: &dyn crate::transfer::DownloadSink,
+) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
     let sftp = binary_session(connection, path).await?;
     let result = async {
         let mut file = sftp
             .open(path.as_str())
             .await
             .map_err(|source| failed(path, &source))?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take((MAX_TRANSFER_BYTES as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|source| FileError::Failed {
-                path: path.as_str().to_owned(),
-                detail: source.to_string(),
-            })?;
-        if bytes.len() > MAX_TRANSFER_BYTES {
-            return Err(FileError::TooLarge {
-                size: bytes.len() as u64,
-                max: MAX_TRANSFER_BYTES as u64,
-            });
-        }
-        Ok(bytes)
+        sink.receive(&mut file).await
     }
     .await;
     let _ = sftp.close().await;
@@ -331,15 +314,9 @@ pub(crate) async fn download(
 pub(crate) async fn upload(
     connection: &Connection,
     path: &RemotePath,
-    bytes: &[u8],
+    input: &mut crate::transfer::PreparedUpload,
     overwrite: bool,
 ) -> Result<(), FileError> {
-    if bytes.len() > MAX_TRANSFER_BYTES {
-        return Err(FileError::TooLarge {
-            size: bytes.len() as u64,
-            max: MAX_TRANSFER_BYTES as u64,
-        });
-    }
     let sftp = binary_session(connection, path).await?;
     let result = async {
         let mode = if overwrite {
@@ -351,7 +328,7 @@ pub(crate) async fn upload(
             .open_with_flags(path.as_str(), OpenFlags::CREATE | OpenFlags::WRITE | mode)
             .await
             .map_err(|source| failed(path, &source))?;
-        file.write_all(bytes)
+        tokio::io::copy(input.reader(), &mut file)
             .await
             .map_err(|source| FileError::Failed {
                 path: path.as_str().to_owned(),
@@ -480,6 +457,7 @@ mod tests {
     use crate::registry::{CredentialRef, PinnedHostKey, Registry};
     use crate::secret::Secret;
     use crate::{HostId, RoleId};
+    use tokio::io::AsyncReadExt as _;
 
     /// A target that serves a real directory over the real protocol.
     ///
@@ -635,31 +613,34 @@ mod tests {
             len: u32,
         ) -> Result<Data, Self::Error> {
             let path = self.open.get(&handle).ok_or(StatusCode::Failure)?;
-            let bytes = std::fs::read(path).map_err(|_| StatusCode::Failure)?;
-            let start = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
-            if start >= bytes.len() {
+            use std::os::unix::fs::FileExt as _;
+            let file = std::fs::File::open(path).map_err(|_| StatusCode::Failure)?;
+            let mut bytes = vec![0; len as usize];
+            let count = file
+                .read_at(&mut bytes, offset)
+                .map_err(|_| StatusCode::Failure)?;
+            if count == 0 {
                 return Err(StatusCode::Eof);
             }
-            let end = start
-                .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
-                .min(bytes.len());
-            Ok(Data {
-                id,
-                data: bytes.get(start..end).unwrap_or_default().to_vec(),
-            })
+            bytes.truncate(count);
+            Ok(Data { id, data: bytes })
         }
 
         async fn write(
             &mut self,
             id: u32,
             handle: String,
-            _offset: u64,
+            offset: u64,
             data: Vec<u8>,
         ) -> Result<Status, Self::Error> {
             let path = self.open.get(&handle).ok_or(StatusCode::Failure)?;
-            let mut existing = std::fs::read(path).unwrap_or_default();
-            existing.extend_from_slice(&data);
-            std::fs::write(path, &existing).map_err(|_| StatusCode::Failure)?;
+            use std::os::unix::fs::FileExt as _;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|_| StatusCode::Failure)?;
+            file.write_all_at(&data, offset)
+                .map_err(|_| StatusCode::Failure)?;
             Ok(Status {
                 id,
                 status_code: StatusCode::Ok,
@@ -800,14 +781,26 @@ mod tests {
 
         struct Unavailable;
         impl DownloadSink for Unavailable {
-            fn publish(&self, _: Vec<u8>) -> Result<crate::action::FileIdentity, String> {
-                Err("private storage detail must not escape".to_owned())
+            fn receive<'a>(
+                &'a self,
+                reader: &'a mut (dyn AsyncRead + Unpin + Send),
+            ) -> crate::transfer::TransferFuture<'a> {
+                Box::pin(async move {
+                    let size = tokio::io::copy(&mut reader.take(9), &mut tokio::io::sink())
+                        .await
+                        .unwrap();
+                    Err(if size > 8 {
+                        Failure::TooLarge
+                    } else {
+                        Failure::PublicationUnavailable
+                    })
+                })
             }
         }
         let root = scratch();
         std::fs::write(root.join("present"), b"bytes").unwrap();
         let large = std::fs::File::create(root.join("large")).unwrap();
-        large.set_len(MAX_TRANSFER_BYTES as u64 + 1).unwrap();
+        large.set_len(9).unwrap();
         let connection = Arc::new(served(&root).await);
         let session = SessionStore::new(
             TestClock::at(1000),
@@ -878,23 +871,77 @@ mod tests {
         let root = scratch();
         let connection = served(&root).await;
         let remote = path("/binary");
-        let bytes = [0_u8, 255, 254, 128, 10].repeat(15000);
-        upload(&connection, &remote, &bytes, false).await.unwrap();
-        assert_eq!(download(&connection, &remote).await.unwrap(), bytes);
+        let bytes = [0_u8, 255, 254, 128, 10].repeat(3_500_000);
+        upload(
+            &connection,
+            &remote,
+            &mut crate::transfer::PreparedUpload::new(String::new(), bytes.clone()).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            download(&connection, &remote, &HashSink).await.unwrap(),
+            crate::transfer::identity(String::new(), &bytes)
+        );
         assert!(
-            upload(&connection, &remote, b"replacement", false)
-                .await
-                .is_err()
+            upload(
+                &connection,
+                &remote,
+                &mut crate::transfer::PreparedUpload::new(String::new(), b"replacement".to_vec())
+                    .unwrap(),
+                false
+            )
+            .await
+            .is_err()
         );
         assert_eq!(std::fs::read(root.join("binary")).unwrap(), bytes);
-        upload(&connection, &remote, b"replacement", true)
-            .await
-            .unwrap();
+        upload(
+            &connection,
+            &remote,
+            &mut crate::transfer::PreparedUpload::new(String::new(), b"replacement".to_vec())
+                .unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            download(&connection, &remote).await.unwrap(),
-            b"replacement"
+            download(&connection, &remote, &HashSink).await.unwrap(),
+            crate::transfer::identity(String::new(), b"replacement")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    struct HashSink;
+    impl crate::transfer::DownloadSink for HashSink {
+        fn receive<'a>(
+            &'a self,
+            reader: &'a mut (dyn AsyncRead + Unpin + Send),
+        ) -> crate::transfer::TransferFuture<'a> {
+            Box::pin(async move {
+                use sha2::{Digest as _, Sha256};
+                let mut digest = Sha256::new();
+                let mut size = 0_u64;
+                let mut buffer = [0; 65536];
+                loop {
+                    let count = reader.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    size = size.checked_add(count as u64).unwrap();
+                    digest.update(buffer.get(..count).unwrap());
+                }
+                Ok(crate::action::FileIdentity {
+                    uri: String::new(),
+                    bytes: size,
+                    sha256: digest
+                        .finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                })
+            })
+        }
     }
 
     fn path(raw: &str) -> RemotePath {

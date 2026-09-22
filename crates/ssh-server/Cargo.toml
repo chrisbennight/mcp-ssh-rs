@@ -15,6 +15,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 nix = { version = "0.31.3", features = ["fs"] }
 rmcp = { workspace = true }
 schemars = { workspace = true }
