@@ -70,7 +70,6 @@ def main():
     social += '<g transform="translate(75 125) scale(2.8)">' + mark("#23201b", "#b66a45") + '</g>'
     social += text("mcp-ssh-rs", 300, 260, 104, "#23201b")
     social += text("SSH commands and file transfers", 85, 380, 47, "#23201b")
-    social += text("for MCP clients. Optional human approval.", 85, 445, 34, "#1e5f46")
     svg("social-preview.svg", 1280, 640, social)
 
 
