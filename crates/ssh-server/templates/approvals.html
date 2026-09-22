@@ -3,91 +3,27 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review queue · MCP SSH</title>
-    <style>
-      :root { color-scheme: dark; --bg:#090d13; --panel:#101720; --raised:#151e29; --border:#293544; --soft:#202b38; --text:#edf3f8; --muted:#91a0af; --cyan:#66d9ef; --amber:#f3b861; }
-      * { box-sizing: border-box; }
-      body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; line-height:1.45; }
-      a { color:inherit; }
-      .shell { min-height:100vh; display:grid; grid-template-columns:15rem minmax(0,1fr); }
-      .sidebar { border-right:1px solid var(--soft); background:#0c1118; padding:1.5rem 1rem; display:flex; flex-direction:column; gap:1.5rem; }
-      .brand { display:flex; align-items:center; gap:.7rem; padding:0 .5rem; font-weight:750; letter-spacing:-.02em; }
-      .brand-mark { width:1.9rem; height:1.9rem; border:1px solid #3d5164; border-radius:.55rem; display:grid; place-items:center; color:var(--cyan); font-family:ui-monospace,monospace; }
-      nav { display:grid; gap:.3rem; }
-      .nav-item { border-radius:.55rem; color:var(--muted); padding:.65rem .75rem; text-decoration:none; }
-      .nav-item.active { background:#172432; color:var(--text); box-shadow:inset 2px 0 var(--cyan); }
-      .sidebar-foot { margin-top:auto; border-top:1px solid var(--soft); padding:1rem .5rem 0; color:var(--muted); font-size:.82rem; }
-      main { min-width:0; }
-      .topbar { min-height:4.5rem; border-bottom:1px solid var(--soft); display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:1rem clamp(1rem,3vw,2.5rem); }
-      .eyebrow { margin:0 0 .2rem; color:var(--cyan); font-size:.72rem; text-transform:uppercase; letter-spacing:.13em; font-weight:750; }
-      h1,h2,h3,p { margin-top:0; }
-      h1 { margin-bottom:0; font-size:clamp(1.45rem,3vw,2rem); letter-spacing:-.035em; }
-      .operator { color:var(--muted); font-size:.88rem; }
-      .operator strong { color:var(--text); }
-      .content { max-width:90rem; margin:0 auto; padding:clamp(1rem,3vw,2.5rem); }
-      .summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.8rem; margin-bottom:1.5rem; }
-      .metric { border:1px solid var(--soft); background:var(--panel); border-radius:.7rem; padding:1rem; }
-      .metric span { color:var(--muted); display:block; font-size:.78rem; text-transform:uppercase; letter-spacing:.08em; }
-      .metric strong { display:block; font-size:1.65rem; margin-top:.2rem; }
-      .section-head { display:flex; justify-content:space-between; gap:1rem; align-items:end; margin:1.5rem 0 .8rem; }
-      .section-head h2 { font-size:1.05rem; margin:0; }
-      .section-head p { color:var(--muted); margin:0; font-size:.86rem; }
-      .empty { border:1px dashed var(--border); border-radius:.8rem; padding:3rem 1rem; text-align:center; color:var(--muted); background:var(--panel); }
-      article { border:1px solid var(--border); border-radius:.8rem; background:var(--panel); margin:0 0 1rem; overflow:hidden; scroll-margin-top:1rem; }
-      article:target { border-color:var(--cyan); box-shadow:0 0 0 2px rgb(102 217 239 / 12%); }
-      .request-head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; padding:1.05rem 1.15rem; border-bottom:1px solid var(--soft); background:var(--raised); }
-      .request-head > div { min-width:0; }
-      .request-head h3 { margin:0 0 .3rem; font-size:1rem; overflow-wrap:anywhere; }
-      .identifier { color:var(--muted); font:.75rem ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; }
-      .risk { border:1px solid #72562e; border-radius:999px; color:var(--amber); padding:.22rem .55rem; font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; font-weight:750; white-space:nowrap; }
-      .request-grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(17rem,.75fr); }
-      .request-main,.request-context { padding:1.15rem; min-width:0; }
-      .request-context { border-left:1px solid var(--soft); background:rgb(255 255 255 / 1%); }
-      dl { margin:0; display:grid; grid-template-columns:8rem minmax(0,1fr); column-gap:.8rem; }
-      dt { color:var(--muted); font-size:.78rem; padding:.34rem 0; }
-      dd { margin:0; padding:.34rem 0; overflow-wrap:anywhere; }
-      .argv-label { margin:0 0 .45rem; color:var(--muted); font-size:.75rem; text-transform:uppercase; letter-spacing:.08em; }
-      .argv { background:#080c12; border:1px solid var(--soft); border-radius:.55rem; margin:0; padding:.8rem .8rem .8rem 3rem; overflow-x:auto; font:.82rem/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
-      .argv li { white-space:pre-wrap; padding-left:.35rem; }
-      .argv li::marker { color:#607184; }
-      .match-preview { margin:.75rem 0 0; border:1px solid #315267; border-radius:.5rem; background:rgb(102 217 239 / 5%); color:#b9dbe4; padding:.65rem .8rem; font-size:.82rem; }
-      .reason { margin:.9rem 0 0; border-left:2px solid var(--amber); background:rgb(243 184 97 / 6%); color:#d8c5a7; padding:.65rem .8rem; font-size:.86rem; }
-      form.actions { display:flex; flex-wrap:wrap; align-items:center; gap:.55rem; border-top:1px solid var(--soft); padding:.9rem 1.15rem; }
-      button,select { font:inherit; }
-      button { border:1px solid #3a4a5c; border-radius:.48rem; background:#1a2633; color:var(--text); cursor:pointer; padding:.5rem .85rem; font-weight:650; }
-      button:hover { border-color:#61778d; }
-      .approve { background:#123328; border-color:#276249; color:#9be7bd; }
-      .refuse { background:transparent; border-color:#6b3d43; color:#ff9b9b; }
-      .session { margin-left:auto; }
-      .duration { color:var(--muted); font-size:.82rem; display:flex; gap:.45rem; align-items:center; }
-      select { background:#0b121a; border:1px solid #3a4a5c; border-radius:.42rem; color:var(--text); padding:.42rem; }
-      .agreements { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(20rem,100%),1fr)); gap:.8rem; }
-      .agreement { padding:1rem; margin:0; }
-      .agreement p { color:var(--muted); margin-bottom:.75rem; }
-      .agreement strong,.agreement code { color:var(--text); }
-      .agreement code { overflow-wrap:anywhere; }
-      @media (max-width:850px) { .shell{grid-template-columns:1fr}.sidebar{border-right:0;border-bottom:1px solid var(--soft);padding:.8rem 1rem;gap:.8rem}nav{display:flex;overflow-x:auto}.sidebar-foot{display:none}.request-grid{grid-template-columns:1fr}.request-context{border-left:0;border-top:1px solid var(--soft)} }
-      @media (max-width:560px) { .summary{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}dl{grid-template-columns:1fr}dt{padding-bottom:0}.session{margin-left:0}form.actions{align-items:stretch}form.actions button{flex:1 1 auto}.duration{flex:1 0 100%} }
-    </style>
+    <title>Review queue · mcp-ssh-rs</title>
+    {% include "styles.html" %}
   </head>
-  <body>
+  <body><a class="skip-link" href="#main-content">Skip to content</a>
     <div class="shell">
       <aside class="sidebar">
-        <div class="brand"><span class="brand-mark">&gt;_</span> MCP SSH</div>
-        <nav aria-label="Dashboard"><a class="nav-item active" href="{{ action }}" aria-current="page">Review queue</a><a class="nav-item" href="/dashboard/inventory">Inventory</a><a class="nav-item" href="/dashboard/sessions">Sessions</a><a class="nav-item" href="/dashboard/audit">Audit log</a><a class="nav-item" href="/dashboard/evaluations">Evaluations</a></nav>
+        {% include "brand.html" %}
+        <nav aria-label="Dashboard"><a class="nav-item active" href="{{ action }}" aria-current="page"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#review"/></svg>Review queue</a><a class="nav-item" href="/dashboard/inventory"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#hosts"/></svg>Inventory</a><a class="nav-item" href="/dashboard/sessions"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#sessions"/></svg>Sessions</a><a class="nav-item" href="/dashboard/audit"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#history"/></svg>Audit log</a><a class="nav-item" href="/dashboard/evaluations"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#review"/></svg>Evaluations</a></nav>
         <div class="sidebar-foot">Human review surface<br>Decisions are recorded before execution.</div>
       </aside>
-      <main>
+      <main id="main-content" tabindex="-1">
         <header class="topbar"><div><p class="eyebrow">Operations</p><h1>Review queue</h1></div><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header>
         <div class="content">
-          <section class="summary" aria-label="Queue summary"><div class="metric"><span>Waiting</span><strong>{{ waiting.len() }}</strong></div><div class="metric"><span>Standing grants</span><strong>{{ standing.len() }}</strong></div><div class="metric"><span>Decision mode</span><strong>Human</strong></div></section>
-          <div class="section-head"><h2>Commands requiring a decision</h2><p>Review exact arguments and execution context together.</p></div>
+          <section class="summary" aria-label="Queue summary"><div class="metric"><span>Waiting</span><strong>{{ waiting.len() }}</strong></div><div class="metric"><span>Standing agreements</span><strong>{{ standing.len() }}</strong></div><div class="metric"><span>Decision mode</span><strong>Human</strong></div></section>
+          <div class="section-head"><h2>Requests requiring a decision</h2><p>Review the operation and its context before deciding.</p></div>
           {% if waiting.is_empty() %}<div class="empty"><strong>Nothing is waiting.</strong><br>The queue will update on the next page load.</div>{% else %}
             {% for request in waiting %}
               <!-- The article id is service-minted hex. Notification fragment links land on this card. -->
               <article id="{{ request.id }}">
                 <div class="request-head"><div><h3>{{ request.principal }} on {{ request.host }}</h3><div class="identifier">request {{ request.id }}</div></div><span class="risk">{{ request.access_class }}</span></div>
-                <div class="request-grid"><div class="request-main"><div class="argv-label">Exact argument vector</div>
+                <div class="request-grid"><div class="request-main"><div class="argv-label">{{ request.operation }} · Exact arguments</div>
                   <!-- One list item per argument preserves the boundary even when an argument contains whitespace. -->
                   <ol class="argv">{% for argument in request.command %}<li>{{ argument }}</li>{% endfor %}</ol><p class="reason"><strong>Why it waits:</strong> {{ request.why }}</p></div>
                   <div class="request-context"><dl><dt>Session purpose</dt><dd>{{ request.purpose }}</dd><dt>Agent intent</dt><dd><strong>Agent-supplied:</strong> {{ request.agent_intent }}</dd><dt>Host</dt><dd>{{ request.host }}</dd><dt>Role</dt><dd>{{ request.role }}</dd><dt>Operation</dt><dd>{{ request.operation }}</dd><dt>Account class</dt><dd>{{ request.access_class }}</dd><dt>Session</dt><dd class="identifier">{{ request.session }}</dd></dl></div></div>

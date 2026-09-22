@@ -101,6 +101,9 @@ after decisions as to the main queue.
 
 ## Assets and reproduction
 
+Use the [visual verification workflow](verification.md) to check application
+changes, populated history fixtures, and public presentation together.
+
 Run `python docs/branding/export.py` with Python 3.10+ and FontTools 4.65.0
 installed in an isolated development environment. The exporter reads the
 checked-in mark and font, and writes outlined SVGs with no external font

@@ -18,7 +18,9 @@ MCP (Model Context Protocol) lets an AI client use these operations as tools.
 **[Contribute](CONTRIBUTING.md)** · **[Get help](SUPPORT.md)**
 
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/images/approval-mobile-dark.png">
   <source media="(max-width: 600px)" srcset="docs/images/approval-mobile.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/approval-dark.png">
   <img src="docs/images/approval.png" alt="A pending command to create a tutorial file on the demo host. The review queue shows its arguments, purpose, target account, and Approve once and Refuse controls.">
 </picture>
 

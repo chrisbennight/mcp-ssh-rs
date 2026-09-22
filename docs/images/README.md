@@ -17,14 +17,21 @@ To recreate it:
    set a 390-pixel viewport and capture the pending request's `article` element
    in full. The README selects that closer view on narrow screens. Keep the
    actual UI and sample text; do not draw extra controls or fabricate history.
+   Repeat in dark system appearance for `approval-dark.png` and
+   `approval-mobile-dark.png`. Clear incidental keyboard focus before capturing;
+   verify focus separately during the interaction checks.
 5. Review the image at README width and a narrow viewport. Keep the README's
    caption, descriptive alternative text, and full-size link aligned with it.
 6. Approve once, collect the result, and stop the demo as the tutorial describes.
 
-The initial image was captured from the rendered tutorial response with
+The current images were captured from the running tutorial with
 Chromium, without changing the HTML or CSS. The local setup used Linux x86_64,
 Docker 29.7.2, Compose 5.4.0, and Python 3.11.2. The request, approval,
-successful collection, and teardown were checked on 21 September 2026.
+successful collection, and teardown were checked on 22 September 2026.
+
+Use the [visual verification workflow](../branding/verification.md) for the
+other application views, keyboard checks, and enlarged text. Synthetic history
+fixtures are review aids and must not replace the real demo screenshots.
 
 The README's small JSON result is a labeled excerpt from successful collection,
 not a second dashboard view. Optional durable history is not configured in the
