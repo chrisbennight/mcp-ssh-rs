@@ -122,6 +122,8 @@ struct Item {
     upload: bool,
     active: Option<Arc<DiskFile>>,
     ticket: Option<Ticket>,
+    cleaning: bool,
+    abandoned: bool,
 }
 
 /// Every reserved item is charged at the full byte ceiling, including in-flight uploads and downloads.
@@ -129,7 +131,7 @@ pub struct Transfers {
     clock: Arc<dyn Clock>,
     origin: String,
     local: Option<crate::local_files::LocalFiles>,
-    items: Mutex<HashMap<String, Item>>,
+    items: Arc<Mutex<HashMap<String, Item>>>,
     settings: TransferSettings,
     staging: Arc<std::fs::File>,
 }
@@ -179,7 +181,7 @@ impl Transfers {
             clock,
             origin: url.as_str().trim_end_matches('/').to_owned(),
             local: None,
-            items: Mutex::new(HashMap::new()),
+            items: Arc::new(Mutex::new(HashMap::new())),
             staging,
             settings,
         })
@@ -202,7 +204,7 @@ impl Transfers {
             clock,
             origin: String::new(),
             local: Some(local),
-            items: Mutex::new(HashMap::new()),
+            items: Arc::new(Mutex::new(HashMap::new())),
             staging,
             settings,
         })
@@ -211,7 +213,7 @@ impl Transfers {
         self.local.is_some()
     }
 
-    fn reserve(
+    async fn reserve(
         &self,
         owner: &PrincipalId,
         params: UploadParams,
@@ -238,9 +240,9 @@ impl Transfers {
         {
             return Err(TransferError::Integrity);
         }
+        self.sweep().await;
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         let now = self.clock.now();
-        items.retain(|_, item| retained(item, now));
         if items.len() >= MAX_ITEMS
             || items.values().filter(|item| item.owner == *owner).count() >= OWNER_ITEMS
         {
@@ -251,6 +253,8 @@ impl Transfers {
             id.clone(),
             Item {
                 local_file: None,
+                cleaning: false,
+                abandoned: false,
                 owner: owner.clone(),
                 created: now,
                 upload,
@@ -272,7 +276,7 @@ impl Transfers {
         Ok(id)
     }
 
-    pub fn authorize_upload(
+    pub async fn authorize_upload(
         &self,
         owner: &PrincipalId,
         params: UploadParams,
@@ -280,7 +284,7 @@ impl Transfers {
         if self.local.is_some() {
             return Err(TransferError::Unknown);
         }
-        let id = self.reserve(owner, params, true)?;
+        let id = self.reserve(owner, params, true).await?;
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         let item = items.get_mut(&id).ok_or(TransferError::Unknown)?;
         let upload = self.issue(item, "PUT");
@@ -331,7 +335,11 @@ impl Transfers {
     ) -> Result<&'a mut Item, TransferError> {
         let id = uri.strip_prefix(URI_PREFIX).ok_or(TransferError::Unknown)?;
         let item = items.get_mut(id).ok_or(TransferError::Unknown)?;
-        if item.owner != *owner || self.clock.now().saturating_sub(item.created) >= TTL {
+        if item.cleaning
+            || item.abandoned
+            || item.owner != *owner
+            || self.clock.now().saturating_sub(item.created) >= TTL
+        {
             return Err(TransferError::Unknown);
         }
         Ok(item)
@@ -343,9 +351,15 @@ impl Transfers {
         uri: &str,
     ) -> Result<ssh_core::transfer::PreparedUpload, TransferError> {
         if let Some(local) = &self.local {
+            let source = self.local_source(uri)?;
             return tokio::time::timeout(
                 self.settings.timeout,
-                local.read(uri, Arc::clone(&self.staging), self.settings.max_bytes),
+                local.read_pinned(
+                    uri,
+                    Arc::clone(&self.staging),
+                    self.settings.max_bytes,
+                    source,
+                ),
             )
             .await
             .map_err(|_| TransferError::Storage)?
@@ -362,19 +376,21 @@ impl Transfers {
         ))
     }
 
-    pub fn destination(
+    pub async fn destination(
         self: &Arc<Self>,
         owner: &PrincipalId,
         name: Option<String>,
     ) -> Result<Arc<dyn DownloadSink>, TransferError> {
-        let id = self.reserve(
-            owner,
-            UploadParams {
-                name,
-                ..UploadParams::default()
-            },
-            false,
-        )?;
+        let id = self
+            .reserve(
+                owner,
+                UploadParams {
+                    name,
+                    ..UploadParams::default()
+                },
+                false,
+            )
+            .await?;
         Ok(Arc::new(Destination {
             store: Arc::clone(self),
             id,
@@ -454,7 +470,9 @@ impl Transfers {
             .find(|(_, item)| item.ticket.as_ref().is_some_and(|ticket| ticket.id == id))
             .ok_or(TransferError::Unknown)?;
         let ticket = item.ticket.as_ref().ok_or(TransferError::Unknown)?;
-        if self.clock.now().saturating_sub(item.created) >= TTL
+        if item.cleaning
+            || item.abandoned
+            || self.clock.now().saturating_sub(item.created) >= TTL
             || !bool::from(hash(credential.as_bytes()).ct_eq(&ticket.credential))
         {
             return Err(TransferError::Unknown);
@@ -474,6 +492,21 @@ impl Transfers {
         })
     }
 
+    fn local_source(&self, uri: &str) -> Result<Option<Arc<Snapshot>>, TransferError> {
+        let Some(id) = self.local.as_ref().and_then(|local| local.output_id(uri)) else {
+            return Ok(None);
+        };
+        let items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+        let item = items.get(&id).ok_or(TransferError::Unknown)?;
+        if item.cleaning || self.clock.now().saturating_sub(item.created) >= TTL {
+            return Err(TransferError::Unknown);
+        }
+        match &item.content {
+            Content::Ready(snapshot) => Ok(Some(Arc::clone(snapshot))),
+            _ => Err(TransferError::Unknown),
+        }
+    }
+
     fn abandon(&self, id: &str) {
         let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(item) = items.get_mut(id) {
@@ -481,50 +514,76 @@ impl Transfers {
                 return;
             }
             item.content = Content::Pending;
-            item.created = 0;
-            if item
-                .active
-                .as_ref()
-                .is_none_or(|disk| Arc::strong_count(disk) == 1 && disk.remove().is_ok())
-            {
+            item.abandoned = true;
+            // Empty reservations have no filesystem work to defer.
+            if item.active.is_none() && !item.cleaning {
                 items.remove(id);
             }
         }
     }
 
-    pub fn sweep(&self) {
+    pub async fn sweep(&self) {
         let now = self.clock.now();
-        self.items
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .retain(|_, item| retained(item, now));
+        let pending = {
+            let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
+            items
+                .iter_mut()
+                .filter_map(|(id, item)| {
+                    if item.cleaning || retained(item, now) {
+                        return None;
+                    }
+                    item.cleaning = true;
+                    Some((
+                        id.clone(),
+                        item.active.take(),
+                        item.local_file.take(),
+                        std::mem::replace(&mut item.content, Content::Pending),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let items = Arc::clone(&self.items);
+        // This worker owns cleanup and reconciliation even if its awaiting caller is cancelled.
+        let cleanup = tokio::task::spawn_blocking(move || {
+            for (id, disk, file, content) in pending {
+                let removed = disk.as_ref().map_or(Ok(()), |disk| disk.remove())
+                    .and_then(|()| file.as_ref().map_or(Ok(()), |file| file.remove()));
+                match removed {
+                    Ok(()) => {
+                        // Close the last handles before releasing the reservation, outside the mutex.
+                        drop((disk, file, content));
+                        items.lock().unwrap_or_else(|error| error.into_inner()).remove(&id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not remove expired file; retaining its reservation");
+                        let mut items = items.lock().unwrap_or_else(|error| error.into_inner());
+                        if let Some(item) = items.get_mut(&id) {
+                            item.active = disk;
+                            item.local_file = file;
+                            item.content = content;
+                            item.cleaning = false;
+                        }
+                    }
+                }
+            }
+        }).await;
+        if let Err(error) = cleanup {
+            tracing::error!(%error, "file cleanup worker failed");
+        }
     }
 }
 
-fn retained(item: &mut Item, now: u64) -> bool {
-    let in_use = now.saturating_sub(item.created) < TTL
+fn retained(item: &Item, now: u64) -> bool {
+    (!item.abandoned && now.saturating_sub(item.created) < TTL)
         || matches!(item.content, Content::Receiving)
         || item
             .active
             .as_ref()
             .is_some_and(|disk| Arc::strong_count(disk) > 1)
-        || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1 || Arc::strong_count(&bytes.disk) > 1);
-    if in_use {
-        return true;
-    }
-    if let Some(disk) = &item.active
-        && let Err(error) = disk.remove()
-    {
-        tracing::warn!(%error, "could not remove staging file; retaining its reservation");
-        return true;
-    }
-    if let Some(file) = &item.local_file
-        && let Err(error) = file.remove()
-    {
-        tracing::warn!(%error, "could not remove expired local output; retaining its reservation");
-        return true;
-    }
-    false
+        || matches!(&item.content, Content::Ready(bytes) if Arc::strong_count(bytes) > 1 || Arc::strong_count(&bytes.disk) > 1)
 }
 
 struct Destination {
@@ -546,7 +605,9 @@ impl DownloadSink for Destination {
                 let item = items
                     .get_mut(&self.id)
                     .ok_or(Failure::PublicationUnavailable)?;
-                if !matches!(item.content, Content::Pending)
+                if item.cleaning
+                    || item.abandoned
+                    || !matches!(item.content, Content::Pending)
                     || item.upload
                     || self.store.clock.now().saturating_sub(item.created) >= TTL
                 {
@@ -625,9 +686,12 @@ async fn upload(
     let Ok(Ticketed { id, .. }) = store.take_ticket(&id, credential, true) else {
         return StatusCode::NOT_FOUND;
     };
-    let receiving = Receiving { store, id };
+    let receiving = Receiving {
+        store: Arc::clone(&store),
+        id,
+    };
     let mut reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-    match tokio::time::timeout(
+    let status = match tokio::time::timeout(
         receiving.store.settings.timeout,
         receiving.store.receive(&receiving.id, &mut reader),
     )
@@ -635,7 +699,10 @@ async fn upload(
     {
         Ok(Ok(_)) => StatusCode::NO_CONTENT,
         _ => StatusCode::BAD_REQUEST,
-    }
+    };
+    drop(receiving);
+    store.sweep().await;
+    status
 }
 
 fn token() -> String {
@@ -683,6 +750,7 @@ mod tests {
                     ..UploadParams::default()
                 },
             )
+            .await
             .unwrap();
         let source =
             ReaderStream::with_capacity(tokio::io::repeat(173).take(size), crate::disk::CHUNK);
@@ -754,6 +822,7 @@ mod tests {
         ] {
             let upload = store
                 .authorize_upload(&caller, UploadParams::default())
+                .await
                 .unwrap();
             let response = routes(Arc::clone(&store))
                 .oneshot(request(&upload.upload, Body::from(bytes)))
@@ -764,6 +833,7 @@ mod tests {
         assert_eq!(store.items.lock().unwrap().len(), 1);
         let upload = store
             .authorize_upload(&caller, UploadParams::default())
+            .await
             .unwrap();
         let failed = futures_util::stream::iter([Err::<axum::body::Bytes, _>(
             std::io::Error::other("disconnected"),
@@ -791,6 +861,7 @@ mod tests {
         );
         let upload = store
             .authorize_upload(&owner("caller"), UploadParams::default())
+            .await
             .unwrap();
         let stalled = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
         let response = routes(Arc::clone(&store))
@@ -798,7 +869,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        store.sweep();
+        store.sweep().await;
         assert!(store.items.lock().unwrap().is_empty());
     }
 
@@ -819,6 +890,7 @@ mod tests {
                     ..UploadParams::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(upload.upload.transport, "http");
         assert!(store.input(&caller, &upload.file.uri).await.is_err());
@@ -894,6 +966,7 @@ mod tests {
                     ..UploadParams::default()
                 },
             )
+            .await
             .unwrap();
         let response = routes(Arc::clone(&store))
             .oneshot(request(&upload.upload, Body::from("bad")))
@@ -916,6 +989,7 @@ mod tests {
                     ..UploadParams::default()
                 },
             )
+            .await
             .unwrap();
         assert_eq!(
             routes(Arc::clone(&store))
@@ -928,15 +1002,16 @@ mod tests {
         assert!(store.input(&caller, &upload.file.uri).await.is_err());
     }
 
-    #[test]
-    fn pending_transfers_reserve_capacity_and_cancelled_downloads_release_it() {
+    #[tokio::test]
+    async fn pending_transfers_reserve_capacity_and_cancelled_downloads_release_it() {
         let store = plane();
         let caller = owner("caller");
-        let sinks: Vec<_> = (0..OWNER_ITEMS)
-            .map(|_| store.destination(&caller, None).unwrap())
-            .collect();
+        let mut sinks = Vec::new();
+        for _ in 0..OWNER_ITEMS {
+            sinks.push(store.destination(&caller, None).await.unwrap());
+        }
         assert!(matches!(
-            store.destination(&caller, None),
+            store.destination(&caller, None).await,
             Err(TransferError::Capacity)
         ));
         drop(sinks);
@@ -946,11 +1021,14 @@ mod tests {
             for _ in 0..OWNER_ITEMS {
                 store
                     .authorize_upload(&caller, UploadParams::default())
+                    .await
                     .unwrap();
             }
         }
         assert!(matches!(
-            store.authorize_upload(&owner("another"), UploadParams::default()),
+            store
+                .authorize_upload(&owner("another"), UploadParams::default())
+                .await,
             Err(TransferError::Capacity)
         ));
     }
@@ -962,6 +1040,7 @@ mod tests {
         let caller = owner("caller");
         let upload = store
             .authorize_upload(&caller, UploadParams::default())
+            .await
             .unwrap();
         clock.advance(TTL.saturating_sub(1));
         let id = url::Url::parse(&upload.upload.url)
@@ -979,15 +1058,18 @@ mod tests {
             id: ticketed.id,
         };
         clock.advance(1);
-        store.sweep();
+        store.sweep().await;
         assert_eq!(store.items.lock().unwrap().len(), 1);
         for _ in 1..OWNER_ITEMS {
             store
                 .authorize_upload(&caller, UploadParams::default())
+                .await
                 .unwrap();
         }
         assert!(matches!(
-            store.authorize_upload(&caller, UploadParams::default()),
+            store
+                .authorize_upload(&caller, UploadParams::default())
+                .await,
             Err(TransferError::Capacity)
         ));
         store
@@ -999,13 +1081,56 @@ mod tests {
             "completion starts a fresh delivery window"
         );
         clock.advance(TTL);
-        store.sweep();
+        store.sweep().await;
         drop(receiving);
         assert!(
             store
                 .authorize_upload(&caller, UploadParams::default())
+                .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn local_output_copy_retains_its_reservation_until_the_source_is_released() {
+        let root = std::env::temp_dir().join(format!("ssh-output-pin-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let clock = Arc::new(TestClock::at(1000));
+        let store = Arc::new(Transfers::local(clock.clone(), &root).unwrap());
+        let caller = owner("local");
+        let sink = store.destination(&caller, None).await.unwrap();
+        let file = sink
+            .receive(&mut std::io::Cursor::new(b"local output"))
+            .await
+            .unwrap();
+        let source = store.local_source(&file.uri).unwrap().unwrap();
+        clock.advance(TTL);
+        store.sweep().await;
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        let copied = store
+            .local
+            .as_ref()
+            .unwrap()
+            .read_pinned(
+                &file.uri,
+                Arc::clone(&store.staging),
+                store.settings.max_bytes,
+                Some(source),
+            )
+            .await
+            .unwrap();
+        store.sweep().await;
+        assert!(store.items.lock().unwrap().is_empty());
+        assert_eq!(copied.identity().bytes, 12);
+        assert!(
+            !url::Url::parse(&file.uri)
+                .unwrap()
+                .to_file_path()
+                .unwrap()
+                .exists()
+        );
+        drop((copied, sink, store));
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
@@ -1013,18 +1138,18 @@ mod tests {
         let clock = Arc::new(TestClock::at(1000));
         let store = Arc::new(Transfers::new(clock.clone(), "https://ssh.example").unwrap());
         let caller = owner("caller");
-        let sink = store.destination(&caller, None).unwrap();
+        let sink = store.destination(&caller, None).await.unwrap();
         let file = sink
             .receive(&mut std::io::Cursor::new(vec![1, 2, 3]))
             .await
             .unwrap();
         let input = store.input(&caller, &file.uri).await.unwrap();
         clock.advance(TTL);
-        store.sweep();
+        store.sweep().await;
         assert_eq!(store.items.lock().unwrap().len(), 1);
         assert!(store.input(&caller, &file.uri).await.is_err());
         drop(input);
-        store.sweep();
+        store.sweep().await;
         assert!(store.items.lock().unwrap().is_empty());
     }
 }

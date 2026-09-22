@@ -601,7 +601,10 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
             let store = files.ok_or_else(|| {
                 McpError::invalid_request("file transfer is not configured", None)
             })?;
-            let sink = store.destination(principal, None).map_err(bad_request)?;
+            let sink = store
+                .destination(principal, None)
+                .await
+                .map_err(bad_request)?;
             match bastion
                 .download_intended(principal, &session, intent, path, sink)
                 .await
@@ -867,7 +870,7 @@ async fn stream_with_files(
                 .to_owned(),
         };
     };
-    let published = match store.destination(principal, None) {
+    let published = match store.destination(principal, None).await {
         Ok(sink) => sink
             .receive(&mut std::io::Cursor::new(bytes))
             .await

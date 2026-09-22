@@ -372,7 +372,7 @@ pub async fn serve(
                 tokio::time::sleep(RECLAIM_EVERY).await;
                 bastion.reclaim().await;
                 if let Some(transfers) = &transfers {
-                    transfers.sweep();
+                    transfers.sweep().await;
                 }
             }
         }

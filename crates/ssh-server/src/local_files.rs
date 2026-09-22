@@ -66,18 +66,43 @@ impl LocalFiles {
             .map_err(|()| std::io::Error::other("output path cannot be represented as a file URI"))
     }
 
+    #[cfg(test)]
     pub async fn read(
         &self,
         uri: &str,
         staging: Arc<File>,
         limit: u64,
     ) -> std::io::Result<PreparedUpload> {
+        self.read_pinned(uri, staging, limit, None).await
+    }
+
+    pub fn output_id(&self, uri: &str) -> Option<String> {
+        let uri = url::Url::parse(uri).ok()?;
+        if uri.query().is_some() || uri.fragment().is_some() {
+            return None;
+        }
+        let path = uri.to_file_path().ok()?;
+        let relative = path.strip_prefix(&self.output.path).ok()?;
+        let name = relative.to_str()?;
+        validate_name(name).ok()?;
+        Some(name.to_owned())
+    }
+
+    pub async fn read_pinned(
+        &self,
+        uri: &str,
+        staging: Arc<File>,
+        limit: u64,
+        source: Option<Arc<crate::disk::Snapshot>>,
+    ) -> std::io::Result<PreparedUpload> {
         let permit = Arc::clone(&self.active)
             .try_acquire_owned()
             .map_err(|_| std::io::Error::other("local input capacity is exhausted"))?;
-        let source = self.open_input(uri)?;
+        let mut source: ssh_core::transfer::Reader = match source {
+            Some(snapshot) => snapshot.reader(),
+            None => Box::new(tokio::fs::File::from_std(self.open_input(uri)?)),
+        };
         let disk = crate::disk::allocate(staging, Some(permit), false).await?;
-        let mut source = tokio::fs::File::from_std(source);
         let snapshot = crate::disk::receive(disk, &mut source, limit)
             .await
             .map_err(|error| std::io::Error::other(error.message()))?;

@@ -103,7 +103,10 @@ Unstarted authorizations expire after five minutes. Once a transfer starts,
 `MCP_SSH_TRANSFER_TIMEOUT_SECONDS` bounds HTTP upload, local input snapshot, and
 SFTP operation duration. It defaults to 1800 seconds and accepts positive integers
 up to 86400. Completed references receive a fresh five-minute delivery window.
-Expired storage held by an active consumer remains charged until release. Operators
+Expired storage held by an active service consumer remains charged until release.
+This includes local outputs being copied into new input snapshots. The trusted
+stdio launcher controls the shared filesystem; files or descriptors it retains
+independently are outside the service’s storage accounting. Operators
 must also bound HTTP connection lifetime at their TLS proxy, including slow GET
 consumers. Choose the operation timeout and proxy limits for the expected file
 sizes and link speeds.
