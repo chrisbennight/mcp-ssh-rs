@@ -68,7 +68,7 @@ impl LocalFiles {
 
     #[cfg(test)]
     pub async fn read(
-        &self,
+        self: &Arc<Self>,
         uri: &str,
         staging: Arc<File>,
         limit: u64,
@@ -89,7 +89,7 @@ impl LocalFiles {
     }
 
     pub async fn read_pinned(
-        &self,
+        self: &Arc<Self>,
         uri: &str,
         staging: Arc<File>,
         limit: u64,
@@ -98,9 +98,19 @@ impl LocalFiles {
         let permit = Arc::clone(&self.active)
             .try_acquire_owned()
             .map_err(|_| std::io::Error::other("local input capacity is exhausted"))?;
-        let mut source: ssh_core::transfer::Reader = match source {
-            Some(snapshot) => snapshot.reader(),
-            None => Box::new(tokio::fs::File::from_std(self.open_input(uri)?)),
+        let (mut source, permit): (ssh_core::transfer::Reader, _) = match source {
+            Some(snapshot) => (snapshot.reader(), permit),
+            None => {
+                let local = Arc::clone(self);
+                let uri = uri.to_owned();
+                let (file, permit) = tokio::task::spawn_blocking(move || {
+                    // Keep admission charged if cancellation leaves this open in progress.
+                    local.open_input(&uri).map(|file| (file, permit))
+                })
+                .await
+                .map_err(std::io::Error::other)??;
+                (Box::new(tokio::fs::File::from_std(file)), permit)
+            }
         };
         let disk = crate::disk::allocate(staging, Some(permit), false).await?;
         let snapshot = crate::disk::receive(disk, &mut source, limit)
@@ -236,7 +246,7 @@ mod tests {
         let input = std::fs::File::create(root.0.join("large")).unwrap();
         let size = 17 * 1024 * 1024;
         input.set_len(size).unwrap();
-        let local = LocalFiles::new(&root.0).unwrap();
+        let local = Arc::new(LocalFiles::new(&root.0).unwrap());
         let upload = local
             .read(&root.uri("large"), local.staging().unwrap(), size)
             .await
@@ -289,7 +299,7 @@ mod tests {
         std::fs::write(outside.0.join("secret"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.0.join("secret"), root.0.join("link")).unwrap();
         std::os::unix::fs::symlink(&outside.0, root.0.join("directory-link")).unwrap();
-        let local = LocalFiles::new(&root.0).unwrap();
+        let local = Arc::new(LocalFiles::new(&root.0).unwrap());
         let original = local
             .read(
                 &root.uri("input"),
@@ -334,7 +344,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = Scratch::new();
         std::fs::write(root.0.join("input"), b"user input").unwrap();
-        let local = LocalFiles::new(&root.0).unwrap();
+        let local = Arc::new(LocalFiles::new(&root.0).unwrap());
         let bytes = [0, 255, 254, 10];
         let snapshot = crate::disk::receive(
             crate::disk::allocate(crate::disk::directory(&root.0).unwrap(), None, true)

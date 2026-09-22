@@ -130,7 +130,7 @@ struct Item {
 pub struct Transfers {
     clock: Arc<dyn Clock>,
     origin: String,
-    local: Option<crate::local_files::LocalFiles>,
+    local: Option<Arc<crate::local_files::LocalFiles>>,
     items: Arc<Mutex<HashMap<String, Item>>>,
     settings: TransferSettings,
     staging: Arc<std::fs::File>,
@@ -203,7 +203,7 @@ impl Transfers {
         Ok(Self {
             clock,
             origin: String::new(),
-            local: Some(local),
+            local: Some(Arc::new(local)),
             items: Arc::new(Mutex::new(HashMap::new())),
             staging,
             settings,
@@ -434,28 +434,37 @@ impl Transfers {
                 return Err(Failure::PublicationUnavailable);
             }
         }
-        let local_file = match &self.local {
-            Some(local) => Some(
-                local
-                    .publish(id, &snapshot)
-                    .map_err(|_| Failure::PublicationUnavailable)?,
-            ),
-            None => None,
-        };
-        let mut items = self.items.lock().unwrap_or_else(|error| error.into_inner());
-        let item = items.get_mut(id).ok_or(Failure::PublicationUnavailable)?;
-        if !matches!(item.content, Content::Receiving) {
-            return Err(Failure::PublicationUnavailable);
-        }
-        let identity = snapshot.identity(item.reference.uri.clone());
-        item.reference.size = Some(snapshot.size);
-        item.reference.digest = Some(digest);
-        item.local_file = local_file;
-        item.content = Content::Ready(snapshot);
-        item.active = None;
-        // Completed content gets the full delivery window, independently of transfer duration.
-        item.created = self.clock.now();
-        Ok(identity)
+        let local = self.local.clone();
+        let items = Arc::clone(&self.items);
+        let clock = Arc::clone(&self.clock);
+        let id = id.to_owned();
+        // Publication and its state transition finish together, even if the caller is cancelled.
+        tokio::task::spawn_blocking(move || {
+            let local_file = match local {
+                Some(local) => Some(
+                    local
+                        .publish(&id, &snapshot)
+                        .map_err(|_| Failure::PublicationUnavailable)?,
+                ),
+                None => None,
+            };
+            let mut items = items.lock().unwrap_or_else(|error| error.into_inner());
+            let item = items.get_mut(&id).ok_or(Failure::PublicationUnavailable)?;
+            if !matches!(item.content, Content::Receiving) {
+                return Err(Failure::PublicationUnavailable);
+            }
+            let identity = snapshot.identity(item.reference.uri.clone());
+            item.reference.size = Some(snapshot.size);
+            item.reference.digest = Some(digest);
+            item.local_file = local_file;
+            item.content = Content::Ready(snapshot);
+            item.active = None;
+            // Completed content gets the full delivery window, independently of transfer duration.
+            item.created = clock.now();
+            Ok(identity)
+        })
+        .await
+        .map_err(|_| Failure::PublicationUnavailable)?
     }
 
     fn take_ticket(
