@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-labelledby="title">
+  <title id="title">mcp-ssh-rs</title>
+  <style>.ink{stroke:#23201b}.accent{stroke:#b66a45}@media(prefers-color-scheme:dark){.ink{stroke:#f7f5f0}.accent{stroke:#df9b76}}</style>
+  <path class="ink" d="M52 17V13a5 5 0 0 0-5-5H13a5 5 0 0 0-5 5v38a5 5 0 0 0 5 5h34a5 5 0 0 0 5-5v-4" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path class="ink" d="m24 23 9 9-9 9" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle class="accent" cx="52" cy="32" r="7" stroke-width="5"/>
+</svg>

@@ -68,6 +68,11 @@ the network, or anything that costs money; use loopback servers and fakes.
 
 ## Documentation
 
+For visual assets, documentation presentation, or application UI changes, read
+[the visual identity guide](docs/branding/README.md) and use its checked-in
+reference and production assets. It covers appearance; product and security
+decisions remain in `docs/design.md`.
+
 Keep `README.md` and `docs/design.md` aligned with implemented behavior.
 Documentation references must use symbols or headings rather than line
 numbers. When the design and the code disagree, say so in the PR rather than

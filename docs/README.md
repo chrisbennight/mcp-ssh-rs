@@ -1,5 +1,10 @@
 # Find the right guide
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="branding/assets/wordmark-dark.svg">
+  <img src="branding/assets/wordmark-light.svg" width="330" alt="mcp-ssh-rs">
+</picture>
+
 Start with the task you want to complete. New users can try the local demo
 before configuring any existing SSH host.
 
@@ -22,6 +27,8 @@ For questions or reproducible defects, see [Get help](../SUPPORT.md).
 Use [Security reports](../SECURITY.md) for vulnerabilities.
 
 ## Contribute or maintain a release
+
+For appearance and UI work, use the [visual identity guide](branding/README.md).
 
 [Contributing](../CONTRIBUTING.md) explains useful first contributions and local
 validation. Its maintainer sections cover repository administration and image

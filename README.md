@@ -1,5 +1,12 @@
 # mcp-ssh-rs
 
+<picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/branding/assets/wordmark-dark.svg">
+  <source media="(max-width: 600px)" srcset="docs/branding/assets/wordmark-light.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/branding/assets/header-dark.svg">
+  <img src="docs/branding/assets/header-light.svg" width="960" alt="mcp-ssh-rs — SSH commands and file transfers for MCP clients">
+</picture>
+
 **SSH commands and file transfers for AI agents, with optional human approval.**
 
 Connect an MCP client to your configured SSH accounts. Review proposed commands
