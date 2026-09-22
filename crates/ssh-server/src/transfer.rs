@@ -126,6 +126,30 @@ struct Item {
     abandoned: bool,
 }
 
+impl Item {
+    fn complete(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        digest: FileDigest,
+        local_file: Option<crate::local_files::OwnedFile>,
+        now: u64,
+    ) -> Result<ssh_core::action::FileIdentity, Failure> {
+        // A successful rename must stay tracked even if receiving was cancelled during publication.
+        self.local_file = local_file;
+        if !matches!(self.content, Content::Receiving) {
+            return Err(Failure::PublicationUnavailable);
+        }
+        let identity = snapshot.identity(self.reference.uri.clone());
+        self.reference.size = Some(snapshot.size);
+        self.reference.digest = Some(digest);
+        self.content = Content::Ready(snapshot);
+        self.active = None;
+        // Completed content gets the full delivery window, independently of transfer duration.
+        self.created = now;
+        Ok(identity)
+    }
+}
+
 /// Every reserved item is charged at the full byte ceiling, including in-flight uploads and downloads.
 pub struct Transfers {
     clock: Arc<dyn Clock>,
@@ -450,18 +474,7 @@ impl Transfers {
             };
             let mut items = items.lock().unwrap_or_else(|error| error.into_inner());
             let item = items.get_mut(&id).ok_or(Failure::PublicationUnavailable)?;
-            if !matches!(item.content, Content::Receiving) {
-                return Err(Failure::PublicationUnavailable);
-            }
-            let identity = snapshot.identity(item.reference.uri.clone());
-            item.reference.size = Some(snapshot.size);
-            item.reference.digest = Some(digest);
-            item.local_file = local_file;
-            item.content = Content::Ready(snapshot);
-            item.active = None;
-            // Completed content gets the full delivery window, independently of transfer duration.
-            item.created = clock.now();
-            Ok(identity)
+            item.complete(snapshot, digest, local_file, clock.now())
         })
         .await
         .map_err(|_| Failure::PublicationUnavailable)?
@@ -1098,6 +1111,57 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_keeps_the_output_for_tracked_cleanup() {
+        let root = std::env::temp_dir().join(format!("ssh-publication-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let store = Transfers::local(Arc::new(TestClock::at(1000)), &root).unwrap();
+        let id = store
+            .reserve(&owner("local"), UploadParams::default(), false)
+            .await
+            .unwrap();
+        let disk = crate::disk::allocate(Arc::clone(&store.staging), None, true)
+            .await
+            .unwrap();
+        let snapshot =
+            crate::disk::receive(Arc::clone(&disk), &mut std::io::Cursor::new(b"output"), 100)
+                .await
+                .unwrap();
+        {
+            let mut items = store.items.lock().unwrap();
+            let item = items.get_mut(&id).unwrap();
+            item.content = Content::Receiving;
+            item.active = Some(disk);
+        }
+        store.abandon(&id);
+        let local_file = store
+            .local
+            .as_ref()
+            .unwrap()
+            .publish(&id, &snapshot)
+            .unwrap();
+        {
+            let mut items = store.items.lock().unwrap();
+            let item = items.get_mut(&id).unwrap();
+            let digest = FileDigest {
+                algorithm: "sha-256".to_owned(),
+                value: URL_SAFE_NO_PAD.encode(snapshot.digest),
+            };
+            assert!(
+                item.complete(snapshot, digest, Some(local_file), 1000)
+                    .is_err()
+            );
+            assert!(
+                item.local_file.is_some(),
+                "cancelled publication must retain its cleanup handle"
+            );
+        }
+        store.sweep().await;
+        assert!(store.items.lock().unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
