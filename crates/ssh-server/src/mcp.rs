@@ -173,6 +173,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
                 serde_json::to_value(
                     store
                         .authorize_upload(principal, params)
+                        .await
                         .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
                 )
             }

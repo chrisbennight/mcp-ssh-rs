@@ -50,6 +50,7 @@ pub struct Settings {
     pub operator_header: axum::http::HeaderName,
     pub file_origin: Option<Url>,
     pub file_root: Option<PathBuf>,
+    pub transfers: crate::transfer::TransferSettings,
     pub process: crate::process::ProcessOptions,
     /// Where the host and role registry is read from.
     pub registry: PathBuf,
@@ -145,6 +146,9 @@ impl Settings {
     pub const OPERATOR_HEADER_VAR: &'static str = "MCP_SSH_OPERATOR_HEADER";
     pub const FILE_ROOT_VAR: &'static str = "MCP_SSH_FILE_ROOT";
     pub const FILE_ORIGIN_VAR: &'static str = "MCP_SSH_FILE_ORIGIN";
+    pub const MAX_TRANSFER_VAR: &'static str = "MCP_SSH_MAX_TRANSFER_BYTES";
+    pub const TRANSFER_TIMEOUT_VAR: &'static str = "MCP_SSH_TRANSFER_TIMEOUT_SECONDS";
+    pub const STAGING_VAR: &'static str = "MCP_SSH_FILE_STAGING";
     pub const REVIEW_VAR: &'static str = "MCP_SSH_REVIEW";
 
     pub fn from_env() -> Result<Self, SettingsError> {
@@ -424,9 +428,33 @@ impl Settings {
                 var: Self::FILE_ROOT_VAR,
             });
         }
+        let defaults = crate::transfer::TransferSettings::default();
+        let max_bytes = positive(&lookup, Self::MAX_TRANSFER_VAR, defaults.max_bytes)?;
+        // Network/local outputs and local snapshots each reserve a full allowance.
+        if max_bytes.checked_mul(32).is_none() || max_bytes > i64::MAX as u64 {
+            return Err(SettingsError::Unusable {
+                var: Self::MAX_TRANSFER_VAR,
+            });
+        }
+        let seconds = positive(
+            &lookup,
+            Self::TRANSFER_TIMEOUT_VAR,
+            defaults.timeout.as_secs(),
+        )?;
+        if seconds > 86400 {
+            return Err(SettingsError::Unusable {
+                var: Self::TRANSFER_TIMEOUT_VAR,
+            });
+        }
+        let transfers = crate::transfer::TransferSettings {
+            max_bytes,
+            timeout: std::time::Duration::from_secs(seconds),
+            staging: optional(&lookup, Self::STAGING_VAR)?.map_or(defaults.staging, PathBuf::from),
+        };
         Ok(Self {
             operator_header,
             file_root,
+            transfers,
             file_origin: optional_url(&lookup, Self::FILE_ORIGIN_VAR, &["http", "https"])?,
             process,
             registry,
@@ -441,6 +469,21 @@ impl Settings {
             notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
         })
+    }
+}
+
+fn positive<F>(lookup: &F, var: &'static str, default: u64) -> Result<u64, SettingsError>
+where
+    F: Fn(&'static str) -> Result<String, VarError>,
+{
+    match lookup(var) {
+        Err(VarError::NotPresent) => Ok(default),
+        Ok(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(SettingsError::Unusable { var }),
+        _ => Err(SettingsError::Unusable { var }),
     }
 }
 
@@ -647,6 +690,35 @@ mod tests {
             (Settings::STANDALONE_BEARER_VAR, BEARER.to_owned()),
             (Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned()),
         ])
+    }
+
+    #[test]
+    fn transfer_settings_default_to_two_decimal_gigabytes_and_reject_invalid_values() {
+        let mut vars = complete();
+        let defaults = Settings::from_lookup(read(&vars)).unwrap().transfers;
+        assert_eq!(defaults.max_bytes, 2_000_000_000);
+        assert_eq!(defaults.timeout.as_secs(), 1800);
+        vars.insert(Settings::MAX_TRANSFER_VAR, "123456789".to_owned());
+        vars.insert(Settings::TRANSFER_TIMEOUT_VAR, "3600".to_owned());
+        let configured = Settings::from_lookup(read(&vars)).unwrap().transfers;
+        assert_eq!(configured.max_bytes, 123456789);
+        assert_eq!(configured.timeout.as_secs(), 3600);
+        for value in [
+            "",
+            "0",
+            "-1",
+            "2GB",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            vars.insert(Settings::MAX_TRANSFER_VAR, value.to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&vars)),
+                Err(SettingsError::Unusable {
+                    var: Settings::MAX_TRANSFER_VAR
+                })
+            ));
+        }
     }
 
     #[test]

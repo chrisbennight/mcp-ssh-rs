@@ -10,6 +10,7 @@ use axum::Router;
 pub mod audit_history;
 pub mod credentials;
 pub mod dashboard;
+mod disk;
 pub mod evaluation;
 pub mod ingress;
 mod local_files;
@@ -208,7 +209,11 @@ pub async fn serve(
         registry,
         Engine::new(settings.review),
         credentials,
-        settings::bounds(),
+        {
+            let mut bounds = settings::bounds();
+            bounds.run.transfer_timeout = settings.transfers.timeout;
+            bounds
+        },
         Some(Arc::new(
             crate::shipped::ToAuditOutput::to(audit).context("starting the audit writer")?,
         )),
@@ -276,9 +281,10 @@ pub async fn serve(
         .as_ref()
         .map(|origin| {
             Ok::<_, anyhow::Error>(Arc::new(
-                crate::transfer::Transfers::new(
+                crate::transfer::Transfers::configured(
                     Arc::new(SystemClock::new().context("reading the boot clock")?),
                     origin.as_str(),
+                    settings.transfers.clone(),
                 )
                 .context("configuring file transfer")?,
             ))
@@ -286,9 +292,10 @@ pub async fn serve(
         .transpose()?;
     let transfers = match settings.file_root.as_ref() {
         Some(root) => Some(Arc::new(
-            crate::transfer::Transfers::local(
+            crate::transfer::Transfers::local_configured(
                 Arc::new(SystemClock::new().context("reading the boot clock")?),
                 root,
+                settings.transfers.clone(),
             )
             .context("configuring local file references")?,
         )),
@@ -365,7 +372,7 @@ pub async fn serve(
                 tokio::time::sleep(RECLAIM_EVERY).await;
                 bastion.reclaim().await;
                 if let Some(transfers) = &transfers {
-                    transfers.sweep();
+                    transfers.sweep().await;
                 }
             }
         }

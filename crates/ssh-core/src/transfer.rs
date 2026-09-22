@@ -1,56 +1,46 @@
 //! Immutable input and byte publication boundary for mediated transfers.
 
 use crate::action::FileIdentity;
-use crate::files::{FileError, MAX_TRANSFER_BYTES};
+use crate::files::FileError;
 use sha2::{Digest as _, Sha256};
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
+use tokio::io::AsyncRead;
 
-/// Validated bytes remain in the runtime and never serialize into tool arguments.
+pub type Reader = Box<dyn AsyncRead + Unpin + Send>;
+pub type TransferFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<FileIdentity, Failure>> + Send + 'a>>;
+
+/// A reader of a completed snapshot whose identity was established before review.
 pub struct PreparedUpload {
     identity: FileIdentity,
-    bytes: Arc<[u8]>,
+    reader: Reader,
 }
 
 impl PreparedUpload {
-    pub fn new(uri: String, bytes: Vec<u8>) -> Result<Self, FileError> {
-        if bytes.len() > MAX_TRANSFER_BYTES {
-            return Err(FileError::TooLarge {
-                size: bytes.len() as u64,
-                max: MAX_TRANSFER_BYTES as u64,
-            });
-        }
-        let identity = identity(uri, &bytes);
-        Ok(Self {
-            identity,
-            bytes: bytes.into(),
-        })
+    /// Adapters supply a completed immutable snapshot, its matching identity, and a reader at byte zero.
+    pub fn from_reader(identity: FileIdentity, reader: Reader) -> Self {
+        Self { identity, reader }
     }
 
-    pub fn from_shared(uri: String, bytes: Arc<[u8]>) -> Result<Self, FileError> {
-        if bytes.len() > MAX_TRANSFER_BYTES {
-            return Err(FileError::TooLarge {
-                size: bytes.len() as u64,
-                max: MAX_TRANSFER_BYTES as u64,
-            });
-        }
-        Ok(Self {
-            identity: identity(uri, &bytes),
-            bytes,
-        })
+    #[cfg(test)]
+    pub fn new(uri: String, bytes: Vec<u8>) -> Result<Self, FileError> {
+        Ok(Self::from_reader(
+            identity(uri, &bytes),
+            Box::new(std::io::Cursor::new(bytes)),
+        ))
     }
 
     pub const fn identity(&self) -> &FileIdentity {
         &self.identity
     }
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub(crate) fn reader(&mut self) -> &mut (dyn AsyncRead + Unpin + Send) {
+        &mut *self.reader
     }
 }
 
-/// Publishes a complete bounded download to the caller's authorized byte store.
-/// The implementation owns retention and access checks. It must not return inline content.
+/// Receives a stream into reserved storage and publishes only complete content.
 pub trait DownloadSink: Send + Sync + 'static {
-    fn publish(&self, bytes: Vec<u8>) -> Result<FileIdentity, String>;
+    fn receive<'a>(&'a self, reader: &'a mut (dyn AsyncRead + Unpin + Send)) -> TransferFuture<'a>;
 }
 
 pub fn identity(uri: String, bytes: &[u8]) -> FileIdentity {
