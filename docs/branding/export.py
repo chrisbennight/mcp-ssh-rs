@@ -66,10 +66,9 @@ def main():
         svg(f"header-{mode}.svg", 960, 240, header)
     svg("symbol-mono.svg", 64, 64, mark("#23201b", "#23201b"))
     social = '<rect width="1280" height="640" fill="#f7f5f0"/>'
-    social += '<path d="M80 535H1200" stroke="#b66a45" stroke-width="3"/>'
-    social += '<g transform="translate(75 125) scale(2.8)">' + mark("#23201b", "#b66a45") + '</g>'
-    social += text("mcp-ssh-rs", 300, 260, 104, "#23201b")
-    social += text("SSH commands and file transfers", 85, 380, 47, "#23201b")
+    social += '<g transform="translate(64 184) scale(4.1)">' + mark("#23201b", "#b66a45") + '</g>'
+    social += text("mcp-ssh-rs", 360, 342, 140, "#23201b")
+    social += text("SSH commands and file transfers", 365, 410, 38, "#23201b")
     svg("social-preview.svg", 1280, 640, social)
 
 
