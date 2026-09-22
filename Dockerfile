@@ -25,6 +25,7 @@ RUN cargo build --release --locked --bin mcp-ssh-rs
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build /src/target/release/mcp-ssh-rs /mcp-ssh-rs
 COPY LICENSE NOTICE /usr/share/doc/mcp-ssh-rs/
+COPY crates/ssh-server/static/fonts/OFL-*.txt /usr/share/doc/mcp-ssh-rs/fonts/
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 USER nonroot:nonroot
 EXPOSE 8080

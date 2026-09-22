@@ -662,6 +662,7 @@ mod tests {
             MCP_PATH,
             DASHBOARD_PATH,
             "/dashboard/approvals",
+            "/dashboard/assets/brand.svg",
             crate::evaluation::EVALUATION_API_PATH,
         ] {
             let response = app
@@ -741,6 +742,10 @@ mod tests {
             "the MCP surface answered a request with no gateway credential"
         );
         assert_eq!(get_path(HEALTH_PATH).await, StatusCode::OK);
+        assert_eq!(
+            get_path("/dashboard/assets/brand.svg").await,
+            StatusCode::UNAUTHORIZED,
+        );
         assert_eq!(
             get_path("/").await,
             StatusCode::UNAUTHORIZED,

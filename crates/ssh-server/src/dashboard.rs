@@ -1121,9 +1121,28 @@ fn render_operations(page: OperationsPage) -> Response {
             tracing::error!(%why, "an operations page could not be rendered");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<p>The operations page could not be rendered.</p>"),
+                message_html("The operations page could not be rendered."),
             )
                 .into_response()
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "message.html")]
+struct MessagePage<'a> {
+    message: &'a str,
+}
+
+fn message_html(message: &str) -> Html<String> {
+    match (MessagePage { message }).render() {
+        Ok(html) => Html(html),
+        Err(why) => {
+            tracing::error!(%why, "a dashboard message could not be rendered");
+            Html(
+                "<p>The dashboard could not be rendered. Return to the review queue.</p>"
+                    .to_owned(),
+            )
         }
     }
 }
@@ -1150,6 +1169,7 @@ where
     S: CredentialSource + 'static,
 {
     Router::new()
+        .route("/assets/{name}", get(brand_asset))
         .route("/approvals", get(queue::<C, S>))
         .route("/inventory", get(inventory::<C, S>))
         .route("/sessions", get(sessions::<C, S>))
@@ -1171,6 +1191,36 @@ where
 
 pub(crate) async fn home() -> Redirect {
     Redirect::to(&format!("{DASHBOARD_PATH}/approvals"))
+}
+
+/// Embedded files share the dashboard's operator authentication boundary.
+async fn brand_asset(Path(name): Path<String>) -> Response {
+    let (mime, bytes): (&str, &[u8]) = match name.as_str() {
+        "brand.svg" => ("image/svg+xml", include_bytes!("../static/brand.svg")),
+        "icons.svg" => ("image/svg+xml", include_bytes!("../static/icons.svg")),
+        "Manrope.ttf" => ("font/ttf", include_bytes!("../static/fonts/Manrope.ttf")),
+        "IBMPlexMono-Regular.ttf" => (
+            "font/ttf",
+            include_bytes!("../static/fonts/IBMPlexMono-Regular.ttf"),
+        ),
+        "OFL-Manrope.txt" => (
+            "text/plain; charset=utf-8",
+            include_bytes!("../static/fonts/OFL-Manrope.txt"),
+        ),
+        "OFL-IBMPlexMono.txt" => (
+            "text/plain; charset=utf-8",
+            include_bytes!("../static/fonts/OFL-IBMPlexMono.txt"),
+        ),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn inventory<C, S>(
@@ -1261,10 +1311,10 @@ where
     S: CredentialSource,
 {
     let Ok(session) = SessionId::parse(&raw_session) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
     let Ok(bounds) = transcript_bounds(query.before, query.start, query.end) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let read = audit_reader
         .transcript(&audit_history::TranscriptQuery {
@@ -1321,21 +1371,21 @@ where
     S: CredentialSource,
 {
     let Ok(session) = SessionId::parse(&raw_session) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
     let Ok(run) = RunId::parse(&raw_run) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
     let stream = match raw_stream.as_str() {
         "stdout" => "stdout",
         "stderr" => "stderr",
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response(),
     };
     let Ok(bounds) = transcript_bounds(query.before, query.start, query.end) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let (Some(before), Some(start), Some(end)) = (bounds.before, bounds.start, bounds.end) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let read = audit_reader
         .output(&audit_history::OutputQuery {
@@ -1396,19 +1446,19 @@ where
     S: CredentialSource,
 {
     let Ok(principal) = query_value(query.principal, 256) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(session) = query_value(query.session, 32) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(host) = query_value(query.host, 253) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(event) = query_value(query.event, 32) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(access_class) = choice_value(query.access_class, &["read_only", "privileged"]) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(verdict) = choice_value(
         query.verdict,
@@ -1421,16 +1471,16 @@ where
             "uncertain",
         ],
     ) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok((window_label, window)) = window_value(query.window) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(q) = query_value(query.q, 128) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok((before, start)) = page_bounds(query.before, query.start) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let filters = Filters {
         principal,
@@ -1502,19 +1552,19 @@ where
     S: CredentialSource,
 {
     let Ok((before, start)) = page_bounds(query.before, query.start) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(access_class) = choice_value(query.access_class, &["read_only", "privileged"]) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok(verdict) = choice_value(
         query.verdict,
         &["supports_intent", "does_not_support_intent", "uncertain"],
     ) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let Ok((window_label, window)) = window_value(query.window) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
     let mut filters = blank_filters();
     filters.access_class = access_class;
@@ -1671,7 +1721,7 @@ where
             tracing::error!(%why, "the approvals page could not be rendered");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Html("<p>The approvals page could not be rendered.</p>"),
+                message_html("The approvals page could not be rendered."),
             )
                 .into_response()
         }
@@ -1695,13 +1745,13 @@ where
     if single_header(&headers, FETCH_SITE_HEADER) != Some("same-origin") {
         return (
             StatusCode::FORBIDDEN,
-            Html("<p>Decisions are made from the approvals page, not from another site.</p>"),
+            message_html("Decisions are made from the approvals page, not from another site."),
         )
             .into_response();
     }
     let id = match ssh_core::approval::RequestId::parse(&id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::NOT_FOUND, Html("<p>No such request.</p>")).into_response(),
+        Err(_) => return (StatusCode::NOT_FOUND, message_html("No such request.")).into_response(),
     };
 
     let agreed = match form.decision.as_str() {
@@ -1716,7 +1766,7 @@ where
             let Ok(for_millis) = standing_duration(form.duration.as_deref()) else {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Html("<p>That is not a duration.</p>"),
+                    message_html("That is not a duration."),
                 )
                     .into_response();
             };
@@ -1736,7 +1786,7 @@ where
         // No recognised button. Nothing is a safe default here: agreeing by
         // accident runs a command a policy flagged, and refusing by accident
         // discards a decision the operator did not make.
-        _ => return (StatusCode::BAD_REQUEST, Html("<p>Approve or refuse.</p>")).into_response(),
+        _ => return (StatusCode::BAD_REQUEST, message_html("Approve or refuse.")).into_response(),
     };
 
     // The operator's name goes into the record with the decision, which is the
@@ -1798,17 +1848,17 @@ where
     if single_header(&headers, FETCH_SITE_HEADER) != Some("same-origin") {
         return (
             StatusCode::FORBIDDEN,
-            Html("<p>Decisions are made from the approvals page, not from another site.</p>"),
+            message_html("Decisions are made from the approvals page, not from another site."),
         )
             .into_response();
     }
     if form.decision != "revoke" {
-        return (StatusCode::BAD_REQUEST, Html("<p>Revoke or leave it.</p>")).into_response();
+        return (StatusCode::BAD_REQUEST, message_html("Revoke or leave it.")).into_response();
     }
     let Ok(agreement) = AgreementId::parse(&agreement) else {
         return (
             StatusCode::NOT_FOUND,
-            Html("<p>No such standing agreement.</p>"),
+            message_html("No such standing agreement."),
         )
             .into_response();
     };
@@ -1822,7 +1872,7 @@ where
     } else {
         (
             StatusCode::NOT_FOUND,
-            Html("<p>No such standing agreement.</p>"),
+            message_html("No such standing agreement."),
         )
             .into_response()
     }
@@ -1842,9 +1892,9 @@ fn decision_failure(id: &ssh_core::approval::RequestId, why: &MediationError) ->
         tracing::error!(%why, request = id.as_str(), "a decision was applied but not recorded");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Html(
-                "<p>The decision was applied, but recording it failed. \
-                 Tell an operator; it is not in the record.</p>",
+            message_html(
+                "The decision was applied, but recording it failed. \
+                 Tell an operator; it is not in the record.",
             ),
         )
             .into_response();
@@ -1852,7 +1902,7 @@ fn decision_failure(id: &ssh_core::approval::RequestId, why: &MediationError) ->
     tracing::warn!(%why, request = id.as_str(), "a request could not be answered");
     (
         StatusCode::CONFLICT,
-        Html("<p>That request is no longer waiting.</p>"),
+        message_html("That request is no longer waiting."),
     )
         .into_response()
 }
@@ -1863,6 +1913,134 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+
+    #[tokio::test]
+    async fn embedded_assets_include_font_licenses_and_reject_unknown_names() {
+        for (name, mime) in [
+            ("brand.svg", "image/svg+xml"),
+            ("icons.svg", "image/svg+xml"),
+            ("Manrope.ttf", "font/ttf"),
+            ("IBMPlexMono-Regular.ttf", "font/ttf"),
+            ("OFL-Manrope.txt", "text/plain; charset=utf-8"),
+            ("OFL-IBMPlexMono.txt", "text/plain; charset=utf-8"),
+        ] {
+            let response = routes(operations_bastion())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(format!("/assets/{name}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert!(!body.is_empty());
+            if name.starts_with("OFL-") {
+                assert!(
+                    String::from_utf8(body.to_vec())
+                        .unwrap()
+                        .contains("SIL OPEN FONT LICENSE")
+                );
+            }
+        }
+        assert_eq!(
+            brand_asset(Path("Cargo.toml".to_owned())).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn feedback_escapes_text_and_links_to_the_current_queue() {
+        let html = message_html("<script>alert(1)</script>").0;
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&#60;script&#62;") || html.contains("&lt;script&gt;"));
+        assert!(html.contains("href=\"/dashboard/approvals\""));
+        assert!(html.contains("Skip to content"));
+    }
+
+    /// Development fixture export, separate from live product screenshots.
+    #[tokio::test]
+    #[ignore = "writes synthetic pages for manual browser review; see docs/branding/verification.md"]
+    async fn export_visual_review_fixtures() {
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/branding-fixtures");
+        std::fs::create_dir_all(&directory).unwrap();
+        let assets = directory.join("dashboard/assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        for name in [
+            "brand.svg",
+            "icons.svg",
+            "Manrope.ttf",
+            "IBMPlexMono-Regular.ttf",
+            "OFL-Manrope.txt",
+            "OFL-IBMPlexMono.txt",
+        ] {
+            let response = brand_asset(Path(name.to_owned())).await;
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            std::fs::write(assets.join(name), body).unwrap();
+        }
+        let reader: Arc<dyn ReadsAudit> = Arc::new(SessionJourneyPage);
+        for (name, path, reader) in [
+            (
+                "audit",
+                "/audit",
+                Arc::new(DurablePage) as Arc<dyn ReadsAudit>,
+            ),
+            (
+                "evaluations",
+                "/evaluations?window=7d&access_class=read_only&verdict=supports_intent",
+                Arc::new(EvaluationPage) as Arc<dyn ReadsAudit>,
+            ),
+            (
+                "transcript",
+                "/sessions/0123456789abcdef0123456789abcdef",
+                Arc::clone(&reader),
+            ),
+            (
+                "output",
+                "/sessions/0123456789abcdef0123456789abcdef/runs/0123456789abcdef-0123456789abcdef0123456789abcdef/stdout?before=1800000000000000000&start=1600000000000000000&end=1800000000000000000",
+                reader,
+            ),
+            (
+                "empty-sessions",
+                "/sessions",
+                Arc::new(audit_history::Unavailable) as Arc<dyn ReadsAudit>,
+            ),
+        ] {
+            let response = routes_with_audit(operations_bastion(), reader)
+                .layer(axum::Extension(Operator("visual-review".to_owned())))
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            std::fs::write(directory.join(format!("{name}.html")), body).unwrap();
+        }
+        let long_argument = "a".repeat(1024);
+        std::fs::write(
+            directory.join("long-command.html"),
+            page(vec![asked(&["printf", &long_argument])]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("conflict.html"),
+            message_html("That request is no longer waiting.").0,
+        )
+        .unwrap();
+    }
     use ssh_core::approval::{Approvals, Standing, Windows};
     use ssh_core::audit::Ledger;
     use ssh_core::clock::TestClock;
@@ -3049,6 +3227,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("The filters or time range are invalid."));
+            assert!(body.contains("href=\"/dashboard/audit\""));
         }
     }
 
