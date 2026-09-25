@@ -17,6 +17,7 @@ mod local_files;
 pub mod mcp;
 pub mod notify;
 pub mod process;
+mod request_limits;
 pub mod settings;
 pub mod shipped;
 pub mod tools;
@@ -131,6 +132,10 @@ where
     let mcp_routes = ingress.into().map_or_else(Router::new, |ingress| {
         Router::new()
             .nest_service(MCP_PATH, mcp)
+            .layer(axum::middleware::from_fn_with_state(
+                crate::request_limits::Limits::default(),
+                crate::request_limits::admit,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 ingress,
                 crate::ingress::require_mcp,
@@ -706,6 +711,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn control_body_limits_follow_authentication_and_leave_file_streaming_available() {
+        let principal = ssh_core::PrincipalId::parse("fixture").unwrap();
+        let clock = Arc::new(ssh_core::clock::TestClock::at(1_000));
+        let bastion = Arc::new(Bastion::new(
+            Arc::clone(&clock),
+            Registry::from_json("{}").unwrap(),
+            Engine::new(ssh_core::policy::ReviewMode::Disabled),
+            NoCredentials,
+            settings::bounds(),
+        ));
+        let token = "0123456789abcdef0123456789abcdef";
+        let ingress = Ingress::standalone(
+            Arc::new(crate::ingress::SharedBearer::new(token.to_owned(), None).unwrap()),
+            principal.clone(),
+        );
+        let files =
+            Arc::new(crate::transfer::Transfers::new(clock, "https://ssh.example").unwrap());
+        let app = router(
+            bastion,
+            ingress,
+            None,
+            Arc::new(crate::notify::Silence),
+            None,
+            OptionalSurfaces {
+                transfers: Some(Arc::clone(&files)),
+                evaluator: None,
+                audit_reader: Arc::new(crate::audit_history::Unavailable),
+            },
+            &[],
+        );
+        let body_that_must_not_be_read = Body::from_stream(futures_util::stream::poll_fn(|_| {
+            panic!("an unauthenticated request body was read");
+            #[allow(unreachable_code)]
+            std::task::Poll::Ready(None::<Result<axum::body::Bytes, std::io::Error>>)
+        }));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(MCP_PATH)
+                    .body(body_that_must_not_be_read)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(MCP_PATH)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(vec![b' '; 256 * 1024 + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(MCP_PATH)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("host", "localhost")
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc":"2.0", "id":1, "method":"initialize", "params": {
+                                "protocolVersion":"2025-11-25", "capabilities":{},
+                                "clientInfo":{"name":"fixture","version":"test"}
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upload = files
+            .authorize_upload(&principal, crate::transfer::UploadParams::default())
+            .await
+            .unwrap();
+        let url = url::Url::parse(&upload.upload.url).unwrap();
+        let mut request = Request::builder()
+            .method(upload.upload.method)
+            .uri(url.path());
+        for (name, value) in &upload.upload.headers {
+            request = request.header(name, value);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(vec![173_u8; 512 * 1024])).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
