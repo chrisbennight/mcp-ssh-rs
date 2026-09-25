@@ -2,14 +2,17 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 use crate::connect::Connection;
+
+mod download;
 
 // Enough for the result tag, field names, byte count, quotes, and punctuation.
 
@@ -262,10 +265,9 @@ pub enum PathError {
     NotOneSpelling,
 }
 
-async fn binary_session(
+async fn binary_stream(
     connection: &Connection,
-    path: &RemotePath,
-) -> Result<SftpSession, FileError> {
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send + 'static, FileError> {
     let channel = connection
         .handle()
         .channel_open_session()
@@ -279,7 +281,14 @@ async fn binary_session(
         .map_err(|source| FileError::Unavailable {
             detail: source.to_string(),
         })?;
-    let sftp = SftpSession::new(BoundedSftpStream::new(channel.into_stream()))
+    Ok(BoundedSftpStream::new(channel.into_stream()))
+}
+
+async fn binary_session(
+    connection: &Connection,
+    path: &RemotePath,
+) -> Result<SftpSession, FileError> {
+    let sftp = SftpSession::new(binary_stream(connection).await?)
         .await
         .map_err(|source| FileError::Unavailable {
             detail: source.to_string(),
@@ -297,16 +306,70 @@ pub(crate) async fn download(
     path: &RemotePath,
     sink: &dyn crate::transfer::DownloadSink,
 ) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
-    let sftp = binary_session(connection, path).await?;
+    let mut sftp = RawSftpSession::new(binary_stream(connection).await?);
+    let version = sftp.init().await.map_err(|source| FileError::Unavailable {
+        detail: source.to_string(),
+    })?;
+    let mut chunk_bytes = download::CHUNK_BYTES;
+    if version
+        .extensions
+        .get(russh_sftp::extensions::LIMITS)
+        .is_some_and(|version| version == "1")
+    {
+        let limits = russh_sftp::client::rawsession::Limits::from(
+            sftp.limits()
+                .await
+                .map_err(|source| failed(path, &source))?,
+        );
+        if let Some(read_len) = limits.read_len {
+            chunk_bytes = u64::from(chunk_bytes).min(read_len) as u32;
+        }
+        if let Some(packet_len) = limits.packet_len {
+            // Leave room for the frame length, DATA type, request identifier,
+            // and byte-string length. A zero payload allowance is refused.
+            chunk_bytes = u64::from(chunk_bytes).min(packet_len.saturating_sub(13)) as u32;
+        }
+        sftp.set_limits(limits);
+    }
+    let sftp = Arc::new(sftp);
     let result = async {
-        let mut file = sftp
-            .open(path.as_str())
+        let resolved = sftp
+            .realpath(path.parent())
             .await
             .map_err(|source| failed(path, &source))?;
-        sink.receive(&mut file).await
+        if resolved
+            .files
+            .first()
+            .is_none_or(|file| file.filename != path.parent())
+        {
+            return Err(elsewhere(path).into());
+        }
+        match sftp.lstat(path.as_str()).await {
+            Ok(attributes) if attributes.attrs.is_symlink() => return Err(elsewhere(path).into()),
+            Ok(_) => {}
+            Err(source) if said(&source, StatusCode::NoSuchFile) => {}
+            Err(source) => return Err(failed(path, &source).into()),
+        }
+        let handle = sftp
+            .open(
+                path.as_str(),
+                OpenFlags::READ,
+                russh_sftp::protocol::FileAttributes::empty(),
+            )
+            .await
+            .map_err(|source| failed(path, &source))?
+            .handle;
+        let mut reader =
+            download::Reader::new(Arc::clone(&sftp), handle, chunk_bytes, download::READ_AHEAD)
+                .map_err(|_| crate::transfer::Failure::RemoteIo)?;
+        let received = sink.receive(&mut reader).await;
+        drop(reader);
+        // This dedicated session releases its read handle on teardown. Do not
+        // wait for another peer acknowledgement after publication succeeded.
+        received
     }
     .await;
-    let _ = sftp.close().await;
+    let _ = sftp.close_session();
     result
 }
 
@@ -468,6 +531,7 @@ mod tests {
     #[derive(Clone)]
     struct FileServer {
         root: PathBuf,
+        answer_close: bool,
         /// Channels kept until their subsystem request arrives, because the
         /// SFTP server takes the channel itself rather than a channel id.
         channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
@@ -519,6 +583,7 @@ mod tests {
                 Files {
                     root: self.root.clone(),
                     open: HashMap::new(),
+                    answer_close: self.answer_close,
                 },
             )
             .await;
@@ -534,6 +599,7 @@ mod tests {
     struct Files {
         root: PathBuf,
         open: HashMap<String, PathBuf>,
+        answer_close: bool,
     }
 
     impl Files {
@@ -596,6 +662,9 @@ mod tests {
         }
 
         async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+            if !self.answer_close {
+                return std::future::pending().await;
+            }
             self.open.remove(&handle);
             Ok(Status {
                 id,
@@ -714,6 +783,10 @@ mod tests {
 
     /// A connection to a target serving a temporary directory.
     async fn served(root: &Path) -> Connection {
+        served_with_close(root, true).await
+    }
+
+    async fn served_with_close(root: &Path, answer_close: bool) -> Connection {
         let host_key =
             keys::PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519).unwrap();
         let pinned =
@@ -728,6 +801,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let mut target_server = FileServer {
             root: root.to_path_buf(),
+            answer_close,
             channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         tokio::spawn(async move {
@@ -779,13 +853,14 @@ mod tests {
         use crate::session::{Lifetime, Purpose, SessionStore};
         use crate::transfer::{DownloadSink, Failure, Payload};
 
-        struct Unavailable;
+        struct Unavailable(bool);
         impl DownloadSink for Unavailable {
             fn receive<'a>(
                 &'a self,
                 reader: &'a mut (dyn AsyncRead + Unpin + Send),
             ) -> crate::transfer::TransferFuture<'a> {
                 Box::pin(async move {
+                    assert!(!self.0, "synthetic transfer worker failure");
                     let size = tokio::io::copy(&mut reader.take(9), &mut tokio::io::sink())
                         .await
                         .unwrap();
@@ -820,11 +895,19 @@ mod tests {
         )
         .unwrap();
         let ledger = Ledger::new(TestClock::at(1000));
-        let runs = Runs::new(Limits::default());
-        for (remote, cause) in [
-            ("/missing", Failure::NotFound),
-            ("/large", Failure::TooLarge),
-            ("/present", Failure::PublicationUnavailable),
+        struct Observed(std::sync::Mutex<Vec<crate::run::Outcome>>);
+        impl crate::run::Settled for Observed {
+            fn settled(&self, outcome: crate::run::Outcome) {
+                self.0.lock().unwrap().push(outcome);
+            }
+        }
+        let observed = Arc::new(Observed(std::sync::Mutex::new(Vec::new())));
+        let runs = Runs::watched(Limits::default(), Some(observed.clone()));
+        for (remote, cause, panics) in [
+            ("/missing", Failure::NotFound, false),
+            ("/large", Failure::TooLarge, false),
+            ("/present", Failure::PublicationUnavailable, false),
+            ("/present", Failure::WorkerStopped, true),
         ] {
             let action = crate::action::Action::download(path(remote)).unwrap();
             let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
@@ -841,7 +924,7 @@ mod tests {
                 .transfer(
                     connection.clone(),
                     receipt,
-                    Payload::Download(Arc::new(Unavailable)),
+                    Payload::Download(Arc::new(Unavailable(panics))),
                 )
                 .await
                 .unwrap();
@@ -862,7 +945,37 @@ mod tests {
             assert!(!outcome.stderr().text.contains("private storage"));
             let later = runs.wait(outcome.run(), Duration::ZERO).await.unwrap();
             assert_eq!(later.state(), outcome.state());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !runs.unfinished().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.0.lock().unwrap().last().unwrap().state(),
+                outcome.state()
+            );
+            assert!(runs.forget(outcome.run()));
         }
+        assert_eq!(observed.0.lock().unwrap().len(), 4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_published_download_does_not_wait_for_a_read_handle_close_reply() {
+        let root = scratch();
+        let bytes = [0_u8, 255, b'a'].repeat(1024);
+        std::fs::write(root.join("binary"), &bytes).unwrap();
+        let connection = served_with_close(&root, false).await;
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            download(&connection, &path("/binary"), &HashSink),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, crate::transfer::identity(String::new(), &bytes));
         std::fs::remove_dir_all(root).unwrap();
     }
 

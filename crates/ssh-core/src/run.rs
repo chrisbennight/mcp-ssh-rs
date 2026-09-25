@@ -434,12 +434,16 @@ impl Collected {
         }
     }
 
-    fn snapshot(&self) -> Stream {
+    fn snapshot(&self, complete: bool) -> Stream {
         Stream {
             // Lossy because command output is bytes, not text, and truncating
             // at a byte bound can split a character. Refusing to report output
             // that is not valid UTF-8 would lose the output entirely.
-            text: String::from_utf8_lossy(&self.kept).into_owned(),
+            text: if complete {
+                String::from_utf8_lossy(&self.kept).into_owned()
+            } else {
+                String::new()
+            },
             truncated: self.seen > self.kept.len() as u64,
             bytes: self.seen,
             matched: self.matched,
@@ -573,7 +577,7 @@ impl Runs {
         let transfer_timeout = self.limits.transfer_timeout;
         tokio::spawn(async move {
             let _reading = reading;
-            let work = async {
+            let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
                         crate::files::download(&connection, &path, &*sink).await
@@ -594,23 +598,18 @@ impl Runs {
                     _ => unreachable!("transfer payload was validated before registration"),
                 }
             };
-            let result = tokio::time::timeout(transfer_timeout, work).await;
+            let result = supervise_transfer(work, transfer_timeout).await;
             {
                 let mut record = live
                     .record
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(Ok(file)) => {
+                    Ok(file) => {
                         record.file = Some(file);
                         record.state = RunState::Exited { code: 0 };
                     }
-                    failure => {
-                        let cause = match failure {
-                            Ok(Err(cause)) => cause,
-                            Err(_) => Failure::TimedOut,
-                            Ok(Ok(_)) => unreachable!(),
-                        };
+                    Err(cause) => {
                         record.state = RunState::TransferFailed {
                             cause,
                             remote_write_may_be_partial: is_upload,
@@ -871,8 +870,10 @@ impl Runs {
             .unwrap_or_else(|e| e.into_inner())
             .get(id.as_str())
             .map(Arc::clone)?;
-        let outcome = snapshot_of(id, &live);
-        (!outcome.still_running()).then_some(outcome)
+        if live.record.lock().unwrap_or_else(|e| e.into_inner()).state == RunState::Running {
+            return None;
+        }
+        Some(snapshot_of(id, &live))
     }
 
     /// Asks about a run, waiting up to `how_long` for it to settle.
@@ -890,7 +891,7 @@ impl Runs {
         // Registered before the state is read, so a run that settles between
         // the check and the wait is not missed.
         let settled = live.settled.notified();
-        if !snapshot_of(id, &live).still_running() {
+        if live.record.lock().unwrap_or_else(|e| e.into_inner()).state != RunState::Running {
             return Ok(snapshot_of(id, &live));
         }
         let _ = tokio::time::timeout(how_long, settled).await;
@@ -989,6 +990,33 @@ impl Runs {
     }
 }
 
+/// Own the worker until it has stopped, including timeout and task failure.
+/// Dropping a join handle alone would leave timed-out remote work running.
+async fn supervise_transfer(
+    work: impl std::future::Future<
+        Output = Result<crate::action::FileIdentity, crate::transfer::Failure>,
+    > + Send
+    + 'static,
+    timeout: Duration,
+) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
+    use crate::transfer::Failure;
+    let mut workers = tokio::task::JoinSet::new();
+    workers.spawn(work);
+    match tokio::time::timeout(timeout, workers.join_next()).await {
+        Ok(Some(Ok(result))) => result,
+        Ok(Some(Err(_))) | Ok(None) => {
+            // A panic payload can contain target or storage data. Only the
+            // bounded failure category belongs in logs and caller responses.
+            tracing::error!("transfer worker ended unexpectedly");
+            Err(Failure::WorkerStopped)
+        }
+        Err(_) => {
+            workers.shutdown().await;
+            Err(Failure::TimedOut)
+        }
+    }
+}
+
 /// What a run looks like right now.
 ///
 /// Free of the store because the reader task holds only the run it is reading,
@@ -996,15 +1024,26 @@ impl Runs {
 /// something that also holds it.
 fn snapshot_of(id: &RunId, live: &Live) -> Outcome {
     let record = live.record.lock().unwrap_or_else(|e| e.into_inner());
+    // Running output is never delivered. Retain its counters without copying
+    // the potentially large byte buffers or decoding text nobody can receive.
+    let complete = record.state != RunState::Running;
     Outcome {
         run: id.clone(),
         authorization: live.authorization.clone(),
         state: record.state,
-        stdout: record.stdout.snapshot(),
-        stderr: record.stderr.snapshot(),
+        stdout: record.stdout.snapshot(complete),
+        stderr: record.stderr.snapshot(complete),
         file: record.file.clone(),
-        stdout_bytes: record.stdout.kept.clone(),
-        stderr_bytes: record.stderr.kept.clone(),
+        stdout_bytes: if complete {
+            record.stdout.kept.clone()
+        } else {
+            Vec::new()
+        },
+        stderr_bytes: if complete {
+            record.stderr.kept.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -1044,6 +1083,178 @@ mod tests {
     use crate::registry::{CredentialRef, PinnedHostKey, Registry};
     use crate::secret::Secret;
     use crate::{HostId, RoleId};
+
+    #[tokio::test]
+    async fn running_snapshots_copy_no_retained_output_and_completion_preserves_bytes() {
+        let runs = Arc::new(runs(Limits::default()));
+        let id = runs.mint_id();
+        let mut stdout = Collected::new(1 << 20);
+        let bytes = [0_u8, 255, b'a', b'\n'].repeat(1 << 18);
+        stdout.push(&bytes);
+        stdout.push(b"aws_secret_access_key = synthetic");
+        let live = Arc::new(Live {
+            record: Mutex::new(Record {
+                file: None,
+                stdout,
+                stderr: Collected::new(1 << 20),
+                state: RunState::Running,
+            }),
+            authorization: recorded(&["true"]).authorization().clone(),
+            settled: Notify::new(),
+        });
+        runs.records
+            .lock()
+            .unwrap()
+            .insert(id.as_str().to_owned(), Arc::clone(&live));
+        for _ in 0..32 {
+            assert!(runs.finished(&id).is_none());
+            let pending = runs.wait(&id, Duration::ZERO).await.unwrap();
+            assert_eq!(pending.stdout.text.capacity(), 0);
+            assert_eq!(pending.stdout_bytes.capacity(), 0);
+            assert!(pending.stdout.bytes > bytes.len() as u64);
+            assert!(pending.stdout.truncated);
+            assert!(pending.stdout.matched.is_some());
+        }
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let runs = Arc::clone(&runs);
+            let id = id.clone();
+            waiters.spawn(async move { runs.wait(&id, Duration::from_secs(30)).await.unwrap() });
+        }
+        tokio::task::yield_now().await;
+        live.record.lock().unwrap().state = RunState::Exited { code: 0 };
+        live.settled.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(result) = waiters.join_next().await {
+                let result = result.unwrap();
+                assert_eq!(result.state(), RunState::Exited { code: 0 });
+                assert_eq!(result.stdout_bytes, bytes);
+            }
+        })
+        .await
+        .unwrap();
+        let completed = runs.wait(&id, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(completed.stdout_bytes, bytes);
+        assert_eq!(completed.stdout.text, String::from_utf8_lossy(&bytes));
+        assert!(completed.stdout.matched.is_some());
+        assert_eq!(runs.finished(&id).unwrap().stdout_bytes, bytes);
+    }
+
+    #[tokio::test]
+    async fn transfer_supervision_reports_panics_and_drops_timed_out_work() {
+        use crate::transfer::Failure;
+        assert_eq!(
+            supervise_transfer(
+                async { panic!("synthetic worker failure") },
+                Duration::from_secs(1)
+            )
+            .await,
+            Err(Failure::WorkerStopped)
+        );
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        struct Guard(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let guard = Guard(Some(dropped));
+        let result = supervise_transfer(
+            async move {
+                let _guard = guard;
+                std::future::pending().await
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result, Err(Failure::TimedOut));
+        assert!(
+            observed.await.is_ok(),
+            "timeout returned before worker resources were released"
+        );
+    }
+
+    #[test]
+    #[ignore = "poll allocation and record-lock contention measurement; run explicitly with --nocapture"]
+    fn polling_benchmark() {
+        use std::io::Write as _;
+        for retained in [32, 1 << 20] {
+            for eager in [true, false] {
+                let mut stdout = Collected::new(retained);
+                let mut stderr = Collected::new(retained);
+                stdout.push(&vec![b'x'; retained]);
+                stderr.push(&vec![b'x'; retained]);
+                let live = Live {
+                    record: Mutex::new(Record {
+                        file: None,
+                        stdout,
+                        stderr,
+                        state: RunState::Running,
+                    }),
+                    authorization: recorded(&["true"]).authorization().clone(),
+                    settled: Notify::new(),
+                };
+                let id = Runs::new(Limits::default()).mint_id();
+                let start = std::sync::Barrier::new(2);
+                let started = Instant::now();
+                let (allocated, writer_wait) = std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        start.wait();
+                        let mut waited = Duration::ZERO;
+                        for _ in 0..100 {
+                            let started = Instant::now();
+                            let record = live.record.lock().unwrap();
+                            waited = waited.saturating_add(started.elapsed());
+                            std::hint::black_box(&record.state);
+                            drop(record);
+                            std::thread::yield_now();
+                        }
+                        waited
+                    });
+                    start.wait();
+                    let mut allocated = 0_usize;
+                    for _ in 0..100 {
+                        let copied = if eager {
+                            // Reproduce the former status path's output copies
+                            // under the same lock; exclude common metadata.
+                            let record = live.record.lock().unwrap();
+                            let stdout = record.stdout.snapshot(true);
+                            let stderr = record.stderr.snapshot(true);
+                            let raw_out = record.stdout.kept.clone();
+                            let raw_err = record.stderr.kept.clone();
+                            let size = stdout
+                                .text
+                                .capacity()
+                                .saturating_add(stderr.text.capacity())
+                                .saturating_add(raw_out.capacity())
+                                .saturating_add(raw_err.capacity());
+                            std::hint::black_box((stdout, stderr, raw_out, raw_err));
+                            size
+                        } else {
+                            let outcome = snapshot_of(&id, &live);
+                            let size = outcome
+                                .stdout
+                                .text
+                                .capacity()
+                                .saturating_add(outcome.stderr.text.capacity())
+                                .saturating_add(outcome.stdout_bytes.capacity())
+                                .saturating_add(outcome.stderr_bytes.capacity());
+                            std::hint::black_box(outcome);
+                            size
+                        };
+                        allocated = allocated.saturating_add(copied);
+                    }
+                    (allocated, writer.join().unwrap())
+                });
+                let result = serde_json::json!({"path":if eager {"previous_eager_status"} else {"metadata_status"}, "retained_bytes_per_stream":retained, "polls":100, "output_allocation_capacity_bytes":allocated, "seconds":started.elapsed().as_secs_f64(), "writer_lock_wait_seconds":writer_wait.as_secs_f64()});
+                let mut output = std::io::stdout().lock();
+                serde_json::to_writer(&mut output, &result).unwrap();
+                output.write_all(b"\n").unwrap();
+            }
+        }
+    }
 
     /// A target that runs what it is asked to run.
     ///

@@ -71,6 +71,7 @@ pub enum Failure {
     RemoteIo,
     PublicationUnavailable,
     TimedOut,
+    WorkerStopped,
 }
 
 impl Failure {
@@ -84,6 +85,7 @@ impl Failure {
             Self::RemoteIo => "remote_io",
             Self::PublicationUnavailable => "publication_unavailable",
             Self::TimedOut => "timed_out",
+            Self::WorkerStopped => "worker_stopped",
         }
     }
 
@@ -99,6 +101,7 @@ impl Failure {
                 "The download could not be published to local output storage."
             }
             Self::TimedOut => "The transfer exceeded its time limit.",
+            Self::WorkerStopped => "The transfer worker ended unexpectedly.",
         }
     }
 }
