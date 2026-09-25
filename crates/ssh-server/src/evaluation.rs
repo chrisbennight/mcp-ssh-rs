@@ -96,6 +96,9 @@ where
             "evaluation could not cross the audit boundary",
         )
             .into_response(),
+        Err(AuditError::EvaluationFull | AuditError::Full) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "audit capacity reached").into_response()
+        }
         Err(why) => {
             tracing::error!(%why, evaluation_id, "an evaluation could not be recorded");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

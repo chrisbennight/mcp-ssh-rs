@@ -91,6 +91,38 @@ released on completion or cancellation. These limits apply before JSON decoding
 and are fixed service defaults. They do not limit command runtime or the
 separate streaming file-byte routes; see [file transfer limits](file-transfers.md#limits-and-outcomes).
 
+## Process-local audit retention
+
+The process-local audit view keeps at most 4096 entries and 16 MiB of encoded
+readable evidence. Content expires after an hour or earlier under byte pressure.
+Older commitments are folded into a checkpoint; verification reports the retired
+prefix explicitly. These fixed process limits do not configure retention at the
+deployment's audit sink or historical reader.
+An outcome larger than the readable budget still crosses the configured
+recording boundary and is retained locally only as a commitment.
+
+Active approval and execution proofs have separate limits of 1024 proofs and
+16 MiB of encoded evidence. Exhaustion refuses new authority before its audit
+write. Existing executions can still record completion; releasing their run or
+pending approval releases the associated proof. Cancelled, unused receipts do
+not keep capacity occupied. Admission and reclamation use the same ledger lock.
+If approval recording encounters capacity or sink failure, its human answer
+remains available for retry within the original expiry; execution still requires
+successful recording.
+
+Evaluation identifiers and evaluated-decision indexes retain at most 65536
+entries for the process lifetime. Further new evaluations receive HTTP 503;
+ordinary SSH work remains available. Existing identifier-conflict and decision
+deduplication behavior is preserved after readable evidence expires. Restarting
+starts a new process-local ledger; durable evidence remains the sink operator's
+responsibility.
+
+For a repeatable local memory measurement, run
+`cargo test --all --all-features --locked retention_memory_benchmark -- --ignored --nocapture --test-threads=1`.
+It reports retained content, commitments, all auxiliary indexes, and process RSS
+over sustained synthetic work. Encoded evidence budgets are not exact RSS limits:
+Rust containers, active readers, and allocator overhead also use memory.
+
 ## Add a host
 
 Set `MCP_SSH_REGISTRY` to a JSON file. The tutorial generates a working example

@@ -22,14 +22,15 @@
 //! consequence, though: it makes retention impossible, because deleting old
 //! entries breaks the chain that proves the recent ones.
 //!
-//! So retention *seals* rather than deletes. A sealed entry keeps its sequence
-//! number and both digests and loses its content. The chain still verifies end
-//! to end, and verification reports which entries can no longer be read — which
-//! is honest, where a chain that silently verified over a gap would not be.
+//! Readable retention seals entries, while a bounded proof window eventually
+//! retires its oldest links into a checkpoint. Verification names the retired
+//! prefix explicitly and checks the retained window against independent issued
+//! digests. Active authority keeps its own bounded proof until its holder ends.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -42,6 +43,9 @@ use crate::policy::{Decision, Verdict};
 use crate::run::{Outcome, RunId, Stream};
 use crate::session::{Session, SessionId};
 use crate::{AccessClass, HostId, PrincipalId, RoleId};
+
+mod retention;
+use retention::{Limits, State, Written};
 
 /// A digest, as lowercase hex.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -407,7 +411,8 @@ impl Attribution {
 
 /// What a decision entry permitted, in a form that travels.
 ///
-/// Minted only by [`Ledger::record_intent`], from the entry it just wrote. It
+/// Minted by [`Ledger::record_intent`] or [`Ledger::record_approval`] from the
+/// entry just written. It
 /// names the entry twice — by position and by digest — because a position
 /// repeats across records and a digest does not, and it carries who the
 /// decision was for so that recording what happened never has to read the
@@ -420,6 +425,39 @@ pub struct Authorization {
     sequence: u64,
     digest: Digest,
     who: Attribution,
+    #[serde(skip)]
+    proof: Arc<Proof>,
+}
+
+/// Active holders keep this proof alive independently of transcript retention.
+/// Completion state travels with every copy of the same authorization.
+struct Proof {
+    entry: Arc<Entry>,
+    bytes: usize,
+    completed: AtomicBool,
+}
+
+impl std::fmt::Debug for Proof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Proof")
+            .field("sequence", &self.entry.sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Proof {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry.sequence == other.entry.sequence && self.entry.digest == other.entry.digest
+    }
+}
+impl Eq for Proof {}
+
+/// Keeps an approval's source evidence available while the approval can act.
+/// Holding this alone does not authorize execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecisionProof {
+    _proof: Arc<Proof>,
 }
 
 impl Authorization {
@@ -631,36 +669,9 @@ pub struct Ledger<C: Clock> {
     /// What this record's first entry commits to, and what makes its digests
     /// its own. Minted once, when the record is created.
     genesis: Digest,
-    entries: Mutex<Vec<Held>>,
-    /// What the ledger has written, and the digest it ended on.
-    ///
-    /// A chain proves each entry follows the one before it, and says nothing
-    /// about the entries that are no longer there: remove the last one, or the
-    /// last ten, and everything remaining still links. Verification compares
-    /// what is present against what was issued, so losing the tail is a break
-    /// rather than a shorter chain that happens to be consistent.
-    issued: Mutex<Issued>,
-    /// Runs this record has already accounted for.
-    ///
-    /// Kept beside the chain rather than inside it, like `issued`, because it
-    /// has to answer after retention has taken the entries it would otherwise
-    /// be read from. A run asked about twice hands back two outcomes, and
-    /// without this the second one becomes a second completion once the first
-    /// has been retired.
-    ///
-    /// This is why an identifier has to name one execution rather than one
-    /// position in one store: a record can be fed by more than one, and two
-    /// stores numbering from the same place would have the second store's first
-    /// run mistaken for a repeat of the first store's.
-    completed: Mutex<HashSet<String>>,
-    /// Bounded-look-up state for advisory evaluations.
-    ///
-    /// Issued identifiers and evaluated decision digests survive retention so
-    /// sealing cannot reopen either append surface. Readable decisions and
-    /// artifacts are indexed only while their corresponding ledger entries
-    /// remain intact; keeping those lookups here prevents a credentialed miss
-    /// from scanning the complete record while blocking audit appends.
-    evaluations: Mutex<EvaluationIndex>,
+    // Admission, appending, and reclamation share one mutation boundary.
+    state: Mutex<State>,
+    limits: Limits,
 }
 
 #[derive(Debug, Default)]
@@ -668,7 +679,7 @@ struct EvaluationIndex {
     issued_ids: HashSet<String>,
     evaluated_decisions: HashSet<String>,
     readable_decisions: HashMap<String, ReadableDecision>,
-    readable_artifacts: HashMap<String, Entry>,
+    readable_artifacts: HashMap<String, Arc<Entry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -682,41 +693,31 @@ struct ReadableDecision {
     access_class: AccessClass,
 }
 
-/// What this record has written, in order.
-///
-/// One digest per entry, kept for the life of the record. A digest is the
-/// entry: recomputing it is how an intact entry is checked, and after retention
-/// there is nothing left to recompute — so the commitment has to have been kept
-/// somewhere retention does not reach, or a sealed entry's own digest is
-/// whatever the last writer left there. Two adjacent sealed entries could
-/// otherwise be changed together, one's digest and the next one's link, and
-/// every later entry and the head would still agree.
-///
-/// The cost is thirty-two bytes an entry, against the argument vectors and
-/// command output that retention exists to shed. Keeping proof is cheap;
-/// keeping content is not.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Independent commitments for the retained window and its retired prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Issued {
-    digests: Vec<Digest>,
+    digests: VecDeque<Digest>,
+    retired: u64,
+    total: u64,
+    checkpoint: Digest,
 }
 
 impl Issued {
     fn entries(&self) -> u64 {
-        u64::try_from(self.digests.len()).unwrap_or(u64::MAX)
+        self.total
     }
 }
 
 impl<C: Clock> Ledger<C> {
     #[must_use]
     pub fn new(clock: C) -> Self {
+        let genesis = Digest::genesis();
         Self {
             clock,
             records_to: None,
-            genesis: Digest::genesis(),
-            entries: Mutex::new(Vec::new()),
-            issued: Mutex::new(Issued::default()),
-            completed: Mutex::new(HashSet::new()),
-            evaluations: Mutex::new(EvaluationIndex::default()),
+            state: Mutex::new(State::new(genesis.clone())),
+            genesis,
+            limits: Limits::default(),
         }
     }
 
@@ -753,14 +754,10 @@ impl<C: Clock> Ledger<C> {
         let recorded_agent_intent = agent_intent.as_str().to_owned();
         let purpose = session.purpose.as_str().to_owned();
         let access_class = session.access_class;
-        // The evaluation index is held before the ledger so retention and an
-        // evaluator cannot observe the decision in only one of the two. This
-        // is the same lock order used by evaluation append and sealing.
-        let mut evaluations = self.evaluations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let attribution = Attribution::of(session);
-        let entry = self.append_to(
-            &mut entries,
+        let written = self.append_to(
+            &mut state,
             attribution.clone(),
             Event::Decided {
                 operation: decision.action().kind(),
@@ -776,35 +773,46 @@ impl<C: Clock> Ledger<C> {
                 policies: decision.policies().to_vec(),
             },
         )?;
-        evaluations.readable_decisions.insert(
-            entry.digest.as_str().to_owned(),
-            ReadableDecision {
-                operation: decision.action().kind(),
-                sequence: entry.sequence,
-                attribution,
-                argv,
-                agent_intent: recorded_agent_intent,
-                purpose,
-                access_class,
-            },
-        );
+        let entry = written.entry;
+        if matches!(state.get(entry.sequence), Some(Held::Intact(_))) {
+            state.evaluations.readable_decisions.insert(
+                entry.digest.as_str().to_owned(),
+                ReadableDecision {
+                    operation: decision.action().kind(),
+                    sequence: entry.sequence,
+                    attribution,
+                    argv,
+                    agent_intent: recorded_agent_intent,
+                    purpose,
+                    access_class,
+                },
+            );
+        }
 
         // A refusal is recorded and authorizes nothing. Minting a receipt for
         // one would make the record of the refusal into permission to run the
         // command it refused.
-        let receipt = (decision.verdict() == Verdict::Permit).then(|| Receipt {
-            authorization: Authorization {
-                sequence: entry.sequence,
-                digest: entry.digest.clone(),
-                who: Attribution::of(decision.session()),
-            },
-            action: decision.action().clone(),
-        });
+        let receipt = if decision.verdict() == Verdict::Permit {
+            Some(Receipt {
+                authorization: Authorization {
+                    sequence: entry.sequence,
+                    digest: entry.digest.clone(),
+                    who: Attribution::of(decision.session()),
+                    proof: written.proof.clone().ok_or(AuditError::NotItsDecision {
+                        sequence: entry.sequence,
+                    })?,
+                },
+                action: decision.action().clone(),
+            })
+        } else {
+            None
+        };
         Ok(Intended {
             entry,
             decision,
             agent_intent,
             receipt,
+            _proof: written.proof,
         })
     }
 
@@ -867,7 +875,7 @@ impl<C: Clock> Ledger<C> {
                 Some(agreement.as_str().to_owned()),
             ),
         };
-        let entry = self.append(
+        let written = self.append_written(
             Attribution::of(session),
             Event::Approved {
                 decided,
@@ -879,6 +887,7 @@ impl<C: Clock> Ledger<C> {
                 agreement,
             },
         )?;
+        let entry = written.entry;
         // The grant is spent here: it was taken by value, it does not copy, and
         // the caller no longer has one. Minting a second receipt from the same
         // agreement would need a second agreement.
@@ -889,6 +898,9 @@ impl<C: Clock> Ledger<C> {
                     sequence: entry.sequence,
                     digest: entry.digest.clone(),
                     who: Attribution::of(session),
+                    proof: written.proof.ok_or(AuditError::NotItsDecision {
+                        sequence: entry.sequence,
+                    })?,
                 },
                 action: decision.action().clone(),
             },
@@ -915,10 +927,13 @@ impl<C: Clock> Ledger<C> {
         digest: &str,
         session: &SessionId,
     ) -> Result<(), AuditError> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let held = usize::try_from(decided)
-            .ok()
-            .and_then(|index| entries.get(index))
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let pinned = state
+            .active_proof(decided)
+            .map(|proof| Held::Intact(Arc::clone(&proof.entry)));
+        let held = state
+            .get(decided)
+            .or(pinned.as_ref())
             .ok_or(AuditError::NoSuchDecision { sequence: decided })?;
         if held.digest().as_str() != digest {
             return Err(AuditError::NotItsApproval { sequence: decided });
@@ -1021,17 +1036,16 @@ impl<C: Clock> Ledger<C> {
                 run: outcome.run().as_str().to_owned(),
             });
         }
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
-        if completed.contains(outcome.run().as_str()) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let authorized = outcome.authorization();
+        this_records_decision(&state, authorized)?;
+        if authorized.proof.completed.load(Ordering::Relaxed) {
             return Err(AuditError::AlreadyCompleted {
                 run: outcome.run().as_str().to_owned(),
             });
         }
-        let authorized = outcome.authorization();
-        this_records_decision(&entries, authorized)?;
         let written = self.append_to(
-            &mut entries,
+            &mut state,
             authorized.who.clone(),
             Event::Completed {
                 run: outcome.run().clone(),
@@ -1042,9 +1056,9 @@ impl<C: Clock> Ledger<C> {
                 file: outcome.file().cloned(),
             },
         )?;
-        completed.insert(outcome.run().as_str().to_owned());
+        authorized.proof.completed.store(true, Ordering::Relaxed);
         Ok(Accounted {
-            entry: written,
+            entry: (*written.entry).clone(),
             outcome,
         })
     }
@@ -1054,14 +1068,15 @@ impl<C: Clock> Ledger<C> {
     /// One decision accepts one artifact. The same evaluator retry is
     /// idempotent while its entry is readable; reusing that identifier for
     /// different content, using another identifier for the same decision, or
-    /// retrying after retention has sealed its content is refused. The issued
-    /// identifier, evaluated-decision, and entry locks span the lookup and
-    /// append, so concurrent submissions cannot both claim either name.
+    /// retrying after retention has sealed its content is refused. The
+    /// ledger lock spans identifier lookup and append, so concurrent
+    /// submissions cannot both claim either name.
     pub fn record_evaluation(&self, artifact: EvaluationArtifact) -> Result<Entry, AuditError> {
         let id = artifact.evaluation_id().to_owned();
         let decision_digest = artifact.decision_digest().to_owned();
-        let mut evaluations = self.evaluations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.reclaim(self.clock.now(), self.limits)?;
+        let evaluations = &state.evaluations;
         if evaluations.issued_ids.contains(&id) {
             if let Some(entry) = evaluations.readable_artifacts.get(&id)
                 && let Event::Evaluated {
@@ -1069,7 +1084,7 @@ impl<C: Clock> Ledger<C> {
                 } = &entry.event
                 && existing == &artifact
             {
-                return Ok(entry.clone());
+                return Ok((**entry).clone());
             }
             return Err(AuditError::EvaluationConflict { id });
         }
@@ -1078,13 +1093,20 @@ impl<C: Clock> Ledger<C> {
                 digest: decision_digest,
             });
         }
-        let Some(decision) = evaluations.readable_decisions.get(&decision_digest) else {
+        if evaluations.issued_ids.len() >= self.limits.evaluation_ids {
+            return Err(AuditError::EvaluationFull);
+        }
+        let Some(decision) = evaluations
+            .readable_decisions
+            .get(&decision_digest)
+            .cloned()
+        else {
             return Err(AuditError::EvaluationDecisionUnknown {
                 digest: artifact.decision_digest().to_owned(),
             });
         };
-        let entry = self.append_to(
-            &mut entries,
+        let written = self.append_to(
+            &mut state,
             decision.attribution.clone(),
             Event::Evaluated {
                 operation: decision.operation,
@@ -1096,10 +1118,17 @@ impl<C: Clock> Ledger<C> {
                 access_class: decision.access_class,
             },
         )?;
+        let entry = written.entry;
+        let readable = matches!(state.get(entry.sequence), Some(Held::Intact(_)));
+        let evaluations = &mut state.evaluations;
         evaluations.issued_ids.insert(id.clone());
         evaluations.evaluated_decisions.insert(decision_digest);
-        evaluations.readable_artifacts.insert(id, entry.clone());
-        Ok(entry)
+        if readable {
+            evaluations
+                .readable_artifacts
+                .insert(id, Arc::clone(&entry));
+        }
+        Ok((*entry).clone())
     }
 
     pub fn record_session_opened(&self, session: &Session) -> Result<Entry, AuditError> {
@@ -1117,23 +1146,36 @@ impl<C: Clock> Ledger<C> {
     }
 
     fn append(&self, who: Attribution, event: Event) -> Result<Entry, AuditError> {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        self.append_to(&mut entries, who, event)
+        self.append_written(who, event)
+            .map(|written| (*written.entry).clone())
+    }
+
+    fn append_written(&self, who: Attribution, event: Event) -> Result<Written, AuditError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.append_to(&mut state, who, event)
     }
 
     /// Appends to a record already being held, so a caller that had to look
     /// before writing can do both without letting go in between.
     fn append_to(
         &self,
-        entries: &mut Vec<Held>,
+        state: &mut State,
         who: Attribution,
         event: Event,
-    ) -> Result<Entry, AuditError> {
+    ) -> Result<Written, AuditError> {
         let at = self.clock.now();
-        let sequence = u64::try_from(entries.len()).map_err(|_| AuditError::Full)?;
-        let previous = entries
-            .last()
-            .map_or_else(|| self.genesis.clone(), |held| held.digest().clone());
+        let sequence = state.issued.total;
+        let previous = state.entries.back().map_or_else(
+            || state.issued.checkpoint.clone(),
+            |held| held.digest().clone(),
+        );
+        let pin = matches!(
+            &event,
+            Event::Decided {
+                verdict: Verdict::Permit | Verdict::NeedsApproval,
+                ..
+            } | Event::Approved { .. }
+        );
 
         let mut entry = Entry {
             sequence,
@@ -1147,6 +1189,7 @@ impl<C: Clock> Ledger<C> {
             digest: self.genesis.clone(),
         };
         entry.digest = digest_of(&entry)?;
+        let prepared = state.prepare(at, self.limits, &entry, pin)?;
         // Before the chain, not after. An entry that could not cross the
         // configured recording boundary is not one anything may run on, and
         // the way to mean that is for it never to become part of the record at
@@ -1157,20 +1200,16 @@ impl<C: Clock> Ledger<C> {
                 .wrote(&entry)
                 .map_err(|_| AuditError::NotRecorded)?;
         }
-        entries.push(Held::Intact(Arc::new(entry.clone())));
-        {
-            let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
-            issued.digests.push(entry.digest.clone());
-        }
-        Ok(entry)
+        state.commit(entry, prepared, pin)
     }
 
     /// Entries still readable, oldest first.
     #[must_use]
     pub fn entries(&self) -> Vec<Entry> {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .iter()
             .filter_map(|held| match held {
                 Held::Intact(entry) => Some((**entry).clone()),
@@ -1187,9 +1226,10 @@ impl<C: Clock> Ledger<C> {
     /// while the recording boundary remains the complete durable history.
     #[must_use]
     pub fn recent_entries(&self, limit: usize) -> Vec<Arc<Entry>> {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .iter()
             .rev()
             .filter_map(|held| match held {
@@ -1202,10 +1242,8 @@ impl<C: Clock> Ledger<C> {
 
     /// Removes the content of everything before `sequence`, keeping the links.
     ///
-    /// This is what retention looks like on a chain: the bytes go, the proof
-    /// stays. Deleting outright would break verification of everything that
-    /// came after, which would mean choosing between keeping records forever
-    /// and being able to trust them.
+    /// Within the retained window, content goes while its issued commitment
+    /// stays. The window can later retire old links into its checkpoint.
     ///
     /// One kind of entry is left alone: one whose content no longer matches its
     /// own digest. Sealing it would copy the digest of the entry it used to be
@@ -1215,42 +1253,36 @@ impl<C: Clock> Ledger<C> {
     /// Nothing else is exempt, including a decision whose command has not
     /// finished. That costs nothing, because an authorization carries what it
     /// permitted and who for, so a completion arriving after its decision has
-    /// been retired is still attributable and still checkable against the
-    /// sealed entry's digest.
+    /// been retired is still attributable through its retained active proof.
     pub fn seal_before(&self, sequence: u64) {
-        let mut evaluations = self.evaluations.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        for held in entries.iter_mut() {
-            if held.sequence() < sequence
-                && let Held::Intact(entry) = held
-                && digest_of(entry).is_ok_and(|recomputed| recomputed == entry.digest)
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for index in 0..state.entries.len() {
+            if state
+                .entries
+                .get(index)
+                .is_some_and(|held| held.sequence() < sequence)
             {
-                *held = Held::Sealed {
-                    sequence: entry.sequence,
-                    previous: entry.previous.clone(),
-                    digest: entry.digest.clone(),
-                };
+                // Altered evidence must remain available for verification.
+                // Manual sealing keeps its existing best-effort contract.
+                let _ = state.seal(index);
             }
         }
-        let remains_readable = |entry_sequence: u64| {
-            usize::try_from(entry_sequence)
-                .ok()
-                .and_then(|index| entries.get(index))
-                .is_some_and(|held| matches!(held, Held::Intact(_)))
-        };
-        evaluations
-            .readable_decisions
-            .retain(|_, decision| remains_readable(decision.sequence));
-        evaluations
-            .readable_artifacts
-            .retain(|_, entry| remains_readable(entry.sequence));
+        state.prune_indexes();
     }
 
-    /// Checks the chain end to end.
+    /// Expire idle readable content through the same accounting used on append.
+    pub fn reclaim(&self) -> Result<(), AuditError> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reclaim(self.clock.now(), self.limits)
+    }
+
+    /// Checks the retained chain end to end and reports its retired prefix.
     ///
     /// Verifies over sealed entries as well as intact ones, and says how many
-    /// could no longer be read — a verification that quietly passed over a gap
-    /// would be worth less than none.
+    /// could no longer be read. Content and individual links before the
+    /// checkpoint are unavailable, not reverified historical evidence.
     pub fn verify(&self) -> Result<Verified, Broken> {
         self.verify_window(None)
     }
@@ -1267,17 +1299,23 @@ impl<C: Clock> Ledger<C> {
     }
 
     fn verify_window(&self, limit: Option<usize>) -> Result<Verified, Broken> {
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = &state.entries;
+        let issued = &state.issued;
         let start = limit.map_or(0, |limit| entries.len().saturating_sub(limit));
         let mut expected_previous = start
             .checked_sub(1)
             .and_then(|before| entries.get(before))
-            .map_or_else(|| self.genesis.clone(), |before| before.digest().clone());
+            .map_or_else(
+                || issued.checkpoint.clone(),
+                |before| before.digest().clone(),
+            );
         let mut sealed = 0_usize;
 
         for (index, held) in entries.iter().enumerate().skip(start) {
-            let position = u64::try_from(index).unwrap_or(u64::MAX);
+            let position = issued
+                .retired
+                .saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
             if held.sequence() != position {
                 return Err(Broken::OutOfOrder {
                     at: position,
@@ -1314,17 +1352,23 @@ impl<C: Clock> Ledger<C> {
 
         // What is present, against what was written. A chain cannot notice its
         // own missing tail: every remaining link is still correct.
-        let present = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        let present = issued
+            .retired
+            .saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
         if present != issued.entries() {
             return Err(Broken::EntriesMissing {
                 issued: issued.entries(),
                 present,
             });
         }
+        if entries.back().map(Held::digest) != issued.digests.back() {
+            return Err(Broken::HeadMismatch);
+        }
 
         Ok(Verified {
             entries: entries.len().saturating_sub(start),
             sealed,
+            retired: issued.retired,
         })
     }
 }
@@ -1342,16 +1386,24 @@ impl<C: Clock> Ledger<C> {
 /// entry that is not its own.
 #[derive(Debug)]
 pub struct Intended {
-    entry: Entry,
+    entry: Arc<Entry>,
     decision: Decision,
     agent_intent: CommandIntent,
     receipt: Option<Receipt>,
+    // Keeps a pending approval's source evidence resolvable after reclamation.
+    _proof: Option<Arc<Proof>>,
 }
 
 impl Intended {
+    pub(crate) fn decision_proof(&self) -> Option<DecisionProof> {
+        self._proof.as_ref().map(|proof| DecisionProof {
+            _proof: Arc::clone(proof),
+        })
+    }
+
     /// The entry this deliberation was recorded as.
     #[must_use]
-    pub const fn deliberation(&self) -> &Entry {
+    pub fn deliberation(&self) -> &Entry {
         &self.entry
     }
 
@@ -1395,6 +1447,8 @@ pub struct Verified {
     pub entries: usize,
     /// How many entries verified but can no longer be read.
     pub sealed: usize,
+    /// Earlier entries summarized by the retained window's checkpoint.
+    pub retired: u64,
 }
 
 /// Shapes that mean the text is credential material.
@@ -1444,12 +1498,20 @@ pub(crate) fn secret_shape(text: &str) -> Option<&'static str> {
 /// all that is needed: the digest commits to the whole entry, so matching it is
 /// proof of which decision this was. What the entry said is not read here,
 /// because the authorization already carries it.
-fn this_records_decision(entries: &[Held], authorized: &Authorization) -> Result<(), AuditError> {
+fn this_records_decision(state: &State, authorized: &Authorization) -> Result<(), AuditError> {
     let sequence = authorized.sequence();
-    let held = usize::try_from(sequence)
-        .ok()
-        .and_then(|index| entries.get(index))
-        .ok_or(AuditError::NoSuchDecision { sequence })?;
+    let proof = state.active_proof(sequence).ok_or_else(|| {
+        if state.get(sequence).is_some() {
+            AuditError::NotItsDecision { sequence }
+        } else {
+            AuditError::NoSuchDecision { sequence }
+        }
+    })?;
+    if !Arc::ptr_eq(&proof, &authorized.proof) || proof.entry.digest != *authorized.digest() {
+        return Err(AuditError::NotItsDecision { sequence });
+    }
+    let pinned = Held::Intact(Arc::clone(&proof.entry));
+    let held = state.get(sequence).unwrap_or(&pinned);
     if held.digest() != authorized.digest() {
         return Err(AuditError::NotItsDecision { sequence });
     }
@@ -1531,6 +1593,10 @@ pub enum AuditError {
     Unserializable { detail: String },
     #[error("the record is full")]
     Full,
+    #[error("retained audit evidence cannot safely be reclaimed")]
+    RetentionCorrupt,
+    #[error("the process has reached its evaluation identifier capacity")]
+    EvaluationFull,
     #[error("entry {sequence} is not a decision that was held for a human")]
     NotHeldForApproval { sequence: u64 },
     #[error("the agreement recorded at entry {sequence} was given for another command")]
@@ -1575,6 +1641,8 @@ pub enum Broken {
     clippy::indexing_slicing
 )]
 mod tests {
+    mod retention;
+
     use super::*;
     use crate::clock::TestClock;
     use crate::policy::Engine;
@@ -2352,7 +2420,8 @@ mod tests {
         // Reach past the API, as anyone rewriting retained records would, and
         // keep the chain self-consistent while doing it.
         {
-            let mut entries = ledger.entries.lock().unwrap();
+            let mut state = ledger.state.lock().unwrap();
+            let entries = &mut state.entries;
             let forged = Digest("f".repeat(64));
             if let Held::Sealed { digest, .. } = &mut entries[1] {
                 *digest = forged.clone();
@@ -2464,8 +2533,8 @@ mod tests {
 
         // Reach past the API, as anyone dropping records would.
         {
-            let mut entries = ledger.entries.lock().unwrap();
-            entries.pop();
+            let mut state = ledger.state.lock().unwrap();
+            state.entries.pop_back();
         }
         assert!(
             matches!(ledger.verify(), Err(Broken::EntriesMissing { .. })),
@@ -2519,7 +2588,8 @@ mod tests {
 
         // Reach past the API, as anyone tampering with stored records would.
         {
-            let mut entries = ledger.entries.lock().unwrap();
+            let mut state = ledger.state.lock().unwrap();
+            let entries = &mut state.entries;
             if let Held::Intact(entry) = &mut entries[1] {
                 Arc::make_mut(entry).event = Event::SessionClosed;
             }
@@ -2537,7 +2607,8 @@ mod tests {
             recorded_run(&ledger, &session, &["docker", "ps"]);
         }
         {
-            let mut entries = ledger.entries.lock().unwrap();
+            let mut state = ledger.state.lock().unwrap();
+            let entries = &mut state.entries;
             entries.remove(1);
         }
         assert!(
@@ -2558,7 +2629,8 @@ mod tests {
             recorded_run(&ledger, &session, &["docker", "ps"]);
         }
         {
-            let mut entries = ledger.entries.lock().unwrap();
+            let mut state = ledger.state.lock().unwrap();
+            let entries = &mut state.entries;
             if let Held::Intact(entry) = &mut entries[0] {
                 Arc::make_mut(entry).event = Event::SessionClosed;
             }
