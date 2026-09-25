@@ -126,6 +126,15 @@ interruption can leave a remote upload partial; replacement is not an atomic
 remote transaction. An unknown result must be investigated before repeating an
 upload. The service never automatically replays a mutation.
 
+Downloads keep at most eight read chunks of up to 64 KiB in flight or awaiting
+delivery, a 512 KiB read-ahead budget independent of file size. Negotiated peer
+limits can reduce chunk size. Responses are validated and delivered in offset
+order, including short reads; a slow consumer stops further requests once that
+window is occupied. Protocol framing and SSH have separate bounded buffers.
+Upload acknowledgement pipelining is unchanged.
+See [local performance measurements](performance.md) for repeatable scheduling,
+backpressure, and polling fixtures.
+
 Completed command output is returned inline only when it is small valid UTF-8
 and not recognized as sensitive. Binary, sensitive, or larger output uses file
 references. The retained stream bytes are preserved exactly; the result still
@@ -139,7 +148,8 @@ Do not repeat a consequential command solely to recover unavailable output.
 These references are temporary delivery, not durable artifact storage.
 
 Transfer failures return `transfer_failed` with a bounded cause such as
-`not_found`, `too_large`, or `publication_unavailable`. The same cause remains
+`not_found`, `too_large`, `publication_unavailable`, or `worker_stopped` for an
+unexpectedly terminated transfer worker. The same cause remains
 available when polling. `remote_write_may_be_partial` distinguishes a failed
 download from an upload whose target may already have changed; investigate
 such writes before retrying. Raw storage and SFTP error text is not returned.
