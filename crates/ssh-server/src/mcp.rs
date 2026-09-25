@@ -13,7 +13,7 @@
 //! [`dispatch`](crate::tools::dispatch) takes an [`AuthenticatedPrincipal`], which only
 //! this crate can construct after admission.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, CustomRequest, CustomResult, Extensions, Implementation,
@@ -80,11 +80,12 @@ pub struct SshMcp<C: Clock, S: CredentialSource> {
     dashboard: Option<Url>,
     launch_principal: Option<AuthenticatedPrincipal>,
     transfers: Option<Arc<crate::transfer::Transfers>>,
+    catalog: Arc<OnceLock<ListToolsResult>>,
 }
 
 impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         bastion: Arc<Bastion<C, S>>,
         notifier: Arc<dyn Notifier>,
         dashboard: Option<Url>,
@@ -95,6 +96,7 @@ impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
             dashboard,
             launch_principal: None,
             transfers: None,
+            catalog: Arc::new(OnceLock::new()),
         }
     }
 
@@ -109,7 +111,16 @@ impl<C: Clock, S: CredentialSource> SshMcp<C, S> {
         transfers: Option<Arc<crate::transfer::Transfers>>,
     ) -> Self {
         self.transfers = transfers;
+        // A configured handler and its request clones share one catalog. A
+        // differently configured handler must not inherit an initialized one.
+        self.catalog = Arc::new(OnceLock::new());
         self
+    }
+
+    fn catalog(&self) -> ListToolsResult {
+        self.catalog
+            .get_or_init(|| tools::catalog_with_files(self.transfers.as_deref()))
+            .clone()
     }
 
     fn principal<'a>(
@@ -131,6 +142,7 @@ impl<C: Clock, S: CredentialSource> Clone for SshMcp<C, S> {
             dashboard: self.dashboard.clone(),
             launch_principal: self.launch_principal.clone(),
             transfers: self.transfers.clone(),
+            catalog: Arc::clone(&self.catalog),
         }
     }
 }
@@ -152,7 +164,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> ServerHandler for SshMcp
         // gateway did not vouch for would tell something that should not have
         // reached this service what it could try next.
         self.principal(&context.extensions)?;
-        Ok(tools::catalog_with_files(self.transfers.as_deref()))
+        Ok(self.catalog())
     }
 
     async fn on_custom_request(
@@ -344,6 +356,9 @@ mod tests {
                 .unwrap(),
             )));
         let (client, server) = tokio::io::duplex(65536);
+        let observer = handler.clone();
+        let commands_only = handler.clone().with_transfers(None);
+        assert_eq!(commands_only.catalog().tools.len(), 5);
         let task = tokio::spawn(async move {
             handler
                 .serve(server)
@@ -369,6 +384,10 @@ mod tests {
                 false,
             ),
             (
+                serde_json::json!({"jsonrpc":"2.0", "id":6, "method":"tools/list", "params":{}}),
+                false,
+            ),
+            (
                 serde_json::json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"ssh_hosts", "arguments":{}}}),
                 false,
             ),
@@ -391,6 +410,29 @@ mod tests {
             let response: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(response.get("id").unwrap(), request.get("id").unwrap());
             assert_eq!(response.get("error").is_some(), expect_error);
+            if request.get("method").and_then(serde_json::Value::as_str) == Some("tools/list") {
+                assert_eq!(
+                    response
+                        .pointer("/result/tools")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    7
+                );
+                let cached = observer
+                    .catalog
+                    .get()
+                    .expect("discovery initialized the shared catalog");
+                let returned = observer.clone().catalog();
+                for (held, returned) in cached.tools.iter().zip(&returned.tools) {
+                    assert!(Arc::ptr_eq(&held.input_schema, &returned.input_schema));
+                    assert!(Arc::ptr_eq(
+                        held.output_schema.as_ref().unwrap(),
+                        returned.output_schema.as_ref().unwrap()
+                    ));
+                }
+            }
             if request.get("id").and_then(serde_json::Value::as_u64) == Some(1) {
                 writer
                     .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
@@ -404,5 +446,36 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let reconfigured = observer.clone().with_transfers(Some(Arc::new(
+            crate::transfer::Transfers::configured(
+                Arc::new(ssh_core::clock::TestClock::at(0)),
+                "https://ssh.example",
+                crate::transfer::TransferSettings {
+                    max_bytes: 8,
+                    ..crate::transfer::TransferSettings::default()
+                },
+            )
+            .unwrap(),
+        )));
+        let original = serde_json::to_value(observer.catalog()).unwrap();
+        let changed = serde_json::to_value(reconfigured.catalog()).unwrap();
+        let maximum = |catalog: &serde_json::Value| {
+            catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "ssh_upload")
+                .unwrap()
+                .pointer("/inputSchema/properties/source/x-mcp-file/maxSize")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(maximum(&changed), 8);
+        assert_eq!(
+            maximum(&original),
+            crate::transfer::TransferSettings::default().max_bytes
+        );
+        assert_eq!(observer.with_transfers(None).catalog().tools.len(), 5);
     }
 }

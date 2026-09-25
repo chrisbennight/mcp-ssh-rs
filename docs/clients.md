@@ -66,6 +66,17 @@ command only collects a request created by its own `request` command.
 
 ## Compatibility limits and troubleshooting
 
+Tool definitions are cached for the service's configured file mechanism and
+limits. They include concise input and output descriptions. Results retain both
+text and structured forms for client compatibility; a client that uses structured
+results should pass one representation to its model rather than duplicate both.
+Catalog JSON size is not a model token count: measure the actual client input
+with that client's tokenizer before claiming token savings.
+
+For a local measurement of the generated catalog, run
+`cargo run --locked --example catalog_size`. It reports JSON bytes for command-only
+and HTTP-file configurations without contacting an SSH target or model.
+
 The supplied [Python tutorial client](../examples/quickstart/demo.py) and the
 Inspector CLI flow above cover discovery, command review, and result collection.
 Inspector's web UI, other client versions, stdio client configurations, and
