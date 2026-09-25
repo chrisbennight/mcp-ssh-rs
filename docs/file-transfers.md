@@ -33,7 +33,8 @@ The adapter uses the same upstream protocol as Waygate:
 - The client sends bytes using the descriptor's separate credential header.
   Uploads become available only after complete size and digest validation.
 - The caller passes the returned URI as `ssh_upload.source`. Its network tool
-  schema marks that string with `x-mcp-file` and upload-only transfer mode.
+  schema marks that string with `x-mcp-file` and upload-only transfer mode,
+  and advertises the configured maximum transfer size.
 - `files/authorizeDownload` resolves an owned reference to a `FileValue` and
   HTTP `GET` descriptor. The descriptor includes exact size and digest metadata.
 

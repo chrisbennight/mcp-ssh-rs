@@ -237,6 +237,11 @@ impl Transfers {
         self.local.is_some()
     }
 
+    /// The validated byte ceiling shared by transfer admission and discovery.
+    pub const fn max_bytes(&self) -> u64 {
+        self.settings.max_bytes
+    }
+
     async fn reserve(
         &self,
         owner: &PrincipalId,

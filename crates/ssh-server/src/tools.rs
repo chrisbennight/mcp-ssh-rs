@@ -1,7 +1,7 @@
 //! The tools an agent can call, and what calling them means.
 //!
-//! Five, and no more than five: name the hosts you could reach, open a session,
-//! run something, ask again about something slow, and give the session back.
+//! Discover hosts, open a session, execute, poll, and close the session.
+//! Configuring a byte channel also enables binary downloads and uploads.
 //! Typed per-operation tools were considered and deferred — until real traffic
 //! says which operations matter, a larger surface is a guess with maintenance
 //! attached.
@@ -18,8 +18,8 @@
 //! Policy declining a command is an ordinary answer and comes back as one, with
 //! the reason. An MCP error means the service could not reach a decision — a
 //! host that will not answer, a record that could not be written. An agent
-//! should retry the second and never the first, and collapsing them would make
-//! that impossible to tell.
+//! must inspect the outcome before retrying; a failed response does not prove
+//! that a remote effect did not happen.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -163,6 +163,7 @@ pub struct SessionOpened {
 /// wrong one.
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(tag = "kept", rename_all = "snake_case")]
+#[schemars(description = "Retained output, a file reference, or an explicit delivery status.")]
 pub enum StreamOut {
     Reference {
         file: crate::transfer::Reference,
@@ -185,6 +186,9 @@ pub enum StreamOut {
     ///
     /// Asking again will not produce it. Whatever the command was reaching for
     /// is not something this service hands to a caller.
+    #[schemars(
+        description = "Sensitive output withheld from inline delivery; repeating the command will not recover it."
+    )]
     Withheld {
         bytes: u64,
         matched: String,
@@ -197,6 +201,7 @@ pub enum StreamOut {
     /// the lines before it have already been handed over. Bytes given to an
     /// agent cannot be taken back, so none are given until the stream is
     /// complete and what it is has been settled.
+    #[schemars(description = "Bytes produced so far. Output is released only after completion.")]
     Pending {
         bytes: u64,
     },
@@ -244,6 +249,9 @@ pub enum ExecResult {
     ///
     /// Only a command the target took and finished with is reported this way,
     /// so `ran` can be read as meaning what it says.
+    #[schemars(
+        description = "Finished. Inspect exit: zero means success; null means no exit status was reported."
+    )]
     Ran {
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<crate::transfer::Reference>,
@@ -263,6 +271,9 @@ pub enum ExecResult {
     ///
     /// Output is not released while a command is going: what a stream is cannot
     /// be decided from part of it.
+    #[schemars(
+        description = "Poll this run with ssh_poll. Do not repeat execution; output is not yet released."
+    )]
     StillRunning {
         run: String,
         stdout: StreamOut,
@@ -274,6 +285,7 @@ pub enum ExecResult {
     /// Distinct from `ran` because a caller told a command completed will not
     /// think to send it again, and distinct from `refused` because policy
     /// permitted this one — the target declined it.
+    #[schemars(description = "The target explicitly declined to start the operation; nothing ran.")]
     NotStarted { run: String, why: String },
     /// Nobody said whether it ran.
     ///
@@ -284,6 +296,9 @@ pub enum ExecResult {
     /// ask a human, before repeating anything that is not safe to do twice.
     /// This is reported rather than guessed at because both guesses are wrong
     /// in ways a caller cannot see.
+    #[schemars(
+        description = "Execution is uncertain. Investigate the target or ask a human before repeating a consequential operation."
+    )]
     Unknown { run: String, why: String },
     /// Transfer failed with a bounded cause; uncertain remote writes must not be replayed.
     TransferFailed {
@@ -297,9 +312,15 @@ pub enum ExecResult {
     /// There is nothing to poll: no run was started. Ask again with the same
     /// command once a human has decided — that is how the answer is found, and
     /// asking again does not queue a second request for them to wade through.
+    #[schemars(
+        description = "Waiting for human review; no run exists. Present decide_at when available, then resubmit the unchanged operation and intent to collect the decision."
+    )]
     AwaitingApproval {
         /// Names the request a human will answer, for anyone tracking it. It is
         /// not needed to collect the answer: sending the command again is.
+        #[schemars(
+            description = "Approval request identifier; collect by resubmitting the unchanged operation."
+        )]
         request: String,
         why: String,
         /// Where a person decides, when this deployment has named its approval
@@ -310,6 +331,9 @@ pub enum ExecResult {
         /// named; the request still waits, and a person with access still
         /// sees it.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(
+            description = "Optional authenticated human-review page. Give this URL to the operator."
+        )]
         decide_at: Option<String>,
     },
     /// A person agreed, their agreement expired before this collected it, and
@@ -320,6 +344,9 @@ pub enum ExecResult {
     /// to the person you act for rather than quietly asking them again — they
     /// have no other way to learn that what they allowed never happened, and
     /// the second question looks identical to the first.
+    #[schemars(
+        description = "Approval expired before collection; nothing ran. Tell the operator and collect the new request as for awaiting_approval."
+    )]
     ApprovalLapsed {
         request: String,
         why: String,
@@ -390,19 +417,10 @@ pub fn catalog() -> ListToolsResult {
             ),
             tool::<ExecArgs, ExecResult>(
                 EXEC,
-                "Run a command in a session. The command is an argument vector, \
-                 not a shell line. Include what this command is intended to \
-                 accomplish; that explanation is shown and recorded as \
-                 agent-supplied evidence, not trusted user intent. Every command \
-                 is authorized individually: it may run, may be refused, or may \
-                 need a human to approve it - and a held answer names the page \
-                 where a person decides, when this deployment has one, so you \
-                 can tell the person you act for. Send the exact same command \
-                 and intent again to collect their answer, and keep asking while \
-                 it waits: an agreement nobody collects in time lapses, and the \
-                 answer then says whose it was so you can tell them it did not \
-                 happen. A command that outlives its wait returns a run \
-                 identifier to poll.",
+                "Execute an argument vector in the session account with agent-supplied intent. \
+                 For awaiting_approval, present decide_at and resubmit the unchanged command and \
+                 intent to collect the decision. For still_running, use ssh_poll. Inspect exit \
+                 after completion; investigate unknown outcomes before repeating execution.",
                 ToolAnnotations::new()
                     .read_only(false)
                     .destructive(true)
@@ -522,7 +540,6 @@ pub struct UploadArgs {
     /// Absolute destination path on the SSH target.
     pub path: String,
     /// File URI uploaded outside model context. Inline content is not accepted.
-    #[schemars(extend("x-mcp-file" = {"transferModes": ["upload"], "maxSize": 16777216}))]
     pub source: String,
     /// Explicitly permit replacement of an existing file. Interrupted writes may be partial.
     pub overwrite: bool,
@@ -540,7 +557,7 @@ pub fn catalog_with_files(files: Option<&crate::transfer::Transfers>) -> ListToo
             ToolAnnotations::new().read_only(false).destructive(true).idempotent(false).open_world(true),
         ));
     }
-    if files.is_some_and(crate::transfer::Transfers::is_local) {
+    if let Some(files) = files {
         for tool in &mut catalog.tools {
             if tool.name == "ssh_upload"
                 && let Some(source) = Arc::make_mut(&mut tool.input_schema)
@@ -548,13 +565,22 @@ pub fn catalog_with_files(files: Option<&crate::transfer::Transfers>) -> ListToo
                     .and_then(|properties| properties.get_mut("source"))
                     .and_then(serde_json::Value::as_object_mut)
             {
-                source.remove("x-mcp-file");
-                source.insert(
-                    "description".to_owned(),
-                    serde_json::json!(
-                        "file:// URI within the launcher's configured shared directory"
-                    ),
-                );
+                if files.is_local() {
+                    source.insert(
+                        "description".to_owned(),
+                        serde_json::json!(
+                            "file:// URI within the launcher's configured shared directory"
+                        ),
+                    );
+                } else {
+                    source.insert(
+                        "x-mcp-file".to_owned(),
+                        serde_json::json!({
+                            "transferModes": ["upload"],
+                            "maxSize": files.max_bytes(),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -1758,6 +1784,108 @@ mod tests {
                 .as_ref()
                 .is_some_and(|said| said.contains("once")),
             "the description does not say the result is delivered once"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertised_upload_limits_match_admission() {
+        use crate::transfer::{TransferSettings, Transfers, UploadParams};
+        let principal = ssh_core::PrincipalId::parse("caller").unwrap();
+        for limit in [
+            8,
+            123_456_789,
+            TransferSettings::default().max_bytes,
+            3_000_000_000,
+        ] {
+            let store = Transfers::configured(
+                Arc::new(ssh_core::clock::TestClock::at(0)),
+                "https://ssh.example",
+                TransferSettings {
+                    max_bytes: limit,
+                    ..TransferSettings::default()
+                },
+            )
+            .unwrap();
+            let catalog = catalog_with_files(Some(&store));
+            let upload = catalog
+                .tools
+                .iter()
+                .find(|tool| tool.name == "ssh_upload")
+                .unwrap();
+            let schema = serde_json::to_value(&upload.input_schema).unwrap();
+            assert_eq!(
+                schema.pointer("/properties/source/x-mcp-file/maxSize"),
+                Some(&serde_json::json!(limit))
+            );
+            let params = |size| {
+                serde_json::from_value::<UploadParams>(serde_json::json!({"size": size})).unwrap()
+            };
+            assert!(
+                store
+                    .authorize_upload(&principal, params(limit))
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                store
+                    .authorize_upload(&principal, params(limit + 1))
+                    .await
+                    .is_err()
+            );
+        }
+        let root = std::env::temp_dir().join(format!("ssh-catalog-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let local = Transfers::local(Arc::new(ssh_core::clock::TestClock::at(0)), &root).unwrap();
+        let catalog = catalog_with_files(Some(&local));
+        let upload = catalog
+            .tools
+            .iter()
+            .find(|tool| tool.name == "ssh_upload")
+            .unwrap();
+        let schema = serde_json::to_value(&upload.input_schema).unwrap();
+        assert!(schema.pointer("/properties/source/x-mcp-file").is_none());
+        assert!(
+            schema
+                .pointer("/properties/source/description")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("file://")
+        );
+        drop(local);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_has_a_bounded_description_budget_and_preserves_result_formats() {
+        let files = crate::transfer::Transfers::new(
+            Arc::new(ssh_core::clock::TestClock::at(0)),
+            "https://ssh.example",
+        )
+        .unwrap();
+        // Count the complete wire catalog, including both schema directions.
+        // This budget prevents long internal explanations from returning to
+        // every model-facing result definition.
+        assert!(
+            serde_json::to_vec(&catalog_with_files(Some(&files)))
+                .unwrap()
+                .len()
+                < 32_000
+        );
+        let result = ok(&ExecResult::Unknown {
+            run: "retained-run".to_owned(),
+            why: "Investigate before repeating".to_owned(),
+        })
+        .unwrap();
+        let wire = serde_json::to_value(result).unwrap();
+        let text = wire.pointer("/content/0/text").unwrap().as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text).unwrap(),
+            *wire.get("structuredContent").unwrap()
+        );
+        assert_eq!(
+            wire.pointer("/structuredContent/outcome").unwrap(),
+            "unknown"
         );
     }
 
