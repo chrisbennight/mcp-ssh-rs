@@ -106,6 +106,9 @@ Active approval and execution proofs have separate limits of 1024 proofs and
 write. Existing executions can still record completion; releasing their run or
 pending approval releases the associated proof. Cancelled, unused receipts do
 not keep capacity occupied. Admission and reclamation use the same ledger lock.
+If approval recording encounters capacity or sink failure, its human answer
+remains available for retry within the original expiry; execution still requires
+successful recording.
 
 Evaluation identifiers and evaluated-decision indexes retain at most 65536
 entries for the process lifetime. Further new evaluations receive HTTP 503;

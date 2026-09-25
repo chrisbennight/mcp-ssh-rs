@@ -384,15 +384,15 @@ impl Grant {
 /// answered rather than asked about again, which is what stops an agent from
 /// putting the same request in front of people until one of them agrees.
 #[derive(Debug)]
-pub enum Standing {
-    /// Somebody has already agreed, and here is the agreement, spent.
+pub enum Standing<R = Grant> {
+    /// Somebody has already agreed, and the agreement was consumed successfully.
     ///
     /// Asking and collecting an answer are the same act — an agent retries the
     /// command — so they are one operation on the store. Two operations would
     /// leave a window in which an answer arriving between them looks like
     /// neither a waiting request nor an agreement, and the retry would queue a
     /// second request for a command somebody has already decided.
-    Ready(Box<Grant>),
+    Ready(Box<R>),
     /// Waiting on a person — and whether this call is what created the
     /// request, because asking is idempotent and telling a human is not.
     Waiting(Box<Ask>),
@@ -584,8 +584,19 @@ impl<C: Clock> Approvals<C> {
     /// agent that retries — which is how it discovers the answer — must not
     /// create a queue of identical requests for a human to wade through.
     pub fn ask(&self, held: &Intended) -> Result<Standing, ApprovalError> {
+        self.ask_with(held, Ok)
+    }
+
+    /// Consume an existing approval only after its recording step succeeds.
+    /// The callback runs under the request lock and must not retain a grant or
+    /// issue a receipt when returning an error.
+    pub(crate) fn ask_with<R, E: From<ApprovalError>>(
+        &self,
+        held: &Intended,
+        consume: impl FnOnce(Grant) -> Result<R, E>,
+    ) -> Result<Standing<R>, E> {
         if held.decision().verdict() != Verdict::NeedsApproval {
-            return Err(ApprovalError::NotHeld);
+            return Err(ApprovalError::NotHeld.into());
         }
         let session = held.decision().session();
         let command = held.decision().command();
@@ -644,17 +655,20 @@ impl<C: Clock> Approvals<C> {
             .map(|(id, _)| id.clone());
         if let Some(id) = agreed
             && let Some(held) = requests.get_mut(&id)
-            && let State::Approved { by, .. } = std::mem::replace(&mut held.state, State::Redeemed)
+            && let State::Approved { by, .. } = &held.state
         {
-            return Ok(Standing::Ready(Box::new(Grant {
-                _proof: held.proof.take(),
+            let ready = consume(Grant {
+                _proof: held.proof.clone(),
                 request: RequestId(id),
                 session: held.asked.session.clone(),
-                approver: by,
+                approver: by.clone(),
                 action: held.action.clone(),
                 decided: held.asked.decided,
                 decided_digest: held.asked.decided_digest.clone(),
-            })));
+            })?;
+            held.state = State::Redeemed;
+            held.proof = None;
+            return Ok(Standing::Ready(Box::new(ready)));
         }
 
         // A standing refusal is the answer, not an invitation to ask again.
@@ -710,7 +724,7 @@ impl<C: Clock> Approvals<C> {
             .filter(|held| held.asked.session == session.id && matches!(held.state, State::Waiting))
             .count();
         if waiting >= self.waiting_per_session {
-            return Err(ApprovalError::TooManyWaiting);
+            return Err(ApprovalError::TooManyWaiting.into());
         }
 
         let asked = Asked {
@@ -849,6 +863,19 @@ impl<C: Clock> Approvals<C> {
         action: &Action,
         agent_intent: &CommandIntent,
     ) -> Result<Grant, ApprovalError> {
+        self.redeem_action_with(id, principal, action, agent_intent, Ok)
+    }
+
+    /// Record and consume under the same lock, retaining approval on failure.
+    /// The callback has the same no-effect-on-error contract as `ask_with`.
+    pub(crate) fn redeem_action_with<R, E: From<ApprovalError>>(
+        &self,
+        id: &RequestId,
+        principal: &PrincipalId,
+        action: &Action,
+        agent_intent: &CommandIntent,
+        consume: impl FnOnce(Grant) -> Result<R, E>,
+    ) -> Result<R, E> {
         let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         let held = requests
@@ -858,12 +885,12 @@ impl<C: Clock> Approvals<C> {
         // The principal is checked first and answers as if the request did not
         // exist, so one caller cannot probe for another's pending approvals.
         if &held.asked.principal != principal {
-            return Err(ApprovalError::Unknown);
+            return Err(ApprovalError::Unknown.into());
         }
         match &held.state {
-            State::Waiting => return Err(ApprovalError::StillWaiting),
-            State::Refused { .. } => return Err(ApprovalError::Refused),
-            State::Redeemed => return Err(ApprovalError::AlreadyRedeemed),
+            State::Waiting => return Err(ApprovalError::StillWaiting.into()),
+            State::Refused { .. } => return Err(ApprovalError::Refused.into()),
+            State::Redeemed => return Err(ApprovalError::AlreadyRedeemed.into()),
             State::Approved {
                 recorded: false, ..
             } => {
@@ -871,31 +898,34 @@ impl<C: Clock> Approvals<C> {
                     request = id.as_str(),
                     "an agreement was asked for before its answer was recorded; withheld"
                 );
-                return Err(ApprovalError::Unrecorded);
+                return Err(ApprovalError::Unrecorded.into());
             }
             State::Approved { .. } => {}
         }
         if now >= held.redeem_by {
-            return Err(ApprovalError::Lapsed);
+            return Err(ApprovalError::Lapsed.into());
         }
         // The approval names one action. Anything else is a different decision
         // than the one that was made.
         if held.action != digest_action(action, agent_intent) {
-            return Err(ApprovalError::DifferentAction);
+            return Err(ApprovalError::DifferentAction.into());
         }
 
-        let State::Approved { by, .. } = std::mem::replace(&mut held.state, State::Redeemed) else {
-            return Err(ApprovalError::AlreadyRedeemed);
+        let State::Approved { by, .. } = &held.state else {
+            return Err(ApprovalError::AlreadyRedeemed.into());
         };
-        Ok(Grant {
-            _proof: held.proof.take(),
+        let ready = consume(Grant {
+            _proof: held.proof.clone(),
             request: id.clone(),
             session: held.asked.session.clone(),
-            approver: by,
+            approver: by.clone(),
             action: held.action.clone(),
             decided: held.asked.decided,
             decided_digest: held.asked.decided_digest.clone(),
-        })
+        })?;
+        held.state = State::Redeemed;
+        held.proof = None;
+        Ok(ready)
     }
 
     /// Marks an agreement's answer as accepted by the recording boundary.

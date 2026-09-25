@@ -316,6 +316,149 @@ fn proof_byte_exhaustion_refuses_new_authority_before_writing() {
 }
 
 #[test]
+fn failed_approval_recording_preserves_the_same_human_answer_for_retry() {
+    use crate::approval::{Approvals, RequestId, Standing, Windows};
+    use crate::mediate::MediationError;
+
+    struct Sink(AtomicBool);
+    impl Records for Sink {
+        fn wrote(&self, _: &Entry) -> Result<(), NotRecorded> {
+            if self.0.load(Ordering::Relaxed) {
+                Err(NotRecorded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn collect(
+        ledger: &Ledger<TestClock>,
+        approvals: &Approvals<TestClock>,
+        intended: &Intended,
+        request: &RequestId,
+        explicit: bool,
+    ) -> Result<(Receipt, Approver), MediationError> {
+        let record = |grant| Ok(ledger.record_approval(intended, grant)?);
+        if explicit {
+            approvals.redeem_action_with(
+                request,
+                &intended.decision().session().principal,
+                intended.decision().action(),
+                intended.agent_intent(),
+                record,
+            )
+        } else {
+            let Standing::Ready(recorded) = approvals.ask_with(intended, record)? else {
+                panic!("the existing human answer must remain collectable");
+            };
+            Ok(*recorded)
+        }
+    }
+
+    for explicit in [false, true] {
+        for failure in ["count", "bytes", "sink"] {
+            let mut ledger = bounded_ledger();
+            let sink = Arc::new(Sink(AtomicBool::new(false)));
+            ledger.records_to = Some(sink.clone());
+            let session = session_that_can_be_asked_about();
+            let intended = ledger
+                .record_intent(
+                    Engine::new(crate::policy::ReviewMode::Privileged)
+                        .decide(&session, command(&["true"])),
+                    intent(),
+                )
+                .unwrap();
+            let approvals = Approvals::new(
+                TestClock::at(0),
+                Windows {
+                    decide_within: 1000,
+                    redeem_within: 1000,
+                },
+                8,
+            );
+            let Standing::Waiting(asked) = approvals.ask(&intended).unwrap() else {
+                panic!("new work must wait for approval");
+            };
+            let id = asked.asked().id.clone();
+            drop(intended);
+            let answer = approvals
+                .decide(
+                    &id,
+                    Approver::Human {
+                        who: "fixture".into(),
+                    },
+                    true,
+                    |_| true,
+                )
+                .unwrap();
+            ledger.record_answer(&answer).unwrap();
+            assert!(approvals.mark_recorded(&id));
+            drop(answer);
+            let blocker = recorded_run(&ledger, &super::session(), &["echo", &"x".repeat(2048)]);
+            let retry = ledger
+                .record_intent(
+                    Engine::new(crate::policy::ReviewMode::Privileged)
+                        .decide(&session, command(&["true"])),
+                    intent(),
+                )
+                .unwrap();
+            match failure {
+                "count" => ledger.limits.active_proofs = 3,
+                "bytes" => {
+                    ledger.limits.proof_bytes = ledger
+                        .state
+                        .lock()
+                        .unwrap()
+                        .proofs
+                        .values()
+                        .filter_map(Weak::upgrade)
+                        .map(|proof| proof.bytes)
+                        .sum();
+                }
+                _ => sink.0.store(true, Ordering::Relaxed),
+            }
+            assert!(matches!(
+                collect(&ledger, &approvals, &retry, &id, explicit),
+                Err(MediationError::Audit(
+                    AuditError::Full | AuditError::NotRecorded
+                ))
+            ));
+            assert!(
+                !ledger
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry.event, Event::Approved { .. }))
+            );
+            drop(blocker);
+            sink.0.store(false, Ordering::Relaxed);
+            let (receipt, _) = collect(&ledger, &approvals, &retry, &id, explicit).unwrap();
+            assert_eq!(
+                approvals.redeem_action(
+                    &id,
+                    &session.principal,
+                    retry.decision().action(),
+                    retry.agent_intent()
+                ),
+                Err(crate::approval::ApprovalError::AlreadyRedeemed)
+            );
+            let entries = ledger.entries();
+            let approved: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match &entry.event {
+                    Event::Approved { request, .. } => Some(request),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(approved, vec![id.as_str()]);
+            ledger
+                .record_outcome(outcome_for(&receipt, "complete"))
+                .unwrap();
+            assert!(ledger.verify().is_ok());
+        }
+    }
+}
+
+#[test]
 #[ignore = "audit retention memory measurement; run explicitly with --nocapture"]
 fn retention_memory_benchmark() {
     use std::io::Write as _;

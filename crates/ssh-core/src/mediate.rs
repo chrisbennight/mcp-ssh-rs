@@ -414,14 +414,18 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                 }
             }
             Verdict::NeedsApproval => {
-                let standing = self.approvals.ask(&intended)?;
+                let standing =
+                    self.approvals
+                        .ask_with(&intended, |grant| -> Result<_, MediationError> {
+                            Ok(self.ledger.record_approval(&intended, grant)?)
+                        })?;
                 let lapsed_from = match &standing {
                     Standing::Lapsed { by, .. } => Some(by.clone()),
                     _ => None,
                 };
                 match standing {
-                    Standing::Ready(grant) => {
-                        let (receipt, approver) = self.ledger.record_approval(&intended, *grant)?;
+                    Standing::Ready(recorded) => {
+                        let (receipt, approver) = *recorded;
                         let (decision, _) = intended.into_parts();
                         Admission::Ready {
                             decision,
@@ -433,21 +437,23 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                         let request = asked.asked().id.clone();
                         // Selection, recording, and redemption remain serialized
                         // with withdrawal of the session agreement.
-                        let grant = self.approvals.use_standing(
+                        let recorded = self.approvals.use_standing(
                             &session.id,
                             |standing| -> Result<_, MediationError> {
                                 self.apply_answer(&request, standing, true)?;
-                                Ok(self.approvals.redeem_action(
+                                self.approvals.redeem_action_with(
                                     &request,
                                     principal,
                                     &action,
                                     intended.agent_intent(),
-                                )?)
+                                    |grant| -> Result<_, MediationError> {
+                                        Ok(self.ledger.record_approval(&intended, grant)?)
+                                    },
+                                )
                             },
                         );
-                        if let Some(grant) = grant {
-                            let (receipt, approver) =
-                                self.ledger.record_approval(&intended, grant?)?;
+                        if let Some(recorded) = recorded {
+                            let (receipt, approver) = recorded?;
                             let (decision, _) = intended.into_parts();
                             Admission::Ready {
                                 decision,
@@ -1504,6 +1510,94 @@ mod tests {
                 .all(|old| !readable.iter().any(|entry| entry.sequence == old.sequence))
         );
         assert!(bastion.verify_audit().unwrap().sealed > 0);
+    }
+
+    #[tokio::test]
+    async fn approval_capacity_failure_does_not_require_another_human_answer() {
+        for standing in [false, true] {
+            let bastion = bastion_with(Arc::new(TestClock::at(1000)), Limits::default()).await;
+            let session = session_for(&bastion, AccessClass::Privileged).await;
+            let command = argv(&["sh", "-c", "true"]);
+            if standing {
+                bastion.approvals.grant_standing(
+                    &session.id,
+                    "fixture".into(),
+                    60_000,
+                    StandingCoverage::Session,
+                );
+            } else {
+                let Executed::AwaitingApproval { asked, .. } = bastion
+                    .exec(&alice(), &session.id, command.clone())
+                    .await
+                    .unwrap()
+                else {
+                    panic!("new work must wait for approval");
+                };
+                bastion
+                    .decide(
+                        &asked.asked().id,
+                        Approver::Human {
+                            who: "fixture".into(),
+                        },
+                        true,
+                    )
+                    .unwrap();
+            }
+            let mut blockers = Vec::new();
+            loop {
+                let decision = bastion
+                    .engine
+                    .decide(&session, Command::new(argv(&["true"])).unwrap());
+                match bastion
+                    .ledger
+                    .record_intent(decision, CommandIntent::parse("capacity fixture").unwrap())
+                {
+                    Ok(intended) => blockers.push(intended),
+                    Err(AuditError::Full) => break,
+                    Err(error) => panic!("unexpected admission failure: {error}"),
+                }
+                assert!(
+                    blockers.len() < 2048,
+                    "proof admission must have a bounded limit"
+                );
+            }
+            drop(blockers.pop());
+            assert!(matches!(
+                bastion.exec(&alice(), &session.id, command.clone()).await,
+                Err(MediationError::Audit(AuditError::Full))
+            ));
+            assert!(bastion.outstanding_runs().is_empty());
+            let answers_before = bastion
+                .ledger
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry.event, Event::Answered { .. }))
+                .count();
+            assert_eq!(answers_before, 1);
+            drop(blockers);
+            assert!(matches!(
+                bastion.exec(&alice(), &session.id, command).await.unwrap(),
+                Executed::Ran {
+                    approved_by: Some(_),
+                    ..
+                }
+            ));
+            let entries = bastion.ledger.entries();
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(entry.event, Event::Answered { .. }))
+                    .count(),
+                answers_before
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(entry.event, Event::Approved { .. }))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
