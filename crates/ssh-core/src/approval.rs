@@ -32,7 +32,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::action::{Action, ActionKind};
-use crate::audit::Intended;
+use crate::audit::{DecisionProof, Intended};
 use crate::clock::{Clock, Millis};
 use crate::command::{Command, CommandIntent};
 use crate::policy::Verdict;
@@ -244,6 +244,7 @@ pub struct Answer {
     asked: Asked,
     approver: Approver,
     agreed: bool,
+    _proof: Option<DecisionProof>,
 }
 
 impl Answer {
@@ -271,6 +272,7 @@ impl Answer {
             asked,
             approver,
             agreed,
+            _proof: None,
         }
     }
 }
@@ -282,6 +284,7 @@ impl Answer {
 /// capability, and approval authorizes an action.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Grant {
+    _proof: Option<DecisionProof>,
     request: RequestId,
     /// Whose work this agreement was given for.
     ///
@@ -370,6 +373,7 @@ impl Grant {
             action,
             decided,
             decided_digest,
+            _proof: None,
         }
     }
 }
@@ -409,6 +413,7 @@ pub enum Standing {
 /// A request in flight.
 #[derive(Clone, Debug)]
 struct Held {
+    proof: Option<DecisionProof>,
     asked: Asked,
     /// Digest of the argument vector this was asked about.
     action: String,
@@ -642,6 +647,7 @@ impl<C: Clock> Approvals<C> {
             && let State::Approved { by, .. } = std::mem::replace(&mut held.state, State::Redeemed)
         {
             return Ok(Standing::Ready(Box::new(Grant {
+                _proof: held.proof.take(),
                 request: RequestId(id),
                 session: held.asked.session.clone(),
                 approver: by,
@@ -727,6 +733,7 @@ impl<C: Clock> Approvals<C> {
         requests.insert(
             asked.id.0.clone(),
             Held {
+                proof: held.decision_proof(),
                 asked: asked.clone(),
                 action,
                 state: State::Waiting,
@@ -807,6 +814,11 @@ impl<C: Clock> Approvals<C> {
             asked: held.asked.clone(),
             approver,
             agreed,
+            _proof: if agreed {
+                held.proof.clone()
+            } else {
+                held.proof.take()
+            },
         })
     }
 
@@ -876,6 +888,7 @@ impl<C: Clock> Approvals<C> {
             return Err(ApprovalError::AlreadyRedeemed);
         };
         Ok(Grant {
+            _proof: held.proof.take(),
             request: id.clone(),
             session: held.asked.session.clone(),
             approver: by,

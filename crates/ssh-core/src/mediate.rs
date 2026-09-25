@@ -692,7 +692,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         self.ledger.recent_entries(limit)
     }
 
-    /// Verifies the complete process-local audit chain, including sealed links.
+    /// Verifies the retained process-local window and reports its retired prefix.
     pub fn verify_audit(&self) -> Result<Verified, Broken> {
         self.ledger.verify()
     }
@@ -953,6 +953,9 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
             if recorded && !self.sessions.holds(authorized.session()) {
                 self.release(&run);
             }
+        }
+        if let Err(error) = self.ledger.reclaim() {
+            tracing::error!(%error, "audit retention could not reclaim evidence");
         }
     }
 
@@ -1483,6 +1486,24 @@ mod tests {
             },
             records_to,
         )
+    }
+
+    #[tokio::test]
+    async fn service_reclamation_expires_idle_audit_content() {
+        let clock = Arc::new(TestClock::at(1_000));
+        let bastion = bastion_with(Arc::clone(&clock), Limits::default()).await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        let entries = bastion.ledger().entries();
+        assert!(entries.iter().any(|entry| entry.session == session.id));
+        clock.advance(3_600_000);
+        bastion.reclaim().await;
+        let readable = bastion.ledger().entries();
+        assert!(
+            entries
+                .iter()
+                .all(|old| !readable.iter().any(|entry| entry.sequence == old.sequence))
+        );
+        assert!(bastion.verify_audit().unwrap().sealed > 0);
     }
 
     #[tokio::test]
