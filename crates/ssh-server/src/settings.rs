@@ -554,7 +554,7 @@ pub fn bounds() -> Bounds {
         },
         // Enough for an agent working several hosts at once; far short of what
         // it takes to exhaust the service by opening sessions.
-        sessions_per_principal: 8,
+        sessions_per_principal: 32,
         run: Limits::default(),
         approval: Windows {
             // Long enough that somebody who was away from the keyboard when the
@@ -1235,6 +1235,7 @@ mod tests {
     #[test]
     fn the_shipped_windows_match_the_operating_budget() {
         let bounds = bounds();
+        assert_eq!(bounds.sessions_per_principal, 32);
         assert_eq!(bounds.lifetime.idle, 24 * 60 * 60 * 1_000);
         assert_eq!(bounds.lifetime.max, 24 * 60 * 60 * 1_000);
         assert_eq!(bounds.approval.decide_within, 60 * 60 * 1_000);

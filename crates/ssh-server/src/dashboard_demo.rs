@@ -309,7 +309,7 @@ async fn commands_after_session_approval_are_present_in_history() {
     assert!(body.contains("check-25.example.test"));
     assert!(body.contains("Succeeded"));
     assert!(body.contains("Confirm end session"));
-    assert!(body.contains("8 / 8"));
+    assert!(body.contains("8 / 32"));
     assert!(body.contains("Recent activity held by this service"));
     let (_, next) = bastion
         .ledger()
@@ -387,7 +387,7 @@ async fn operator_can_recover_a_slot_without_log_service_or_agent_credentials() 
         );
     }
     let principal = PrincipalId::parse("demo-agent").unwrap();
-    assert_eq!(bastion.session_usage(&principal), (7, 8));
+    assert_eq!(bastion.session_usage(&principal), (7, 32));
     assert!(bastion.standing_approvals().is_empty());
     let replacement = bastion
         .open_session(
@@ -400,7 +400,7 @@ async fn operator_can_recover_a_slot_without_log_service_or_agent_credentials() 
         .await
         .unwrap();
     assert_ne!(replacement.id, session);
-    assert_eq!(bastion.session_usage(&principal), (8, 8));
+    assert_eq!(bastion.session_usage(&principal), (8, 32));
     let entries = bastion.ledger().entries();
     assert!(entries.iter().any(|entry| entry.session == session && entry.principal == principal && matches!(&entry.event, ssh_core::audit::Event::SessionTerminated { operator } if operator.as_str() == "demo-operator")));
     let filtered = get_html(app, "/sessions?host=demo-dns").await;
