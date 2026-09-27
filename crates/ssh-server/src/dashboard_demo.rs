@@ -192,7 +192,11 @@ async fn populated() -> (Arc<DemoBastion>, SessionId) {
         registry,
         ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged),
         DemoKey(client_key),
-        crate::settings::bounds(),
+        ssh_core::mediate::Bounds {
+            // Keep this demo's eight sessions at capacity to exercise slot recovery.
+            sessions_per_principal: 8,
+            ..crate::settings::bounds()
+        },
     ));
     let principal = PrincipalId::parse("demo-agent").unwrap();
     let session = bastion

@@ -199,7 +199,13 @@ ask its administrator before repeating a consequential operation. An expired
 or restarted session needs a new session; an approval does not survive restart.
 Default sessions have a day-long maximum and idle limit, with a short grace
 period. Pending human decisions expire after an hour. These limits currently
-come from `settings::bounds`; they are not environment settings.
+come from `settings::bounds`; these time windows are not environment settings.
+
+The session limit defaults to 32 per authenticated principal. Set
+`MCP_SSH_SESSIONS_PER_PRINCIPAL` to a positive decimal integer to override it,
+then restart the service. Zero, blank, malformed, and out-of-range values prevent
+startup. The setting applies to HTTP and stdio. Clients sharing one identity
+share its allowance; raising it increases the resources that identity can hold.
 
 ## Inspect and end sessions
 

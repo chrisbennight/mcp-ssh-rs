@@ -47,6 +47,7 @@ pub struct EvaluatorSettings {
 /// embed a credential in its path, the way webhook services commonly issue
 /// them, so only its presence is shown.
 pub struct Settings {
+    pub sessions_per_principal: usize,
     pub operator_header: axum::http::HeaderName,
     pub file_origin: Option<Url>,
     pub file_root: Option<PathBuf>,
@@ -108,6 +109,7 @@ pub struct Settings {
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
+            .field("sessions_per_principal", &self.sessions_per_principal)
             .field("registry", &self.registry)
             .field("bearers", &self.bearers)
             .field("proxy_bearers", &self.proxy_bearers)
@@ -123,6 +125,8 @@ impl std::fmt::Debug for Settings {
 }
 
 impl Settings {
+    pub const SESSIONS_PER_PRINCIPAL_VAR: &'static str = "MCP_SSH_SESSIONS_PER_PRINCIPAL";
+    pub const DEFAULT_SESSIONS_PER_PRINCIPAL: usize = 32;
     pub const AUTH_MODE_VAR: &'static str = "MCP_SSH_AUTH_MODE";
     pub const STANDALONE_BEARER_VAR: &'static str = "MCP_SSH_BEARER";
     pub const PRINCIPAL_VAR: &'static str = "MCP_SSH_PRINCIPAL";
@@ -452,6 +456,14 @@ impl Settings {
             staging: optional(&lookup, Self::STAGING_VAR)?.map_or(defaults.staging, PathBuf::from),
         };
         Ok(Self {
+            sessions_per_principal: usize::try_from(positive(
+                &lookup,
+                Self::SESSIONS_PER_PRINCIPAL_VAR,
+                Self::DEFAULT_SESSIONS_PER_PRINCIPAL as u64,
+            )?)
+            .map_err(|_| SettingsError::Unusable {
+                var: Self::SESSIONS_PER_PRINCIPAL_VAR,
+            })?,
             operator_header,
             file_root,
             transfers,
@@ -469,6 +481,15 @@ impl Settings {
             notify: optional_url(&lookup, Self::NOTIFY_VAR, &["http", "https"])?,
             trusted_hosts: list(&lookup, Self::TRUSTED_HOSTS_VAR)?,
         })
+    }
+
+    /// Effective bounds shared by HTTP and stdio serving.
+    #[must_use]
+    pub fn bounds(&self) -> Bounds {
+        let mut bounds = bounds();
+        bounds.sessions_per_principal = self.sessions_per_principal;
+        bounds.run.transfer_timeout = self.transfers.timeout;
+        bounds
     }
 }
 
@@ -514,13 +535,7 @@ fn bearer_pair(
         .map_err(|source| SettingsError::Invalid { var, source })
 }
 
-/// What the service will not exceed, until a deployment says otherwise.
-///
-/// Chosen here rather than read from the environment. Every value below is a
-/// bound on what one caller may consume, and a deployment that has not thought
-/// about them is better served by ones that were thought about than by none.
-/// They become configuration when an operator has a reason to disagree with a
-/// specific one, which is a smaller change than exposing knobs nobody has set.
+/// Default resource bounds; [`Settings::bounds`] applies deployment settings.
 #[must_use]
 pub fn bounds() -> Bounds {
     Bounds {
@@ -554,7 +569,7 @@ pub fn bounds() -> Bounds {
         },
         // Enough for an agent working several hosts at once; far short of what
         // it takes to exhaust the service by opening sessions.
-        sessions_per_principal: 8,
+        sessions_per_principal: Settings::DEFAULT_SESSIONS_PER_PRINCIPAL,
         run: Limits::default(),
         approval: Windows {
             // Long enough that somebody who was away from the keyboard when the
@@ -690,6 +705,84 @@ mod tests {
             (Settings::STANDALONE_BEARER_VAR, BEARER.to_owned()),
             (Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned()),
         ])
+    }
+
+    #[test]
+    fn session_setting_defaults_and_overrides_the_enforced_per_principal_limit() {
+        use ssh_core::session::{Purpose, SessionStore};
+        use ssh_core::{AccessClass, HostId, RoleId};
+
+        for (configured, expected) in [(None, 32), (Some("1"), 1), (Some("40"), 40)] {
+            let mut vars = standalone();
+            if let Some(value) = configured {
+                vars.insert(Settings::SESSIONS_PER_PRINCIPAL_VAR, value.to_owned());
+            }
+            let settings = Settings::from_lookup(read(&vars)).unwrap();
+            let bounds = settings.bounds();
+            assert_eq!(bounds.sessions_per_principal, expected);
+            let sessions = SessionStore::new(
+                ssh_core::clock::TestClock::at(0),
+                bounds.lifetime,
+                bounds.sessions_per_principal,
+            );
+            let open = |owner| {
+                sessions.open(
+                    PrincipalId::parse(owner).unwrap(),
+                    HostId::parse("fixture").unwrap(),
+                    RoleId::parse("user").unwrap(),
+                    Purpose::parse("test configured session allowance").unwrap(),
+                    AccessClass::ReadOnly,
+                )
+            };
+            for _ in 0..expected {
+                open("alice").unwrap();
+            }
+            assert_eq!(open("alice").unwrap_err().limit, expected);
+            open("bob").unwrap();
+        }
+    }
+
+    #[test]
+    fn session_setting_rejects_invalid_values_without_echoing_them() {
+        for value in [
+            "",
+            " ",
+            "0",
+            "-1",
+            "+1",
+            "1.5",
+            " 32",
+            "32 ",
+            "secret",
+            "18446744073709551616",
+        ] {
+            let mut vars = standalone();
+            vars.insert(Settings::SESSIONS_PER_PRINCIPAL_VAR, value.to_owned());
+            let error = Settings::from_lookup(read(&vars)).unwrap_err();
+            assert!(matches!(
+                error,
+                SettingsError::Unusable {
+                    var: Settings::SESSIONS_PER_PRINCIPAL_VAR
+                }
+            ));
+            assert_eq!(
+                error.to_string(),
+                "MCP_SSH_SESSIONS_PER_PRINCIPAL is set to something this service cannot read"
+            );
+        }
+        let vars = standalone();
+        assert!(matches!(
+            Settings::from_lookup(|var| {
+                if var == Settings::SESSIONS_PER_PRINCIPAL_VAR {
+                    Err(VarError::NotUnicode(std::ffi::OsString::new()))
+                } else {
+                    read(&vars)(var)
+                }
+            }),
+            Err(SettingsError::Unusable {
+                var: Settings::SESSIONS_PER_PRINCIPAL_VAR
+            })
+        ));
     }
 
     #[test]
