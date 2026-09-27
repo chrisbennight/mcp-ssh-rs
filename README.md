@@ -105,6 +105,10 @@ hosts, transfer files, and operate the service. The service supports standalone
 stdio or HTTP, with optional gateway integration; the guide explains the
 configuration each route needs.
 
+The dashboard lets operators inspect session activity and recover session slots.
+See [session controls](docs/operations.md#inspect-and-end-sessions) for the
+difference between ending a session and revoking its approval.
+
 [Get help or report a bug](SUPPORT.md) ·
 [Contribute](CONTRIBUTING.md) · [Report a vulnerability](SECURITY.md) ·
 [Published releases](https://github.com/chrisbennight/mcp-ssh-rs/releases) ·

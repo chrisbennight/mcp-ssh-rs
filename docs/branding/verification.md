@@ -30,6 +30,24 @@ carries the font notices under `/usr/share/doc/mcp-ssh-rs/fonts/`.
 
 ## Optional-history and long-content fixtures
 
+For an interactive session-management review without Authentik, run:
+
+```sh
+cargo test -p ssh-server serve_browser_review --locked -- --ignored --nocapture
+```
+
+Open `http://127.0.0.1:18765/dashboard/sessions`. This test-only server uses the
+real dashboard and execution core with a loopback SSH target that returns fixed
+text without executing a shell. It creates eight sessions for one demo principal,
+approves one session, and executes 26 commands. The history adapter reads the
+test ledger; it does not exercise a deployed log collector. The browser uses a
+fixed demo operator in this test only. No production authentication is changed.
+Stop the test when finished; it also stops after two hours.
+
+Inspect recent activity and its older page, expand output, revoke approval, and
+end a selected session. Check that its principal's usage drops from eight slots
+to seven. Use only this loopback demo for destructive browser checks.
+
 From the repository root, explicitly run the development fixture exporter:
 
 ```sh

@@ -201,6 +201,25 @@ Default sessions have a day-long maximum and idle limit, with a short grace
 period. Pending human decisions expire after an hour. These limits currently
 come from `settings::bounds`; they are not environment settings.
 
+## Inspect and end sessions
+
+In the dashboard, open **Sessions** and filter by host or principal. Each row
+shows current work and the principal's slot usage across all hosts. Open a row
+to inspect its command requests, outputs, approval, and expiry.
+
+**Recent activity** reads the records still held by this service, including
+commands executed after a session-wide approval. **Saved history** reads the
+configured log service. Both views page through command requests; an initial
+approval request and the client's later execution request can appear separately.
+Recent activity is limited by retention and restart. Missing saved history does
+not disable the current session's controls.
+
+To recover a slot, open **End session…**, check the target and owner, and confirm.
+The session is removed and its SSH connection is disconnected. Running commands
+may be interrupted; detached remote processes may continue. The recorded event
+names the operator who ended the session. **Revoke session approval** only changes
+approval for future commands; it does not end the session or release its slot.
+
 ## Logs and optional integrations
 
 Collect the configured JSON audit destination with appropriate access control
