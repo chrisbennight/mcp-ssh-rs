@@ -593,6 +593,11 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             validate_recorded(object.get("stderr").ok_or(())?)
         }
         "session_closed" => exact_keys(object, &["event"]),
+        "session_terminated" => {
+            exact_keys(object, &["event", "operator"])?;
+            PrincipalId::parse(required_string(object, "operator")?).map_err(|_| ())?;
+            Ok(())
+        }
         "evaluated" => {
             if object.contains_key("decided") {
                 operation_keys(

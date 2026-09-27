@@ -350,6 +350,9 @@ pub enum Event {
         file: Option<crate::action::FileIdentity>,
     },
     SessionClosed,
+    SessionTerminated {
+        operator: PrincipalId,
+    },
     /// An external, advisory assessment of a recorded decision.
     ///
     /// This entry authorizes nothing and cannot change an earlier verdict.
@@ -1145,6 +1148,19 @@ impl<C: Clock> Ledger<C> {
         self.append(Attribution::of(session), Event::SessionClosed)
     }
 
+    pub fn record_session_terminated(
+        &self,
+        session: &Session,
+        operator: &PrincipalId,
+    ) -> Result<Entry, AuditError> {
+        self.append(
+            Attribution::of(session),
+            Event::SessionTerminated {
+                operator: operator.clone(),
+            },
+        )
+    }
+
     fn append(&self, who: Attribution, event: Event) -> Result<Entry, AuditError> {
         self.append_written(who, event)
             .map(|written| (*written.entry).clone())
@@ -1238,6 +1254,90 @@ impl<C: Clock> Ledger<C> {
             })
             .take(limit)
             .collect()
+    }
+
+    /// A page of this process's session activity, with related entries joined
+    /// under the same lock. Shared entries avoid copying stored output.
+    #[must_use]
+    pub fn session_activity(
+        &self,
+        session: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> (Vec<Arc<Entry>>, Option<u64>) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entries: Vec<_> = state
+            .entries
+            .iter()
+            .rev()
+            .filter_map(|held| match held {
+                Held::Intact(entry) if &entry.session == session => Some(entry),
+                _ => None,
+            })
+            .collect();
+        let mut decisions: Vec<_> = entries
+            .iter()
+            .copied()
+            .filter(|entry| {
+                matches!(entry.event, Event::Decided { .. })
+                    && before.is_none_or(|before| entry.sequence < before)
+            })
+            .take(limit.saturating_add(1))
+            .collect();
+        let more = decisions.len() > limit;
+        decisions.truncate(limit);
+        let next = more
+            .then(|| decisions.last().map(|entry| entry.sequence))
+            .flatten();
+        let sequences: std::collections::HashSet<_> =
+            decisions.iter().map(|entry| entry.sequence).collect();
+        let digests: Vec<_> = decisions
+            .iter()
+            .map(|entry| entry.digest.as_str())
+            .collect();
+        let approvals: std::collections::HashSet<_> = entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::Approved { decided, .. } if sequences.contains(decided) => {
+                    Some(entry.sequence)
+                }
+                _ => None,
+            })
+            .collect();
+        let selected = entries
+            .into_iter()
+            .filter(|entry| {
+                sequences.contains(&entry.sequence)
+                    || match &entry.event {
+                        Event::Answered { decided, .. } | Event::Approved { decided, .. } => {
+                            sequences.contains(decided)
+                        }
+                        Event::Completed { decided, .. } => {
+                            sequences.contains(decided) || approvals.contains(decided)
+                        }
+                        Event::Evaluated { artifact, .. } => {
+                            digests.contains(&artifact.decision_digest.as_str())
+                        }
+                        _ => false,
+                    }
+            })
+            .map(Arc::clone)
+            .collect();
+        (selected, next)
+    }
+
+    #[must_use]
+    pub fn session_output(&self, session: &SessionId, run: &RunId) -> Option<Arc<Entry>> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.iter().rev().find_map(|held| match held {
+            Held::Intact(entry)
+                if &entry.session == session
+                    && matches!(&entry.event, Event::Completed { run: held, .. } if held == run) =>
+            {
+                Some(Arc::clone(entry))
+            }
+            _ => None,
+        })
     }
 
     /// Removes the content of everything before `sequence`, keeping the links.

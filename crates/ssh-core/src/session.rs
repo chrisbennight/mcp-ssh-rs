@@ -239,6 +239,7 @@ pub struct SessionSnapshot {
     pub last_used: Millis,
     pub idle_by: Millis,
     pub ends_by: Millis,
+    pub observed_at: Millis,
 }
 
 /// What a caller needs to open an equivalent session after one lapses.
@@ -427,10 +428,27 @@ impl<C: Clock> SessionStore<C> {
     /// sessions, so response memory is independent of the total principal set.
     #[must_use]
     pub fn recent_snapshots(&self, limit: usize) -> Vec<SessionSnapshot> {
+        self.filtered_snapshots(limit, None, None)
+    }
+
+    /// Filter before bounding the result so a selected host cannot disappear
+    /// behind newer sessions belonging to other hosts.
+    #[must_use]
+    pub fn filtered_snapshots(
+        &self,
+        limit: usize,
+        host: Option<&HostId>,
+        principal: Option<&PrincipalId>,
+    ) -> Vec<SessionSnapshot> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         let mut newest = Vec::with_capacity(limit.min(sessions.len()));
         for held in sessions.values() {
+            if host.is_some_and(|host| host != &held.host)
+                || principal.is_some_and(|principal| principal != &held.principal)
+            {
+                continue;
+            }
             let position = newest.partition_point(|candidate: &&Session| {
                 candidate.opened_at > held.opened_at
                     || (candidate.opened_at == held.opened_at
@@ -452,8 +470,42 @@ impl<C: Clock> SessionStore<C> {
                 last_used: held.last_used,
                 idle_by: held.last_used.saturating_add(held.lifetime.idle),
                 ends_by: held.opened_at.saturating_add(held.lifetime.max),
+                observed_at: now,
             })
             .collect()
+    }
+
+    /// Operator inspection of one exact session; does not renew its lifetime.
+    #[must_use]
+    pub fn snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.now();
+        let held = sessions.get(id.as_str())?;
+        Some(SessionSnapshot {
+            session: held.clone(),
+            status: held
+                .expiry(now)
+                .map_or(SessionStatus::Live, SessionStatus::Lapsed),
+            opened_at: held.opened_at,
+            last_used: held.last_used,
+            idle_by: held.last_used.saturating_add(held.lifetime.idle),
+            ends_by: held.opened_at.saturating_add(held.lifetime.max),
+            observed_at: now,
+        })
+    }
+
+    /// Current usable slots and the configured per-principal limit.
+    #[must_use]
+    pub fn usage(&self, principal: &PrincipalId) -> (usize, usize) {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.now();
+        (
+            sessions
+                .values()
+                .filter(|session| &session.principal == principal && session.expiry(now).is_none())
+                .count(),
+            self.per_principal,
+        )
     }
 
     /// Whether this one session can still be used.
@@ -552,6 +604,20 @@ impl<C: Clock> SessionStore<C> {
             }
             _ => Err(SessionError::Unknown),
         }
+    }
+
+    /// Record an operator's removal while the session cannot be swept or
+    /// removed by another caller. A failed record leaves the session intact.
+    pub fn remove_recorded<E: From<SessionError>>(
+        &self,
+        id: &SessionId,
+        record: impl FnOnce(&Session) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let session = sessions.get(id.as_str()).ok_or(SessionError::Unknown)?;
+        record(session)?;
+        sessions.remove(id.as_str());
+        Ok(())
     }
 
     /// Number of sessions the store is holding.

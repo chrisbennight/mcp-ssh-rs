@@ -29,13 +29,13 @@ use axum::routing::get;
 use axum::{Form, Router};
 use base64::Engine as _;
 use serde::Deserialize;
-use ssh_core::AccessClass;
 use ssh_core::approval::{AgreementId, Approver, Asked, StandingApproval, StandingCoverage};
 use ssh_core::clock::Clock;
 use ssh_core::connect::CredentialSource;
 use ssh_core::mediate::{Bastion, MediationError};
 use ssh_core::run::RunId;
-use ssh_core::session::{Expiry, SessionId, SessionStatus};
+use ssh_core::session::{Expiry, SessionId, SessionSnapshot, SessionStatus};
+use ssh_core::{AccessClass, HostId, PrincipalId};
 
 use crate::audit_history::{self, ReadsAudit};
 use crate::ingress::SharedBearer;
@@ -293,6 +293,10 @@ pub(crate) fn visible(text: &str) -> String {
     shown
 }
 
+fn visible_output(text: &str) -> String {
+    text.split('\n').map(visible).collect::<Vec<_>>().join("\n")
+}
+
 const fn access_class_name(access_class: AccessClass) -> &'static str {
     match access_class {
         AccessClass::ReadOnly => "read_only",
@@ -368,6 +372,10 @@ pub struct SessionShown {
     pub idle_by: String,
     pub ends_by: String,
     pub history_url: String,
+    pub running: usize,
+    pub waiting: usize,
+    pub slots: usize,
+    pub limit: usize,
 }
 
 pub struct InventoryShown {
@@ -375,6 +383,7 @@ pub struct InventoryShown {
     pub roles: Vec<String>,
     pub live_sessions: usize,
     pub history_url: String,
+    pub sessions_url: String,
 }
 
 pub struct AuditShown {
@@ -441,6 +450,25 @@ pub struct JourneyShown {
     pub outcome: String,
     pub outputs: Vec<OutputShown>,
     pub evaluation: Option<JourneyEvaluationShown>,
+    pub status: String,
+    pub approval: String,
+    pub when: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionsQuery {
+    host: Option<String>,
+    principal: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ActivitySource {
+    #[default]
+    Auto,
+    Current,
+    History,
 }
 
 #[derive(Default, Deserialize)]
@@ -464,6 +492,8 @@ struct PageQuery {
     before: Option<String>,
     start: Option<String>,
     end: Option<String>,
+    #[serde(default)]
+    source: ActivitySource,
 }
 
 #[derive(Default, Deserialize)]
@@ -515,6 +545,9 @@ struct OperationsPage {
     source_available: bool,
     next_url: String,
     page_size: usize,
+    current: Option<SessionShown>,
+    standing: Vec<StandingShown>,
+    current_activity: bool,
 }
 
 impl OperationsPage {
@@ -545,12 +578,24 @@ impl OperationsPage {
             source_available: true,
             next_url: String::new(),
             page_size: audit_history::PAGE_SIZE,
+            current: None,
+            standing: Vec::new(),
+            current_activity: false,
         }
     }
 }
 
-fn milliseconds(at: u64) -> String {
-    format!("{at} ms")
+fn elapsed_time(millis: u64) -> String {
+    let seconds = millis / 1_000;
+    if seconds < 60 {
+        "less than a minute".to_owned()
+    } else if seconds < 3_600 {
+        format!("{} min", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} h {} min", seconds / 3_600, seconds % 3_600 / 60)
+    } else {
+        format!("{} days", seconds / 86_400)
+    }
 }
 
 fn retained_prefix(text: &str) -> &str {
@@ -627,6 +672,10 @@ fn wire_summary(event: &serde_json::Value) -> String {
                 .map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
         ),
         "session_closed" => "Session closed".to_owned(),
+        "session_terminated" => format!(
+            "Session terminated by {}",
+            visible(wire_string(event, "operator").unwrap_or("unknown operator"))
+        ),
         "evaluated" => {
             let artifact = event.get("artifact").unwrap_or(&serde_json::Value::Null);
             format!(
@@ -671,7 +720,7 @@ fn wire_output(label: &'static str, output: &serde_json::Value) -> Option<Output
                 preview: if retained.is_empty() {
                     "(empty)".to_owned()
                 } else {
-                    visible(retained)
+                    visible_output(retained)
                 },
                 note,
                 inspect_url: String::new(),
@@ -715,7 +764,7 @@ fn wire_retained_output(label: &'static str, output: &serde_json::Value) -> Opti
         preview: if text.is_empty() {
             "(empty)".to_owned()
         } else {
-            visible(text)
+            visible_output(text)
         },
         note,
         inspect_url: String::new(),
@@ -892,6 +941,60 @@ fn wire_journeys(
             });
 
             JourneyShown {
+                status: completion.map_or_else(
+                    || {
+                        if verdict == "deny"
+                            || answer.is_some_and(|entry| {
+                                entry
+                                    .event
+                                    .get("agreed")
+                                    .and_then(serde_json::Value::as_bool)
+                                    == Some(false)
+                            })
+                        {
+                            "Refused".to_owned()
+                        } else if approval.is_some() || verdict == "permit" {
+                            "Completion not recorded".to_owned()
+                        } else if answer.is_some() {
+                            "Approval recorded".to_owned()
+                        } else {
+                            "Approval requested".to_owned()
+                        }
+                    },
+                    |entry| {
+                        let state = wire_string(&entry.event, "state").unwrap_or("Unknown outcome");
+                        match state {
+                            "exit 0" | "Exited { code: 0 }" => "Succeeded".to_owned(),
+                            "Running" => "Running".to_owned(),
+                            _ => visible(state),
+                        }
+                    },
+                ),
+                approval: approval.map_or_else(
+                    || {
+                        if verdict == "permit" {
+                            "No approval required".to_owned()
+                        } else {
+                            "No execution approval recorded".to_owned()
+                        }
+                    },
+                    |entry| {
+                        let who = visible(
+                            wire_string(&entry.event, "approver").unwrap_or("unknown operator"),
+                        );
+                        if entry
+                            .event
+                            .get("standing")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                        {
+                            format!("Session approved by {who}")
+                        } else {
+                            format!("Approved by {who}")
+                        }
+                    },
+                ),
+                when: source_time(decision.source_nanos),
                 decision: decision.sequence,
                 decision_digest: decision.digest.clone(),
                 access_class: wire_string(&decision.event, "access_class")
@@ -914,11 +1017,17 @@ fn wire_journeys(
 }
 
 fn source_time(nanos: u64) -> String {
-    format!(
-        "{}.{:03} Unix seconds",
-        nanos / 1_000_000_000,
-        (nanos % 1_000_000_000) / 1_000_000
-    )
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let at = nanos / 1_000_000;
+    if at > now {
+        format!("in {} (source clock)", elapsed_time(at.saturating_sub(now)))
+    } else {
+        format!("{} ago", elapsed_time(now.saturating_sub(at)))
+    }
 }
 
 fn audit_shown(entry: audit_history::Entry) -> AuditShown {
@@ -962,7 +1071,7 @@ fn retained_output_url(
 
 fn transcript_page_url(session: &str, before: u64, start: u64, end: u64) -> String {
     format!(
-        "/dashboard/sessions/{}?before={before}&start={start}&end={end}",
+        "/dashboard/sessions/{}?source=history&before={before}&start={start}&end={end}",
         visible(session)
     )
 }
@@ -999,7 +1108,9 @@ fn next_audit_url(filters: &Filters, before: Option<u64>, start: u64) -> String 
 
 fn next_session_url(session: &str, before: Option<u64>, start: u64, end: u64) -> String {
     before.map_or_else(String::new, |before| {
-        format!("/dashboard/sessions/{session}?before={before}&start={start}&end={end}")
+        format!(
+            "/dashboard/sessions/{session}?source=history&before={before}&start={start}&end={end}"
+        )
     })
 }
 
@@ -1178,6 +1289,10 @@ where
             get(retained_output::<C, S>),
         )
         .route("/sessions/{id}", get(session_transcript::<C, S>))
+        .route(
+            "/sessions/{id}/terminate",
+            axum::routing::post(terminate::<C, S>),
+        )
         .route("/audit", get(audit::<C, S>))
         .route("/evaluations", get(evaluations::<C, S>))
         .route("/approvals/{id}", axum::routing::post(answer::<C, S>))
@@ -1251,56 +1366,170 @@ where
                 .collect(),
             live_sessions: live_by_host.get(host.as_str()).copied().unwrap_or_default(),
             history_url: host_audit_url(host.as_str()),
+            sessions_url: format!(
+                "/dashboard/sessions?{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("host", host.as_str())
+                    .finish()
+            ),
         })
         .collect();
     let mut page = OperationsPage::new(operator.0, "Host and role inventory");
     page.inventory_active = true;
     page.inventory = inventory;
-    page.source_notice = "Live configuration view. Hosts and roles come from this process's loaded registry; listing describes configured reachability, not permission for any principal or command.".to_owned();
+    page.source_notice =
+        "Choose a host to inspect its sessions. Account permissions are configured on the target."
+            .to_owned();
     render_operations(page)
 }
 
 async fn sessions<C, S>(
     State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
+    Query(query): Query<SessionsQuery>,
 ) -> Response
 where
     C: Clock + 'static,
     S: CredentialSource,
 {
+    let host = query
+        .host
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(HostId::parse)
+        .transpose();
+    let principal = query
+        .principal
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(PrincipalId::parse)
+        .transpose();
+    let (Ok(host), Ok(principal)) = (host, principal) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            message_html("Choose a valid host or principal."),
+        )
+            .into_response();
+    };
     let sessions = bastion
-        .recent_session_snapshots(OPERATIONS_RESULT_LIMIT)
+        .session_snapshots(OPERATIONS_RESULT_LIMIT, host.as_ref(), principal.as_ref())
         .into_iter()
-        .map(|snapshot| SessionShown {
-            id: snapshot.session.id.as_str().to_owned(),
-            principal: snapshot.session.principal.as_str().to_owned(),
-            host: snapshot.session.host.as_str().to_owned(),
-            role: snapshot.session.role.as_str().to_owned(),
-            purpose: visible(snapshot.session.purpose.as_str()),
-            access_class: access_class_name(snapshot.session.access_class).to_owned(),
-            status: match snapshot.status {
-                SessionStatus::Live => "live".to_owned(),
-                SessionStatus::Lapsed(Expiry::Idle) => "lapsed · idle".to_owned(),
-                SessionStatus::Lapsed(Expiry::MaxLifetime) => {
-                    "lapsed · maximum lifetime".to_owned()
-                }
-            },
-            opened_at: milliseconds(snapshot.opened_at),
-            last_used: milliseconds(snapshot.last_used),
-            idle_by: milliseconds(snapshot.idle_by),
-            ends_by: milliseconds(snapshot.ends_by),
-            history_url: session_history_url(snapshot.session.id.as_str()),
-        })
+        .map(|snapshot| session_shown(&bastion, snapshot))
         .collect();
     let mut page = OperationsPage::new(operator.0, "Sessions");
     page.sessions_active = true;
     page.sessions = sessions;
-    page.source_notice = "Live process view. Data shown here is retained since this service restart; each session links to its separate durable fleet transcript.".to_owned();
+    page.filters.host = query.host.unwrap_or_default();
+    page.filters.principal = query.principal.unwrap_or_default();
+    page.source_notice = "Sessions held by this service. Limits apply per principal across all hosts. Open a session to inspect its work or end it.".to_owned();
     render_operations(page)
 }
 
+fn session_shown<C: Clock + 'static, S: CredentialSource>(
+    bastion: &Bastion<C, S>,
+    snapshot: SessionSnapshot,
+) -> SessionShown {
+    let session = &snapshot.session;
+    let (slots, limit) = bastion.session_usage(&session.principal);
+    SessionShown {
+        id: session.id.as_str().to_owned(),
+        principal: visible(session.principal.as_str()),
+        host: visible(session.host.as_str()),
+        role: visible(session.role.as_str()),
+        purpose: visible(session.purpose.as_str()),
+        access_class: access_class_name(session.access_class).to_owned(),
+        status: match snapshot.status {
+            SessionStatus::Live => "Open",
+            SessionStatus::Lapsed(Expiry::Idle) => "Expired (idle)",
+            SessionStatus::Lapsed(Expiry::MaxLifetime) => "Expired",
+        }
+        .to_owned(),
+        opened_at: format!(
+            "{} ago",
+            elapsed_time(snapshot.observed_at.saturating_sub(snapshot.opened_at))
+        ),
+        last_used: format!(
+            "{} ago",
+            elapsed_time(snapshot.observed_at.saturating_sub(snapshot.last_used))
+        ),
+        idle_by: elapsed_time(snapshot.idle_by.saturating_sub(snapshot.observed_at)),
+        ends_by: elapsed_time(
+            snapshot
+                .ends_by
+                .min(snapshot.idle_by)
+                .saturating_sub(snapshot.observed_at),
+        ),
+        running: bastion
+            .runs_in_flight_with_authorization()
+            .iter()
+            .filter(|(_, auth)| auth.session() == &session.id)
+            .count(),
+        waiting: bastion
+            .waiting_for_approval()
+            .iter()
+            .filter(|request| request.session == session.id)
+            .count(),
+        slots,
+        limit,
+        history_url: session_history_url(session.id.as_str()),
+    }
+}
+
+async fn terminate<C, S>(
+    State(bastion): State<Arc<Bastion<C, S>>>,
+    axum::Extension(operator): axum::Extension<Operator>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<Decision>,
+) -> Response
+where
+    C: Clock + 'static,
+    S: CredentialSource,
+{
+    if single_header(&headers, FETCH_SITE_HEADER) != Some("same-origin") {
+        return (
+            StatusCode::FORBIDDEN,
+            message_html("End sessions from this dashboard."),
+        )
+            .into_response();
+    }
+    if form.decision != "terminate" {
+        return (
+            StatusCode::BAD_REQUEST,
+            message_html("Confirm which session to end."),
+        )
+            .into_response();
+    }
+    let (Ok(session), Ok(operator)) = (SessionId::parse(&id), PrincipalId::parse(&operator.0))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            message_html("The session or operator identity is invalid."),
+        )
+            .into_response();
+    };
+    match bastion.terminate_session(&session, &operator).await {
+        Ok(()) => Redirect::to("/dashboard/sessions").into_response(),
+        Err(MediationError::Session(_)) => (
+            StatusCode::CONFLICT,
+            message_html(
+                "This session has already ended. Return to Sessions for the current list.",
+            ),
+        )
+            .into_response(),
+        Err(why) => {
+            tracing::error!(%why, session = %id, "operator session termination failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message_html("Could not end the session. Refresh its status before retrying."),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn session_transcript<C, S>(
-    State(_bastion): State<Arc<Bastion<C, S>>>,
+    State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
     axum::Extension(audit_reader): axum::Extension<Arc<dyn ReadsAudit>>,
     Path(raw_session): Path<String>,
@@ -1313,6 +1542,101 @@ where
     let Ok(session) = SessionId::parse(&raw_session) else {
         return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
+    let snapshot = bastion.session_snapshot(&session);
+    let current = snapshot.map(|snapshot| session_shown(&bastion, snapshot));
+    let mut page = OperationsPage::new(
+        operator.0,
+        current.as_ref().map_or_else(
+            || "Session history".to_owned(),
+            |session| format!("{} · {}", session.host, session.role),
+        ),
+    );
+    page.transcript_active = true;
+    page.transcript_session = session.as_str().to_owned();
+    page.current = current;
+    page.standing = bastion
+        .standing_approvals()
+        .into_iter()
+        .filter(|(agreement, _)| agreement.session == session)
+        .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
+        .collect();
+    if query.source == ActivitySource::Current
+        || (query.source == ActivitySource::Auto
+            && page.current.is_some()
+            && query.before.is_none()
+            && query.start.is_none()
+            && query.end.is_none())
+    {
+        let before = query.before.as_deref().map(str::parse::<u64>).transpose();
+        let Ok(before) = before else {
+            return (
+                StatusCode::BAD_REQUEST,
+                message_html("Invalid activity page."),
+            )
+                .into_response();
+        };
+        let (entries, next) =
+            bastion
+                .ledger()
+                .session_activity(&session, before, audit_history::PAGE_SIZE);
+        let entries: Result<Vec<_>, _> = entries.iter().map(|entry| current_entry(entry)).collect();
+        let Ok(entries) = entries else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message_html("Could not read this session's activity."),
+            )
+                .into_response();
+        };
+        page.journeys = wire_journeys(&entries, &session, 0, 0, 0);
+        let observed_at = bastion.now();
+        let running = bastion.runs_in_flight_with_authorization();
+        let waiting = bastion.waiting_for_approval();
+        for journey in &mut page.journeys {
+            if running.iter().any(|(_, authorization)| {
+                authorization.session() == &session
+                    && (authorization.sequence() == journey.decision
+                        || entries.iter().any(|entry| {
+                            entry.sequence == authorization.sequence()
+                                && wire_u64(&entry.event, "decided") == Some(journey.decision)
+                        }))
+            }) {
+                journey.status = "Running".to_owned();
+            } else if waiting
+                .iter()
+                .any(|request| request.session == session && request.decided == journey.decision)
+            {
+                journey.status = "Awaiting approval".to_owned();
+            }
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.sequence == journey.decision)
+            {
+                journey.when =
+                    format!("{} ago", elapsed_time(observed_at.saturating_sub(entry.at)));
+            }
+            for output in &mut journey.outputs {
+                if !output.inspect_url.is_empty() {
+                    output.inspect_url = output
+                        .inspect_url
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                        + "?source=current";
+                }
+            }
+        }
+        page.current_activity = true;
+        page.source_notice = "Recent activity held by this service. Earlier activity may have expired; use Saved history to search the log service.".to_owned();
+        page.verification = "Current service".to_owned();
+        page.next_url = next.map_or_else(String::new, |before| {
+            format!(
+                "/dashboard/sessions/{}?source=current&before={before}",
+                session.as_str()
+            )
+        });
+        return render_operations(page);
+    }
     let Ok(bounds) = transcript_bounds(query.before, query.start, query.end) else {
         return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
@@ -1324,10 +1648,6 @@ where
             session: session.clone(),
         })
         .await;
-    let mut page =
-        OperationsPage::new(operator.0, format!("Session {}", visible(session.as_str())));
-    page.transcript_active = true;
-    page.transcript_session = visible(session.as_str());
     match read {
         Ok(history) => {
             let page_before = bounds.before.unwrap_or(history.window_end);
@@ -1345,22 +1665,30 @@ where
                 history.window_start,
                 history.window_end,
             );
-            page.source_notice = "Durable fleet transcript. Every recorded command decision on this page—policy-permitted, approval-held, or denied—is assembled with the answers, authorization, outcomes, and evaluations the exact session contains in the deployment log store.".to_owned();
-            page.verification = "Loki available · exact session filter".to_owned();
+            page.source_notice =
+                "Saved command history, newest first. Refresh to include newly collected logs."
+                    .to_owned();
+            page.verification = "Saved history".to_owned();
         }
         Err(why) => {
             tracing::warn!(%why, session = %session.as_str(), "the durable session transcript is unavailable");
             page.source_available = false;
             page.verification_ok = false;
-            page.verification = "Durable source unavailable".to_owned();
-            page.source_notice = "Durable fleet transcript unavailable. The page does not substitute process-local data or stale success.".to_owned();
+            page.verification = "History unavailable".to_owned();
+            page.source_notice = "The log service is not configured or could not be reached. Current session controls are still available.".to_owned();
         }
     }
     render_operations(page)
 }
 
+fn current_entry(
+    entry: &ssh_core::audit::Entry,
+) -> Result<audit_history::Entry, serde_json::Error> {
+    serde_json::from_value(serde_json::to_value(entry)?)
+}
+
 async fn retained_output<C, S>(
-    State(_bastion): State<Arc<Bastion<C, S>>>,
+    State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
     axum::Extension(audit_reader): axum::Extension<Arc<dyn ReadsAudit>>,
     Path((raw_session, raw_run, raw_stream)): Path<(String, String, String)>,
@@ -1381,6 +1709,40 @@ where
         "stderr" => "stderr",
         _ => return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response(),
     };
+    if query.source == ActivitySource::Current {
+        let mut page = OperationsPage::new(operator.0, format!("Command output · {stream}"));
+        page.output_active = true;
+        page.output_run = run.as_str().to_owned();
+        page.output_back_url = format!("/dashboard/sessions/{}?source=current", session.as_str());
+        page.source_notice = "Output held by this service. The capture limit is shown below if any output was discarded.".to_owned();
+        page.verification = "Current service".to_owned();
+        match bastion
+            .ledger()
+            .session_output(&session, &run)
+            .as_deref()
+            .map(current_entry)
+            .transpose()
+        {
+            Ok(Some(entry)) => {
+                page.output = entry
+                    .event
+                    .get(stream)
+                    .and_then(|output| wire_retained_output(stream, output))
+            }
+            Ok(None) => {
+                page.verification_ok = false;
+                page.source_notice = "This output is no longer held by the service. Check Saved history for a collected copy.".to_owned();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    message_html("Could not read the command output."),
+                )
+                    .into_response();
+            }
+        }
+        return render_operations(page);
+    }
     let Ok(bounds) = transcript_bounds(query.before, query.start, query.end) else {
         return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
     };
@@ -1409,27 +1771,29 @@ where
                 .get(stream)
                 .and_then(|value| wire_retained_output(stream, value));
             if page.output.is_some() {
-                page.source_notice = "Retained command output from the exact session and run in the deployment log store. This view expands the complete retained stream; it cannot recover bytes discarded by the execution capture bound.".to_owned();
-                page.verification = "Loki available · exact session and run filter".to_owned();
+                page.source_notice =
+                    "Saved command output. Any capture limit is described below.".to_owned();
+                page.verification = "Saved history".to_owned();
             } else {
                 page.source_available = false;
                 page.verification_ok = false;
-                page.verification = "Malformed durable output".to_owned();
+                page.verification = "Unreadable output".to_owned();
                 page.source_notice =
-                    "The durable completion did not contain a readable output stream.".to_owned();
+                    "The saved command result contains no readable output.".to_owned();
             }
         }
         Ok(None) => {
             page.verification_ok = false;
-            page.verification = "No retained completion found".to_owned();
-            page.source_notice = "No completion for this exact session and run is present in the selected durable transcript window.".to_owned();
+            page.verification = "Output not found".to_owned();
+            page.source_notice =
+                "No saved output was found for this command in the selected time range.".to_owned();
         }
         Err(why) => {
             tracing::warn!(%why, session = %session.as_str(), run = %run.as_str(), stream, "retained command output is unavailable");
             page.source_available = false;
             page.verification_ok = false;
-            page.verification = "Durable source unavailable".to_owned();
-            page.source_notice = "Retained command output is unavailable. The page does not substitute process-local data or a truncated preview.".to_owned();
+            page.verification = "History unavailable".to_owned();
+            page.source_notice = "The log service could not provide this output. Try Recent activity for a copy still held by this service.".to_owned();
         }
     }
     render_operations(page)
@@ -1511,9 +1875,9 @@ where
                 (
                     entries,
                     next_audit_url(&filters, page.next_before, page.window_start),
-                    "Durable fleet view. Entries are read from the deployment log store; timestamps are the collector's wall clock.".to_owned(),
+                    "Search saved events by host, session, principal, or command text.".to_owned(),
                     true,
-                    "Loki available · entry digests shown".to_owned(),
+                    "History connected".to_owned(),
                     true,
                 )
             }
@@ -1522,9 +1886,9 @@ where
                 (
                     Vec::new(),
                     String::new(),
-                    "Durable fleet view unavailable. No historical rows are shown; the page does not substitute process-local data or stale success.".to_owned(),
+                    "The log service is not configured or could not be reached. No saved events can be shown.".to_owned(),
                     false,
-                    "Durable source unavailable".to_owned(),
+                    "History unavailable".to_owned(),
                     false,
                 )
             }
@@ -1668,7 +2032,8 @@ where
             let next_url = next_evaluations_url(&filters, page.next_before, page.window_start);
             (
                 evaluations,
-                "Durable fleet view. Evaluation artifacts are read from the deployment log store and remain advisory only.".to_owned(),
+                "External assessments of commands. These assessments do not approve execution."
+                    .to_owned(),
                 true,
                 next_url,
             )
@@ -1677,7 +2042,7 @@ where
             tracing::warn!(%why, "the durable evaluation page is unavailable");
             (
                 Vec::new(),
-                "Durable fleet view unavailable. No evaluation artifacts are shown; the page does not substitute process-local data or stale success.".to_owned(),
+                "The log service is not configured or could not be reached. No saved assessments can be shown.".to_owned(),
                 false,
                 String::new(),
             )
@@ -1906,6 +2271,10 @@ fn decision_failure(id: &ssh_core::approval::RequestId, why: &MediationError) ->
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "dashboard_demo.rs"]
+mod demo;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -2620,7 +2989,8 @@ mod tests {
         assert!(body.contains("dns1"));
         assert!(body.contains("readonly"));
         assert!(body.contains("operator"));
-        assert!(body.contains("not an authorization promise"));
+        assert!(body.contains("Account permissions are configured on the target"));
+        assert!(body.contains("/dashboard/sessions?host=dns1"));
         assert!(body.contains("/dashboard/audit?host=dns1"));
         assert!(!body.contains("mcp-ssh/dns1/readonly"));
     }
@@ -2708,7 +3078,7 @@ mod tests {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Durable fleet view."));
+        assert!(body.contains("Search saved events"));
         assert!(body.contains("systemctl"));
         assert!(body.contains(r#"value="7d" selected"#));
         assert!(body.contains(r#"value="read_only" selected"#));
@@ -3054,8 +3424,8 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         for expected in [
-            "Decision #10",
-            "Decision #20",
+            "id=\"command-10\"",
+            "id=\"command-20\"",
             "Policy decision entry #20",
             "automatic",
             "chris accepted via session standing agreement",
@@ -3065,7 +3435,8 @@ mod tests {
             "May reveal service metadata",
             "active",
             "Older commands",
-            "Inspect complete retained stdout",
+            "Open full stdout",
+            "Succeeded",
         ] {
             assert!(
                 body.contains(expected),
@@ -3095,14 +3466,14 @@ mod tests {
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Complete retained command output"));
+        assert!(body.contains("Command output"));
         assert!(
             body.contains("TAIL"),
             "the retained tail was omitted: {body}"
         );
         assert!(body.contains("target produced 9000 bytes"));
         assert!(body.contains("execution capture truncated"));
-        assert!(body.contains("exact session and run filter"));
+        assert!(body.contains("Saved history"));
     }
 
     #[test]
@@ -3135,7 +3506,7 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(controls.preview.contains("\\u{a}"));
+        assert!(controls.preview.contains("line one\n"));
         assert!(controls.preview.contains("\\u{202e}"));
 
         let withheld = wire_output(
@@ -3156,10 +3527,10 @@ mod tests {
     async fn operations_views_state_live_and_durable_source_boundaries_honestly() {
         let bastion = operations_bastion();
         for (path, expected) in [
-            ("/sessions", "No sessions are held by this process."),
+            ("/sessions", "No sessions match."),
             (
                 "/sessions/0123456789abcdef0123456789abcdef",
-                "The durable session transcript is currently unavailable.",
+                "Command history could not be loaded.",
             ),
             ("/audit", "Historical audit data is currently unavailable."),
             (
@@ -3184,10 +3555,10 @@ mod tests {
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains(expected), "{path} omitted {expected}: {body}");
             if path == "/sessions" {
-                assert!(body.contains("retained since this service restart"));
+                assert!(body.contains("Sessions held by this service"));
                 assert!(body.contains("100"), "sessions omitted its result bound");
             } else {
-                assert!(body.contains("does not substitute process-local data or stale success"));
+                assert!(body.contains("The log service is not configured or could not be reached"));
                 assert!(body.contains("20"), "{path} omitted its durable page bound");
             }
             if path == "/evaluations" {

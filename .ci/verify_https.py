@@ -290,7 +290,8 @@ def check(binary, image):
                             "Authorization": "Bearer " + configured["MCP_SSH_PROXY_BEARER_CURRENT"],
                             "x-test-operator": "operator"})
                         assert status == 200
-                        assert (b"Loki available" in body) == (case == "trusted"), (case, "audit TLS")
+                        assert (b"History connected" in body) == (case == "trusted"), (case, "audit TLS")
+                        assert (b"History unavailable" in body) == (case != "trusted"), (case, "audit TLS refusal")
                         assert not destination.requests, "outbound client followed a redirect"
                     print(f"HTTPS {case}: gateway identity, notifications, and audit checked")
 

@@ -689,6 +689,54 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         self.sessions.recent_snapshots(limit)
     }
 
+    pub fn session_snapshots(
+        &self,
+        limit: usize,
+        host: Option<&HostId>,
+        principal: Option<&PrincipalId>,
+    ) -> Vec<SessionSnapshot> {
+        self.sessions.filtered_snapshots(limit, host, principal)
+    }
+
+    pub fn session_snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
+        self.sessions.snapshot(id)
+    }
+
+    pub fn session_usage(&self, principal: &PrincipalId) -> (usize, usize) {
+        self.sessions.usage(principal)
+    }
+
+    /// Clock reading for displaying ages of process-local records.
+    pub fn now(&self) -> Millis {
+        self.clock.now()
+    }
+
+    /// Separately authenticated operator action. The adapter supplies the
+    /// operator identity; an agent cannot select it through an MCP argument.
+    pub async fn terminate_session(
+        &self,
+        id: &SessionId,
+        operator: &PrincipalId,
+    ) -> Result<(), MediationError> {
+        let connection = {
+            let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
+            self.sessions
+                .remove_recorded(id, |session| -> Result<(), MediationError> {
+                    self.ledger.record_session_terminated(session, operator)?;
+                    Ok(())
+                })?;
+            self.connections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id.as_str())
+        };
+        if let Some(connection) = connection {
+            let _ = connection.lock().await.close().await;
+        }
+        self.reclaim().await;
+        Ok(())
+    }
+
     /// A bounded newest-first window over readable audit entries.
     ///
     /// Entries share immutable storage with the ledger, so reading an
@@ -3017,6 +3065,58 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn operator_termination_requires_recording_and_releases_only_its_session() {
+        let boundary = FlakyBoundary::healthy();
+        let bastion = bastion_recording(
+            Arc::new(SystemClock::new().unwrap()),
+            Limits::default(),
+            Some(Arc::clone(&boundary) as Arc<dyn Records>),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        let other = session_for(&bastion, AccessClass::ReadOnly).await;
+        let operator = PrincipalId::parse("operator").unwrap();
+        boundary.fail_now();
+        assert!(matches!(
+            bastion.terminate_session(&session.id, &operator).await,
+            Err(MediationError::Audit(_))
+        ));
+        assert!(bastion.session_snapshot(&session.id).is_some());
+        assert_eq!(bastion.held_connections(), 2);
+        boundary.recover();
+        bastion
+            .terminate_session(&session.id, &operator)
+            .await
+            .unwrap();
+        assert!(bastion.session_snapshot(&session.id).is_none());
+        assert!(bastion.session_snapshot(&other.id).is_some());
+        assert_eq!(bastion.held_connections(), 1);
+        assert_eq!(bastion.session_usage(&alice()), (1, 8));
+        assert!(
+            bastion
+                .exec(&alice(), &session.id, argv(&["true"]))
+                .await
+                .is_err()
+        );
+        assert!(
+            bastion
+                .terminate_session(&session.id, &operator)
+                .await
+                .is_err()
+        );
+        let records = bastion.ledger().entries();
+        let terminations: Vec<_> = records
+            .iter()
+            .filter(|entry| matches!(entry.event, Event::SessionTerminated { .. }))
+            .collect();
+        assert_eq!(terminations.len(), 1);
+        assert_eq!(terminations[0].principal, alice());
+        assert!(
+            matches!(&terminations[0].event, Event::SessionTerminated { operator: who } if who == &operator)
+        );
     }
 
     /// A human's agreement is worth nothing until the record has accepted the
