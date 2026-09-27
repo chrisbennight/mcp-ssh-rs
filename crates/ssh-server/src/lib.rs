@@ -214,11 +214,7 @@ pub async fn serve(
         registry,
         Engine::new(settings.review),
         credentials,
-        {
-            let mut bounds = settings::bounds();
-            bounds.run.transfer_timeout = settings.transfers.timeout;
-            bounds
-        },
+        settings.bounds(),
         Some(Arc::new(
             crate::shipped::ToAuditOutput::to(audit).context("starting the audit writer")?,
         )),

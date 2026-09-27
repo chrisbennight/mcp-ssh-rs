@@ -106,6 +106,8 @@ stdio or HTTP, with optional gateway integration; the guide explains the
 configuration each route needs.
 
 The dashboard lets operators inspect session activity and recover session slots.
+The session limit defaults to 32 per authenticated principal and can be changed
+with `MCP_SSH_SESSIONS_PER_PRINCIPAL` before starting the service.
 See [session controls](docs/operations.md#inspect-and-end-sessions) for the
 difference between ending a session and revoking its approval.
 
