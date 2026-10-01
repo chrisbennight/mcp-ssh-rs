@@ -207,6 +207,13 @@ then restart the service. Zero, blank, malformed, and out-of-range values preven
 startup. The setting applies to HTTP and stdio. Clients sharing one identity
 share its allowance; raising it increases the resources that identity can hold.
 
+When your allowance is full, close an unused session with `ssh_close_session`
+and the session's original `session`, `host`, `role`, and `access_class`.
+The refusal reports your allowance and this recovery call. Expired sessions
+give up their slots when a new session is opened, and housekeeping disconnects
+their SSH connections. Do not close a session whose running work you need to
+preserve.
+
 ## Inspect and end sessions
 
 In the dashboard, open **Sessions** and filter by host or principal. Each row

@@ -139,7 +139,9 @@ pub enum PurposeError {
 /// sessions without limit can consume the service's memory without ever running
 /// a command.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-#[error("this principal already holds {limit} live sessions")]
+#[error(
+    "you hold {limit} of {limit} live sessions; close an unused session with ssh_close_session using its session, host, role, and access_class, or inspect Sessions in the dashboard. Closing a session may interrupt its running work"
+)]
 pub struct TooManySessions {
     pub limit: usize,
 }
@@ -1070,6 +1072,22 @@ mod tests {
         // concurrency rather than on how much work a principal may ever do.
         store.clock.advance(LIFETIME.idle);
         open(&store, "alice");
+    }
+
+    #[test]
+    fn session_exhaustion_explains_ownership_and_how_to_release_a_slot() {
+        let message = TooManySessions { limit: 8 }.to_string();
+        assert!(message.contains("you hold 8 of 8 live sessions"));
+        for field in [
+            "ssh_close_session",
+            "session",
+            "host",
+            "role",
+            "access_class",
+        ] {
+            assert!(message.contains(field), "{message}");
+        }
+        assert!(message.contains("may interrupt"));
     }
 
     /// A session is the unit a human approves, and "approve this" cannot be
