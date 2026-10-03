@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -100,21 +100,24 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: bash .ci/changed-components.sh
       - name: Build from public dependencies
-        if: steps.scope.outputs.image == 'true' && github.event_name != 'push'
+        if: steps.scope.outputs.image == 'true' && (github.event_name != 'push' || steps.scope.outputs.publish != 'true')
         run: docker build --tag mcp-ssh-ci .
       - name: Check the container
-        if: steps.scope.outputs.image == 'true' && github.event_name != 'push'
+        if: steps.scope.outputs.image == 'true' && (github.event_name != 'push' || steps.scope.outputs.publish != 'true')
         run: python3 .ci/smoke_image.py mcp-ssh-ci
       - name: Verify outbound TLS
-        if: steps.scope.outputs.tls == 'true' && github.event_name != 'push'
+        if: steps.scope.outputs.tls == 'true' && (github.event_name != 'push' || steps.scope.outputs.publish != 'true')
         run: python3 .ci/verify_https.py --image mcp-ssh-ci
       - name: Exercise the standalone Quickstart
-        if: steps.scope.outputs.quickstart == 'true' && github.event_name != 'push'
+        if: steps.scope.outputs.quickstart == 'true' && (github.event_name != 'push' || steps.scope.outputs.publish != 'true')
         run: python3 .ci/verify_quickstart.py mcp-ssh-ci
 
   publish:
     needs: [audit, test, verify-image]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.verify-image.outputs.publish == 'true'
+    concurrency:
+      group: mcp-ssh-rs-image-publication
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
