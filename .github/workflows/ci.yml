@@ -116,7 +116,7 @@ jobs:
     needs: [audit, test, verify-image]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.verify-image.outputs.publish == 'true'
     concurrency:
-      group: mcp-ssh-rs-image-publication
+      group: mcp-ssh-rs-image-publication-${{ github.ref }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -141,7 +141,38 @@ jobs:
       - name: Exercise publication candidate Quickstart
         if: needs.verify-image.outputs.quickstart == 'true'
         run: python3 .ci/verify_quickstart.py mcp-ssh-publish
+      - name: Read current main for publication
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: .ci/publication-main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck publication inputs against current main
+        id: release_scope
+        run: |
+          set -euo pipefail
+          current=true
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            qualified_root="$PWD"
+            cd .ci/publication-main
+            git cat-file -e "$GITHUB_SHA^{commit}"
+            current=false
+            if git merge-base --is-ancestor "$GITHUB_SHA" HEAD; then
+              scope_file=$(mktemp)
+              trap 'rm -f "$scope_file"' EXIT
+              GITHUB_EVENT_NAME=push BASE_SHA="$GITHUB_SHA" GITHUB_OUTPUT="$scope_file" \
+                bash "$qualified_root/.ci/changed-components.sh"
+              if grep -Fxq 'publish=false' "$scope_file"; then current=true; fi
+            fi
+          fi
+          printf 'current=%s\n' "$current" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == false ]]; then echo 'SKIP: newer main changes application inputs'; fi
+
       - name: Publish to GHCR and verify the image
+        if: (true) && steps.release_scope.outputs.current == 'true'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
