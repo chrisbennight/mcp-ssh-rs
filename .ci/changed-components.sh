@@ -4,6 +4,7 @@ rust=false
 audit=false
 python=false
 image=false
+publish=false
 tls=false
 quickstart=false
 case "${GITHUB_EVENT_NAME:?event is required}" in
@@ -13,6 +14,7 @@ case "${GITHUB_EVENT_NAME:?event is required}" in
 esac
 if [[ "$GITHUB_EVENT_NAME" == push && "${GITHUB_REF:-}" == refs/tags/* ]]; then full=true; fi
 if [[ "$full" == true ]]; then
+  publish=true
   rust=true; audit=true; python=true; image=true; tls=true; quickstart=true
 else
   [[ "${BASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || { echo 'A full base commit is required' >&2; exit 1; }
@@ -27,6 +29,7 @@ else
     case "$path" in
       .ci/changed-components.sh|.github/workflows/*) rust=true; audit=true; python=true; image=true; tls=true; quickstart=true ;;
       Cargo.toml|Cargo.lock|rust-toolchain.toml|rust-toolchain|crates/*/Cargo.toml) rust=true; audit=true; image=true; tls=true; quickstart=true ;;
+      .cargo/audit.toml) audit=true ;;
       .cargo/*) rust=true; image=true; tls=true; quickstart=true ;;
       rustfmt.toml|.rustfmt.toml|clippy.toml|.clippy.toml) rust=true ;;
       crates/*/tests/*|crates/*/benches/*|crates/*/examples/*) rust=true ;;
@@ -39,7 +42,11 @@ else
       .ci/verify_quickstart.py|examples/quickstart/*) image=true; quickstart=true; python=true ;;
       .ci/*) python=true ;;
     esac
+    case "$path" in
+      crates/*/tests/*|crates/*/benches/*|crates/*/examples/*|crates/*/*.md) ;;
+      Cargo.toml|Cargo.lock|rust-toolchain.toml|rust-toolchain|crates/*|Dockerfile|.dockerignore|LICENSE|NOTICE) publish=true ;;
+    esac
   done <"$changed_files"
 fi
-printf 'rust=%s\naudit=%s\npython=%s\nimage=%s\ntls=%s\nquickstart=%s\n' \
-  "$rust" "$audit" "$python" "$image" "$tls" "$quickstart" >>"${GITHUB_OUTPUT:?output file is required}"
+printf 'rust=%s\naudit=%s\npython=%s\nimage=%s\ntls=%s\nquickstart=%s\npublish=%s\n' \
+  "$rust" "$audit" "$python" "$image" "$tls" "$quickstart" "$publish" >>"${GITHUB_OUTPUT:?output file is required}"
