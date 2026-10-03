@@ -116,7 +116,8 @@ jobs:
     needs: [audit, test, verify-image]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.verify-image.outputs.publish == 'true'
     concurrency:
-      group: mcp-ssh-rs-image-publication-${{ github.ref }}
+      group: mcp-ssh-rs-image-publication
+      queue: max
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 40

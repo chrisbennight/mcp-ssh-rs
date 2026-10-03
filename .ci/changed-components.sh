@@ -32,7 +32,7 @@ else
       .cargo/audit.toml) audit=true ;;
       .cargo/*) rust=true; image=true; tls=true; quickstart=true ;;
       rustfmt.toml|.rustfmt.toml|clippy.toml|.clippy.toml) rust=true ;;
-      crates/ssh-core/src/files/download/tests.rs|crates/*/tests/*|crates/*/benches/*|crates/*/examples/*) rust=true ;;
+      crates/ssh-core/src/files/download/tests.rs|crates/ssh-server/src/dashboard_demo.rs|crates/*/tests/*|crates/*/benches/*|crates/*/examples/*) rust=true ;;
       crates/*/*.md) ;;
       crates/*) rust=true; image=true; tls=true; quickstart=true ;;
       Dockerfile|.dockerignore|LICENSE|NOTICE) image=true; tls=true; quickstart=true ;;
@@ -43,8 +43,8 @@ else
       .ci/*) python=true ;;
     esac
     case "$path" in
-      crates/ssh-core/src/files/download/tests.rs|crates/*/tests/*|crates/*/benches/*|crates/*/examples/*|crates/*/*.md) ;;
-      Cargo.toml|Cargo.lock|rust-toolchain.toml|rust-toolchain|crates/*|Dockerfile|.dockerignore|LICENSE|NOTICE) publish=true ;;
+      crates/ssh-core/src/files/download/tests.rs|crates/ssh-server/src/dashboard_demo.rs|crates/*/tests/*|crates/*/benches/*|crates/*/examples/*|crates/*/*.md) ;;
+      Cargo.toml|Cargo.lock|rust-toolchain.toml|rust-toolchain|.cargo/config|.cargo/config.toml|crates/*|Dockerfile|.dockerignore|LICENSE|NOTICE) publish=true ;;
     esac
   done <"$changed_files"
 fi
