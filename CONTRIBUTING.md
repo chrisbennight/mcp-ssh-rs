@@ -55,7 +55,8 @@ reproduce it locally, install the `cargo-audit` version pinned in
 or newer. This fails on yanked dependencies and known vulnerabilities except
 the version-bounded [RSA assessment](docs/dependency-security.md).
 It does not require GitHub's
-Dependabot alerts to be enabled. It runs when CI runs; it does not continuously
+Dependabot alerts to be enabled. It runs when the dependency graph or advisory checker changes, and on manual
+validation or version tags; it does not continuously
 monitor an unchanged branch or prove that dependencies have no vulnerabilities.
 
 The regular suite exercises transfers above the former in-memory ceiling with
@@ -110,10 +111,18 @@ before running it; the check refuses to reuse `.quickstart/`.
 [CI](.github/workflows/ci.yml) runs `audit`, `test`, and `verify-image` on pull requests
 and pushes to `main` or version tags (`v*`), using GitHub-hosted runners and public dependencies.
 A release tag must equal `v` followed by the workspace package version.
+
+Checks select their actual changed inputs. Rust tests do not build an image;
+Markdown skips Rust and image steps. Runtime or packaging changes select the
+image checks. The TLS and Quickstart scripts select their respective native
+checks. Manual runs and version tags select all checks; unavailable Git history
+fails selection. Existing check names remain required even when their costly
+steps are skipped. Image work waits for source and dependency checks.
 The Dockerfile's optional crate mirror is not required by CI.
 
-After all checks pass on a push to `main` or a matching version tag, `publish` builds and checks its own
-image, then pushes `ghcr.io/chrisbennight/mcp-ssh-rs:sha-<full-commit-sha>`.
+On a push with image inputs, `verify-image` selects the checks and `publish`
+builds one candidate after source and advisory checks pass. It runs the selected
+health, TLS and Quickstart checks against that same candidate before pushing `ghcr.io/chrisbennight/mcp-ssh-rs:sha-<full-commit-sha>`.
 Only that job receives package-write permission. It uses the workflow's
 `GITHUB_TOKEN`; no Infisical credentials or deployment webhook are needed.
 It reads the image back from GHCR and checks its image ID. Use the reported
