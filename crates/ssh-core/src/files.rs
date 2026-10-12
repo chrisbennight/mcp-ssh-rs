@@ -965,7 +965,11 @@ mod tests {
     /// An upload source is released only by a write that reached the target,
     /// and by the transfer itself: a caller that stopped waiting does not keep
     /// it held. A failed write keeps the source for an investigated retry.
-    #[tokio::test]
+    ///
+    /// The release also follows the reported outcome. A release still running
+    /// when the deadline passes must not leave a success reported as a
+    /// timeout, which promises the source is still there for a retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_a_successful_upload_releases_its_source() {
         use crate::audit::Ledger;
         use crate::clock::TestClock;
@@ -997,12 +1001,18 @@ mod tests {
         .unwrap();
         let ledger = Ledger::new(TestClock::at(1000));
         // No wait at all, so the call hands back a transfer that is still going.
+        let deadline = Duration::from_secs(1);
         let runs = Runs::new(Limits {
             wait: Duration::ZERO,
+            transfer_timeout: deadline,
             ..Limits::default()
         });
         let bytes = b"placed bytes";
-        for (remote, succeeds) in [("/placed", true), ("/missing/placed", false)] {
+        for (remote, succeeds, releasing) in [
+            ("/placed", true, Duration::ZERO),
+            ("/missing/placed", false, Duration::ZERO),
+            ("/slowly-released", true, deadline.saturating_mul(2)),
+        ] {
             let released = Arc::new(AtomicUsize::new(0));
             // The test supplies the bytes, so the transfer cannot finish first.
             let (mut sender, reader) = tokio::io::duplex(64);
@@ -1013,6 +1023,9 @@ mod tests {
             .released_on_success({
                 let released = Arc::clone(&released);
                 move || {
+                    // Blocks without stalling the runtime, so the deadline
+                    // can pass while the release is still running.
+                    tokio::task::block_in_place(|| std::thread::sleep(releasing));
                     released.fetch_add(1, Ordering::SeqCst);
                 }
             });

@@ -40,7 +40,7 @@ impl PreparedUpload {
         self
     }
 
-    /// Ends an upload whose remote write succeeded.
+    /// Ends an upload whose remote write succeeded and will be reported so.
     ///
     /// The reader is closed before the release runs, so the source is no
     /// longer in use by this upload when it is freed.

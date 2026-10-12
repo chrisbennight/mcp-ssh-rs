@@ -580,7 +580,9 @@ impl Runs {
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
-                        crate::files::download(&connection, &path, &*sink).await
+                        crate::files::download(&connection, &path, &*sink)
+                            .await
+                            .map(Moved::Downloaded)
                     }
                     (
                         Operation::Upload {
@@ -593,14 +595,21 @@ impl Runs {
                         crate::files::upload(&connection, &path, &mut input, overwrite)
                             .await
                             .map_err(Failure::from)?;
-                        // Released here rather than by the caller, which may
-                        // have stopped waiting or been cancelled by now.
-                        Ok(input.succeeded())
+                        Ok(Moved::Uploaded(input))
                     }
                     _ => unreachable!("transfer payload was validated before registration"),
                 }
             };
-            let result = supervise_transfer(work, transfer_timeout).await;
+            // An upload's source is released only after the deadline can no
+            // longer turn its success into a timeout, and by this task rather
+            // than the caller, which may have stopped waiting by now.
+            let result =
+                supervise_transfer(work, transfer_timeout)
+                    .await
+                    .map(|moved| match moved {
+                        Moved::Downloaded(file) => file,
+                        Moved::Uploaded(input) => input.succeeded(),
+                    });
             {
                 let mut record = live
                     .record
@@ -992,15 +1001,22 @@ impl Runs {
     }
 }
 
+/// A transfer whose remote work finished.
+///
+/// An upload hands its source back instead of releasing it, so that the
+/// release depends on the outcome the record reports rather than on how far
+/// the worker got before its deadline.
+enum Moved {
+    Downloaded(crate::action::FileIdentity),
+    Uploaded(crate::transfer::PreparedUpload),
+}
+
 /// Own the worker until it has stopped, including timeout and task failure.
 /// Dropping a join handle alone would leave timed-out remote work running.
-async fn supervise_transfer(
-    work: impl std::future::Future<
-        Output = Result<crate::action::FileIdentity, crate::transfer::Failure>,
-    > + Send
-    + 'static,
+async fn supervise_transfer<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, crate::transfer::Failure>> + Send + 'static,
     timeout: Duration,
-) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
+) -> Result<T, crate::transfer::Failure> {
     use crate::transfer::Failure;
     let mut workers = tokio::task::JoinSet::new();
     workers.spawn(work);
@@ -1146,7 +1162,7 @@ mod tests {
     async fn transfer_supervision_reports_panics_and_drops_timed_out_work() {
         use crate::transfer::Failure;
         assert_eq!(
-            supervise_transfer(
+            supervise_transfer::<()>(
                 async { panic!("synthetic worker failure") },
                 Duration::from_secs(1)
             )
@@ -1163,7 +1179,7 @@ mod tests {
             }
         }
         let guard = Guard(Some(dropped));
-        let result = supervise_transfer(
+        let result = supervise_transfer::<()>(
             async move {
                 let _guard = guard;
                 std::future::pending().await
