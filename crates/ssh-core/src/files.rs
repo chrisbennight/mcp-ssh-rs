@@ -962,6 +962,105 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// An upload source is released only by a write that reached the target,
+    /// and by the transfer itself: a caller that stopped waiting does not keep
+    /// it held. A failed write keeps the source for an investigated retry.
+    #[tokio::test]
+    async fn only_a_successful_upload_releases_its_source() {
+        use crate::audit::Ledger;
+        use crate::clock::TestClock;
+        use crate::policy::{Engine, ReviewMode};
+        use crate::run::{Limits, RunState, Runs};
+        use crate::session::{Lifetime, Purpose, SessionStore};
+        use crate::transfer::{Payload, PreparedUpload};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt as _;
+
+        let root = scratch();
+        let connection = Arc::new(served(&root).await);
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 10000,
+                max: 60000,
+                grace: 5000,
+            },
+            1,
+        )
+        .open(
+            crate::PrincipalId::parse("alice").unwrap(),
+            HostId::parse("testhost").unwrap(),
+            RoleId::parse("readonly").unwrap(),
+            Purpose::parse("verify upload release").unwrap(),
+            crate::AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        // No wait at all, so the call hands back a transfer that is still going.
+        let runs = Runs::new(Limits {
+            wait: Duration::ZERO,
+            ..Limits::default()
+        });
+        let bytes = b"placed bytes";
+        for (remote, succeeds) in [("/placed", true), ("/missing/placed", false)] {
+            let released = Arc::new(AtomicUsize::new(0));
+            // The test supplies the bytes, so the transfer cannot finish first.
+            let (mut sender, reader) = tokio::io::duplex(64);
+            let input = PreparedUpload::from_reader(
+                crate::transfer::identity(String::new(), bytes),
+                Box::new(reader),
+            )
+            .released_on_success({
+                let released = Arc::clone(&released);
+                move || {
+                    released.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let action =
+                crate::action::Action::upload(path(remote), input.identity().clone(), false)
+                    .unwrap();
+            let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
+            let receipt = ledger
+                .record_intent(
+                    decision,
+                    crate::command::CommandIntent::parse("verify upload release").unwrap(),
+                )
+                .unwrap()
+                .into_parts()
+                .1
+                .unwrap();
+            let outcome = runs
+                .transfer(connection.clone(), receipt, Payload::Upload(input))
+                .await
+                .unwrap();
+            if succeeds {
+                assert!(outcome.still_running());
+                assert_eq!(released.load(Ordering::SeqCst), 0);
+                sender.write_all(bytes).await.unwrap();
+            }
+            drop(sender);
+            let outcome = runs
+                .wait(outcome.run(), Duration::from_secs(10))
+                .await
+                .unwrap();
+            if succeeds {
+                assert_eq!(outcome.state(), RunState::Exited { code: 0 });
+            } else {
+                assert!(matches!(
+                    outcome.state(),
+                    RunState::TransferFailed {
+                        remote_write_may_be_partial: true,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(released.load(Ordering::SeqCst), usize::from(succeeds));
+            assert!(runs.forget(outcome.run()));
+        }
+        assert_eq!(std::fs::read(root.join("placed")).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn a_published_download_does_not_wait_for_a_read_handle_close_reply() {
         let root = scratch();

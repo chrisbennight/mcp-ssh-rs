@@ -553,7 +553,7 @@ pub fn catalog_with_files(files: Option<&crate::transfer::Transfers>) -> ListToo
             ToolAnnotations::new().read_only(false).destructive(false).idempotent(false).open_world(true),
         ));
         catalog.tools.push(tool::<UploadArgs, ExecResult>(
-            "ssh_upload", "Place an uploaded file reference on the SSH target. No inline or base64 content. Set overwrite explicitly. Unknown outcomes require investigation before retrying.",
+            "ssh_upload", "Place an uploaded file reference on the SSH target. No inline or base64 content. Set overwrite explicitly. Success releases an uploaded reference. Unknown outcomes require investigation before retrying.",
             ToolAnnotations::new().read_only(false).destructive(true).idempotent(false).open_world(true),
         ));
     }

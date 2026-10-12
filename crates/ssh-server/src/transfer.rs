@@ -123,7 +123,9 @@ struct Item {
     active: Option<Arc<DiskFile>>,
     ticket: Option<Ticket>,
     cleaning: bool,
-    abandoned: bool,
+    /// No new use may start: its transfer was abandoned, or its upload reached
+    /// the target. It stays charged only while work in progress holds storage.
+    withdrawn: bool,
 }
 
 impl Item {
@@ -164,7 +166,9 @@ pub struct Transfers {
 pub enum TransferError {
     #[error("file reference is unavailable")]
     Unknown,
-    #[error("file transfer capacity is exhausted; release or let earlier references expire")]
+    #[error(
+        "file transfer capacity is exhausted; slots free when an upload using an earlier reference succeeds or when earlier references expire, normally within five minutes"
+    )]
     Capacity,
     #[error("file size or metadata exceeds its configured limit")]
     Limit,
@@ -283,7 +287,7 @@ impl Transfers {
             Item {
                 local_file: None,
                 cleaning: false,
-                abandoned: false,
+                withdrawn: false,
                 owner: owner.clone(),
                 created: now,
                 upload,
@@ -365,7 +369,7 @@ impl Transfers {
         let id = uri.strip_prefix(URI_PREFIX).ok_or(TransferError::Unknown)?;
         let item = items.get_mut(id).ok_or(TransferError::Unknown)?;
         if item.cleaning
-            || item.abandoned
+            || item.withdrawn
             || item.owner != *owner
             || self.clock.now().saturating_sub(item.created) >= TTL
         {
@@ -399,10 +403,21 @@ impl Transfers {
         let Content::Ready(bytes) = &item.content else {
             return Err(TransferError::Unknown);
         };
-        Ok(ssh_core::transfer::PreparedUpload::from_reader(
+        let input = ssh_core::transfer::PreparedUpload::from_reader(
             bytes.identity(uri.to_owned()),
             bytes.reader(),
-        ))
+        );
+        // Only references made to upload are released. Downloads and retained
+        // output also serve as sources, but they are still owed to the caller.
+        if !item.upload {
+            return Ok(input);
+        }
+        let shared = Arc::clone(&self.items);
+        let id = uri
+            .strip_prefix(URI_PREFIX)
+            .ok_or(TransferError::Unknown)?
+            .to_owned();
+        Ok(input.released_on_success(move || withdraw_placed(&shared, &id)))
     }
 
     pub async fn destination(
@@ -498,7 +513,7 @@ impl Transfers {
             .ok_or(TransferError::Unknown)?;
         let ticket = item.ticket.as_ref().ok_or(TransferError::Unknown)?;
         if item.cleaning
-            || item.abandoned
+            || item.withdrawn
             || self.clock.now().saturating_sub(item.created) >= TTL
             || !bool::from(hash(credential.as_bytes()).ct_eq(&ticket.credential))
         {
@@ -541,7 +556,7 @@ impl Transfers {
                 return;
             }
             item.content = Content::Pending;
-            item.abandoned = true;
+            item.withdrawn = true;
             // Empty reservations have no filesystem work to defer.
             if item.active.is_none() && !item.cleaning {
                 items.remove(id);
@@ -603,8 +618,22 @@ impl Transfers {
     }
 }
 
+/// Withdraws an uploaded reference whose content has reached a target.
+///
+/// The store is a transfer buffer, so the slot goes back to its owner at the
+/// next admission. Another upload still reading the same bytes keeps them
+/// charged until it finishes.
+fn withdraw_placed(items: &Mutex<HashMap<String, Item>>, id: &str) {
+    let mut items = items.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(item) = items.get_mut(id)
+        && matches!(item.content, Content::Ready(_))
+    {
+        item.withdrawn = true;
+    }
+}
+
 fn retained(item: &Item, now: u64) -> bool {
-    (!item.abandoned && now.saturating_sub(item.created) < TTL)
+    (!item.withdrawn && now.saturating_sub(item.created) < TTL)
         || matches!(item.content, Content::Receiving)
         || item
             .active
@@ -633,7 +662,7 @@ impl DownloadSink for Destination {
                     .get_mut(&self.id)
                     .ok_or(Failure::PublicationUnavailable)?;
                 if item.cleaning
-                    || item.abandoned
+                    || item.withdrawn
                     || !matches!(item.content, Content::Pending)
                     || item.upload
                     || self.store.clock.now().saturating_sub(item.created) >= TTL
@@ -1058,6 +1087,76 @@ mod tests {
                 .await,
             Err(TransferError::Capacity)
         ));
+    }
+
+    /// The store is a transfer buffer: a reference whose upload reached its
+    /// target gives its slot back at once instead of holding it for the rest
+    /// of its window. An upload that did not succeed keeps its reference for a
+    /// retry.
+    #[tokio::test]
+    async fn a_successful_upload_returns_its_slot_before_the_window_ends() {
+        let store = plane();
+        let caller = owner("caller");
+        let mut uris = Vec::new();
+        for _ in 0..OWNER_ITEMS {
+            let upload = store
+                .authorize_upload(&caller, UploadParams::default())
+                .await
+                .unwrap();
+            let response = routes(Arc::clone(&store))
+                .oneshot(request(&upload.upload, Body::from("piece")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            uris.push(upload.file.uri);
+        }
+        assert!(matches!(
+            store
+                .authorize_upload(&caller, UploadParams::default())
+                .await,
+            Err(TransferError::Capacity)
+        ));
+        let first = uris.first().unwrap();
+        drop(store.input(&caller, first).await.unwrap());
+        assert!(
+            store.input(&caller, first).await.is_ok(),
+            "an upload that did not succeed keeps its reference for a retry"
+        );
+        let concurrent = store.input(&caller, first).await.unwrap();
+        store.input(&caller, first).await.unwrap().succeeded();
+        assert!(store.input(&caller, first).await.is_err());
+        assert!(store.authorize_download(&caller, first).is_err());
+        assert!(
+            matches!(
+                store
+                    .authorize_upload(&caller, UploadParams::default())
+                    .await,
+                Err(TransferError::Capacity)
+            ),
+            "bytes another upload is still reading stay charged"
+        );
+        drop(concurrent);
+        assert!(
+            store
+                .authorize_upload(&caller, UploadParams::default())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Downloads and retained output can be placed on another target, but
+    /// they are still owed to their caller, so that does not withdraw them.
+    #[tokio::test]
+    async fn placing_a_download_elsewhere_keeps_it_for_its_caller() {
+        let store = plane();
+        let caller = owner("caller");
+        let sink = store.destination(&caller, None).await.unwrap();
+        let file = sink
+            .receive(&mut std::io::Cursor::new(b"downloaded"))
+            .await
+            .unwrap();
+        store.input(&caller, &file.uri).await.unwrap().succeeded();
+        assert!(store.authorize_download(&caller, &file.uri).is_ok());
     }
 
     #[tokio::test]

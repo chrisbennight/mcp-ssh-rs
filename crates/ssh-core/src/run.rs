@@ -593,7 +593,9 @@ impl Runs {
                         crate::files::upload(&connection, &path, &mut input, overwrite)
                             .await
                             .map_err(Failure::from)?;
-                        Ok(input.identity().clone())
+                        // Released here rather than by the caller, which may
+                        // have stopped waiting or been cancelled by now.
+                        Ok(input.succeeded())
                     }
                     _ => unreachable!("transfer payload was validated before registration"),
                 }

@@ -14,12 +14,47 @@ pub type TransferFuture<'a> =
 pub struct PreparedUpload {
     identity: FileIdentity,
     reader: Reader,
+    release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl PreparedUpload {
     /// Adapters supply a completed immutable snapshot, its matching identity, and a reader at byte zero.
     pub fn from_reader(identity: FileIdentity, reader: Reader) -> Self {
-        Self { identity, reader }
+        Self {
+            identity,
+            reader,
+            release: None,
+        }
+    }
+
+    /// Frees the source once its content has been written to the target.
+    ///
+    /// A source is a transfer buffer, not storage: after a successful write
+    /// nothing needs it, and keeping it would hold capacity the caller's next
+    /// transfer needs. Only success runs this. A failed, refused, or
+    /// unapproved upload keeps its source, so an investigated retry does not
+    /// have to send the bytes again.
+    #[must_use]
+    pub fn released_on_success(mut self, release: impl FnOnce() + Send + 'static) -> Self {
+        self.release = Some(Box::new(release));
+        self
+    }
+
+    /// Ends an upload whose remote write succeeded.
+    ///
+    /// The reader is closed before the release runs, so the source is no
+    /// longer in use by this upload when it is freed.
+    pub fn succeeded(self) -> FileIdentity {
+        let Self {
+            identity,
+            reader,
+            release,
+        } = self;
+        drop(reader);
+        if let Some(release) = release {
+            release();
+        }
+        identity
     }
 
     #[cfg(test)]

@@ -152,8 +152,9 @@ not change that identity. Target account permissions remain the containment
 boundary. SFTP path checks do not prevent a malicious target from racing its
 own filesystem. Interrupted remote writes may be partial and are not replayed.
 
-Storage reserves bounded capacity before transfers, validates complete uploads
-before use, and expires references. Exact file size and digest metadata are
+Storage is a transfer buffer, not an archive. It reserves bounded capacity
+before transfers, validates complete uploads before use, releases an upload
+reference once its upload succeeds, and expires the rest. Exact file size and digest metadata are
 ordinary protected metadata, not credential values. Local outputs publish after
 complete writes and clean up generated files. See [file transfers](file-transfers.md)
 for the operational contract and retention limits.
