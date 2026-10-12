@@ -104,8 +104,18 @@ Unstarted authorizations expire after five minutes. Once a transfer starts,
 `MCP_SSH_TRANSFER_TIMEOUT_SECONDS` bounds HTTP upload, local input snapshot, and
 SFTP operation duration. It defaults to 1800 seconds and accepts positive integers
 up to 86400. Completed references receive a fresh five-minute delivery window.
-Expired storage held by an active service consumer remains charged until release.
-This includes local outputs being copied into new input snapshots. The trusted
+Storage that has expired or been released remains charged while an active
+service consumer still holds it. This includes local outputs being copied into
+new input snapshots.
+
+Transfer storage is a buffer for moving bytes, not an archive. A reference from
+`files/authorizeUpload` is released as soon as an `ssh_upload` using it finishes
+writing to the target, so its slot is free for the next upload. A reference
+whose upload fails, times out, waits for approval, or is refused stays usable
+until its window ends, so an investigated retry does not need the bytes sent
+again. A released reference cannot be used again or downloaded; supply the file
+again to place it on another target. Download and retained-output references
+are not released by serving as an upload source. The trusted
 stdio launcher controls the shared filesystem; files or descriptors it retains
 independently are outside the service’s storage accounting. Operators
 must also bound HTTP connection lifetime at their TLS proxy, including slow GET
