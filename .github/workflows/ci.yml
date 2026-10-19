@@ -173,6 +173,7 @@ jobs:
           if [[ "$current" == false ]]; then echo 'SKIP: newer main changes application inputs'; fi
 
       - name: Publish to GHCR and verify the image
+        id: publish
         if: (true) && steps.release_scope.outputs.current == 'true'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,3 +189,13 @@ jobs:
           docker pull "$image"
           test "$(docker image inspect --format '{{.Id}}' "$image")" = "$image_id"
           docker image inspect --format '{{json .RepoDigests}}' "$image"
+          python3 .ci/publication_record.py
+
+      - name: Retain verified publication record
+        if: steps.publish.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ssh-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ssh-publication.json
+          if-no-files-found: error
+          retention-days: 90

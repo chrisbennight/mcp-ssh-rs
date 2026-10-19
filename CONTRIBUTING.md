@@ -127,7 +127,9 @@ Only that job receives package-write permission. It uses the workflow's
 `GITHUB_TOKEN`; no Infisical credentials or deployment webhook are needed.
 It reads the image back from GHCR and checks its image ID. Use the reported
 digest for an exact deployment: rerunning the same commit can replace its SHA
-tag. There is no moving `latest` tag or automatic deployment to a host.
+tag. Successful publications retain an attempt-specific `ssh-publication` artifact
+for downstream image update PRs. There is no moving `latest` tag or automatic
+deployment to a host.
 
 Verify package access separately before sharing a pull command. Repository
 visibility does not itself publish a package.
