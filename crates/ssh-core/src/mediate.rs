@@ -101,7 +101,7 @@ enum Admission {
 pub struct Bounds {
     /// How long a session lives, and how long a lapsed one is remembered.
     pub lifetime: Lifetime,
-    /// Most live sessions one principal may hold at once.
+    /// Most session slots one principal may hold, including pending opens.
     pub sessions_per_principal: usize,
     /// What a single execution may consume.
     pub run: Limits,
@@ -278,6 +278,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     ) -> Result<Session, MediationError> {
         self.check_account(&host, &role, access_class)?;
         let target = self.registry.resolve(&host, &role)?;
+        let opening = self.sessions.reserve(principal)?;
         // The target carries the host and role it was resolved for, so the
         // connection is labelled by the lookup that produced its address and
         // credential rather than by anything passed alongside.
@@ -288,9 +289,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
             // reconciliation cannot catch the session existing without its
             // connection or the other way round.
             let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
-            let session = self
-                .sessions
-                .open(principal, host, role, purpose, access_class)?;
+            let session = opening.open(host, role, purpose, access_class);
             self.connections
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1770,6 +1769,39 @@ mod tests {
         assert_eq!(result, Err(MediationError::AccountMismatch));
         assert_eq!(bastion.held_connections(), 0);
         assert!(bastion.ledger().entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_opens_refuse_excess_work_before_fetch_and_cancelled_opens_release_slots() {
+        let clock = Arc::new(TestClock::at(1_000));
+        let (mut bastion, gate) = bastion_gated(Arc::clone(&clock)).await;
+        bastion.sessions = SessionStore::new(clock, LIFETIME, 1);
+        let bastion = Arc::new(bastion);
+        gate.arm();
+        let opening = tokio::spawn({
+            let bastion = Arc::clone(&bastion);
+            async move { session_for(&bastion, AccessClass::ReadOnly).await }
+        });
+        gate.until_a_dial_waits().await;
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            bastion.open_session(
+                alice(),
+                HostId::parse("dns1").unwrap(),
+                RoleId::parse("readonly").unwrap(),
+                Purpose::parse("inspect another task").unwrap(),
+                AccessClass::ReadOnly,
+            ),
+        )
+        .await
+        .expect("quota rejection must precede credential retrieval");
+        assert!(matches!(refused, Err(MediationError::TooManySessions(_))));
+        assert_eq!(bastion.held_connections(), 0);
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+        gate.armed.store(false, Ordering::SeqCst);
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        bastion.close_session(&alice(), &session.id).await.unwrap();
     }
 
     async fn session_for<C: Clock + 'static>(

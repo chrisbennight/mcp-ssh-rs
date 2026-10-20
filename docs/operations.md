@@ -206,6 +206,9 @@ The session limit defaults to 32 per authenticated principal. Set
 then restart the service. Zero, blank, malformed, and out-of-range values prevent
 startup. The setting applies to HTTP and stdio. Clients sharing one identity
 share its allowance; raising it increases the resources that identity can hold.
+Connection attempts reserve a slot before retrieving credentials or dialing.
+Failed or cancelled attempts release it. Credential retrieval, SSH transport
+setup, and authentication share a fifteen-second setup deadline.
 
 When your allowance is full, close an unused session with `ssh_close_session`
 and the session's original `session`, `host`, `role`, and `access_class`.

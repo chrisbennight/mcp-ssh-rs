@@ -133,14 +133,14 @@ pub enum PurposeError {
     TooLong { max: usize },
 }
 
-/// One principal already holds as many live sessions as it may.
+/// One principal already occupies its session allowance, including pending opens.
 ///
 /// Close one, or let one lapse. Refusing is the point: a caller that can open
 /// sessions without limit can consume the service's memory without ever running
 /// a command.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 #[error(
-    "you hold {limit} of {limit} live sessions; close an unused session with ssh_close_session using its session, host, role, and access_class, or inspect Sessions in the dashboard. Closing a session may interrupt its running work"
+    "you hold {limit} of {limit} session slots (open or connecting); wait for connection setup to finish, close an unused session with ssh_close_session using its session, host, role, and access_class, or inspect Sessions in the dashboard. Closing a session may interrupt its running work"
 )]
 pub struct TooManySessions {
     pub limit: usize,
@@ -280,6 +280,68 @@ pub struct SessionStore<C: Clock> {
     lifetime: Lifetime,
     per_principal: usize,
     sessions: Mutex<HashMap<String, Session>>,
+    pending: Mutex<HashMap<PrincipalId, usize>>,
+}
+
+/// A slot held while connection setup is in flight.
+pub(crate) struct Opening<'a, C: Clock> {
+    store: &'a SessionStore<C>,
+    principal: PrincipalId,
+    active: bool,
+}
+
+impl<C: Clock> Opening<'_, C> {
+    pub(crate) fn open(
+        mut self,
+        host: HostId,
+        role: RoleId,
+        purpose: Purpose,
+        access_class: AccessClass,
+    ) -> Session {
+        let id = SessionId(new_identifier());
+        // Reservation and publication use the same lock order, so a slot is
+        // transferred rather than counted twice or briefly made available.
+        let mut pending = self.store.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sessions = self
+            .store
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = self.store.clock.now();
+        let session = Session {
+            id,
+            principal: self.principal.clone(),
+            host,
+            role,
+            purpose,
+            access_class,
+            opened_at: now,
+            last_used: now,
+            lifetime: self.store.lifetime,
+        };
+        sessions.insert(session.id.0.clone(), session.clone());
+        release_pending(&mut pending, &self.principal);
+        self.active = false;
+        session
+    }
+}
+
+impl<C: Clock> Drop for Opening<'_, C> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut pending = self.store.pending.lock().unwrap_or_else(|e| e.into_inner());
+            release_pending(&mut pending, &self.principal);
+        }
+    }
+}
+
+fn release_pending(pending: &mut HashMap<PrincipalId, usize>, principal: &PrincipalId) {
+    if let Some(count) = pending.get_mut(principal) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            pending.remove(principal);
+        }
+    }
 }
 
 impl<C: Clock> SessionStore<C> {
@@ -300,7 +362,7 @@ impl<C: Clock> SessionStore<C> {
     }
 
     /// `per_principal` is the most entries one principal may occupy, counting
-    /// both live sessions and lapsed ones still being remembered.
+    /// pending opens, live sessions, and lapsed ones still being remembered.
     ///
     /// Expiry bounds how *long* a session lives, not how many exist. Without a
     /// count as well, a caller can open sessions faster than they age out and
@@ -313,6 +375,7 @@ impl<C: Clock> SessionStore<C> {
             lifetime,
             per_principal,
             sessions: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -330,7 +393,16 @@ impl<C: Clock> SessionStore<C> {
         purpose: Purpose,
         access_class: AccessClass,
     ) -> Result<Session, TooManySessions> {
-        let id = SessionId(new_identifier());
+        Ok(self
+            .reserve(principal)?
+            .open(host, role, purpose, access_class))
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        principal: PrincipalId,
+    ) -> Result<Opening<'_, C>, TooManySessions> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         // Read under the lock. A reading taken before waiting for it can be
         // older than one another caller already wrote.
@@ -345,7 +417,8 @@ impl<C: Clock> SessionStore<C> {
             .values()
             .filter(|held| held.principal == principal)
             .count();
-        if held >= self.per_principal {
+        let opening = pending.get(&principal).copied().unwrap_or(0);
+        if held.saturating_add(opening) >= self.per_principal {
             // A lapsed session gives up its slot rather than denying one.
             // Remembering what a session was for is worth keeping; it is not
             // worth refusing the replacement session it exists to help open.
@@ -363,19 +436,12 @@ impl<C: Clock> SessionStore<C> {
             };
             sessions.remove(&stale);
         }
-        let session = Session {
-            id: id.clone(),
+        pending.insert(principal.clone(), opening.saturating_add(1));
+        Ok(Opening {
+            store: self,
             principal,
-            host,
-            role,
-            purpose,
-            access_class,
-            opened_at: now,
-            last_used: now,
-            lifetime: self.lifetime,
-        };
-        sessions.insert(id.0, session.clone());
-        Ok(session)
+            active: true,
+        })
     }
 
     /// Forgets every session that lapsed longer ago than the grace period.
@@ -674,6 +740,21 @@ mod tests {
                 AccessClass::ReadOnly,
             )
             .expect("within the per-principal limit")
+    }
+
+    #[test]
+    fn pending_connections_share_capacity_and_release_it_on_drop() {
+        let store = SessionStore::new(TestClock::at(1_000), LIFETIME, 1);
+        let opening = store.reserve(principal("alice")).unwrap();
+        assert!(store.reserve(principal("alice")).is_err());
+        assert!(store.live().is_empty());
+        drop(store.reserve(principal("bob")).unwrap());
+        drop(opening);
+        let session = open(&store, "alice");
+        assert!(store.reserve(principal("alice")).is_err());
+        store.close(&session.id, &principal("alice")).unwrap();
+        assert!(store.reserve(principal("alice")).is_ok());
+        assert!(store.pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1077,7 +1158,7 @@ mod tests {
     #[test]
     fn session_exhaustion_explains_ownership_and_how_to_release_a_slot() {
         let message = TooManySessions { limit: 8 }.to_string();
-        assert!(message.contains("you hold 8 of 8 live sessions"));
+        assert!(message.contains("you hold 8 of 8 session slots (open or connecting)"));
         for field in [
             "ssh_close_session",
             "session",
