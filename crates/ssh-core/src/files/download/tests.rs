@@ -24,6 +24,7 @@ struct Peer {
     reads: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
     written: Arc<AtomicUsize>,
+    requested_end: Arc<std::sync::atomic::AtomicU64>,
     job: tokio::task::JoinHandle<()>,
 }
 
@@ -77,11 +78,13 @@ fn fixture_stream(
     let reads = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let written = Arc::new(AtomicUsize::new(0));
+    let requested_end = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (client, server) = tokio::io::duplex(128 << 10);
     let source = Arc::clone(&bytes);
     let seen = Arc::clone(&reads);
     let peak = Arc::clone(&maximum);
     let write_bytes = Arc::clone(&written);
+    let end = Arc::clone(&requested_end);
     let job = tokio::spawn(async move {
         let (mut input, mut server) = tokio::io::split(server);
         let (send, mut incoming) = tokio::sync::mpsc::channel(READ_AHEAD);
@@ -113,6 +116,7 @@ fn fixture_stream(
                             });
                         },
                         Packet::Read(request) => {
+                            end.fetch_max(request.offset.checked_add(u64::from(request.len)).unwrap(), Ordering::SeqCst);
                             seen.fetch_add(1, Ordering::SeqCst);
                             peak.fetch_max(answers.len().saturating_add(1), Ordering::SeqCst);
                             if matches!(mode, Reply::Disconnect) { break; }
@@ -150,9 +154,26 @@ fn fixture_stream(
             reads,
             maximum,
             written,
+            requested_end,
             job,
         },
     )
+}
+
+#[tokio::test]
+async fn byte_budget_bounds_every_scheduled_read_even_with_large_read_ahead() {
+    for (size, budget) in [(100_000, 2), (1, 2), (100_000, 65_538), (100_000, 0)] {
+        for window in [1, READ_AHEAD, 64] {
+            let (session, peer) = fixture(size, Duration::ZERO, Reply::Ordinary, true).await;
+            let mut reader = Reader::new(session, "fixture".into(), CHUNK_BYTES, window)
+                .unwrap()
+                .bounded(budget);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, peer.bytes.get(..size.min(budget as usize)).unwrap());
+            assert!(peer.requested_end.load(Ordering::SeqCst) <= budget);
+        }
+    }
 }
 
 #[tokio::test]

@@ -18,6 +18,7 @@ pub(super) const READ_AHEAD: usize = 8;
 type ReadFuture = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>;
 
 struct Request {
+    size: u32,
     future: Option<ReadFuture>,
     result: Option<io::Result<Vec<u8>>>,
 }
@@ -28,6 +29,7 @@ pub(super) struct Reader {
     chunk_bytes: u32,
     window: usize,
     next: u64,
+    limit: u64,
     requests: VecDeque<Request>,
     current: std::io::Cursor<Vec<u8>>,
     eof: bool,
@@ -55,10 +57,16 @@ impl Reader {
             chunk_bytes,
             window,
             next: 0,
+            limit: u64::MAX,
             requests: VecDeque::new(),
             current: std::io::Cursor::new(Vec::new()),
             eof: false,
         })
+    }
+
+    pub(super) fn bounded(mut self, bytes: u64) -> Self {
+        self.limit = bytes;
+        self
     }
 }
 
@@ -80,7 +88,11 @@ impl AsyncRead for Reader {
         }
         while self.requests.len() < self.window {
             let offset = self.next;
-            let Some(next) = offset.checked_add(u64::from(self.chunk_bytes)) else {
+            let size = u64::from(self.chunk_bytes).min(self.limit.saturating_sub(offset)) as u32;
+            if size == 0 {
+                break;
+            }
+            let Some(next) = offset.checked_add(u64::from(size)) else {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SFTP offset overflow",
@@ -89,11 +101,15 @@ impl AsyncRead for Reader {
             self.next = next;
             let session = Arc::clone(&self.session);
             let handle = self.handle.clone();
-            let size = self.chunk_bytes;
             self.requests.push_back(Request {
+                size,
                 future: Some(Box::pin(read_chunk(session, handle, offset, size))),
                 result: None,
             });
+        }
+        if self.requests.is_empty() {
+            self.eof = true;
+            return Poll::Ready(Ok(()));
         }
         // Poll every request so later offsets can cross the wire before the
         // first reply. Delivery still consumes only the oldest offset.
@@ -112,10 +128,10 @@ impl AsyncRead for Reader {
         else {
             return Poll::Pending;
         };
-        self.requests.pop_front();
+        let requested = self.requests.pop_front().map(|request| request.size);
         match result {
             Ok(bytes) => {
-                if bytes.len() < self.chunk_bytes as usize {
+                if requested.is_some_and(|size| bytes.len() < size as usize) {
                     self.eof = true;
                     self.requests.clear();
                 }

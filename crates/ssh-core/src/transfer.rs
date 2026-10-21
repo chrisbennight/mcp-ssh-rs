@@ -195,7 +195,7 @@ impl Failure {
             Self::Cancelled => "The transfer was cancelled locally; remote work may be incomplete.",
             Self::UnsupportedOperation => "The SFTP peer does not support the requested operation.",
             Self::ReplacementUnknown => {
-                "The replacement acknowledgement was lost; the destination may have been replaced. Investigate before retrying."
+                "The replacement outcome is unknown; the destination may have been replaced. Investigate before retrying."
             }
             Self::StagingCleanupFailed => {
                 "The staged operation failed and temporary file removal was not confirmed; inspect both named paths before retrying."

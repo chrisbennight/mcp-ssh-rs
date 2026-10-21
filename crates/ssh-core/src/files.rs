@@ -337,6 +337,16 @@ pub(crate) async fn download(
     sink: &dyn crate::transfer::DownloadSink,
     window: DownloadWindow,
 ) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
+    download_bounded(connection, path, sink, window, None).await
+}
+
+async fn download_bounded(
+    connection: &Connection,
+    path: &RemotePath,
+    sink: &dyn crate::transfer::DownloadSink,
+    window: DownloadWindow,
+    read_limit: Option<u64>,
+) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
     let mut sftp = RawSftpSession::new(binary_stream(connection).await?);
     let version = sftp.init().await.map_err(|source| FileError::Unavailable {
         detail: source.to_string(),
@@ -393,6 +403,9 @@ pub(crate) async fn download(
         let mut reader =
             download::Reader::new(Arc::clone(&sftp), handle, chunk_bytes, window.requests())
                 .map_err(|_| crate::transfer::Failure::RemoteIo)?;
+        if let Some(limit) = read_limit {
+            reader = reader.bounded(limit);
+        }
         let received = sink.receive(&mut reader).await;
         drop(reader);
         // This dedicated session releases its read handle on teardown. Do not
@@ -410,9 +423,10 @@ pub(crate) async fn upload_with_staging(
     input: &mut crate::transfer::PreparedUpload,
     overwrite: bool,
     stage: Option<&RemotePath>,
+    replacement: &std::sync::atomic::AtomicBool,
 ) -> Result<(), crate::transfer::Failure> {
     if let Some(stage) = stage {
-        staged::upload(connection, path, stage, input).await
+        staged::upload(connection, path, stage, input, replacement).await
     } else {
         upload(connection, path, input, overwrite)
             .await
@@ -580,6 +594,7 @@ mod tests {
         root: PathBuf,
         answer_close: bool,
         rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
         /// Channels kept until their subsystem request arrives, because the
         /// SFTP server takes the channel itself rather than a channel id.
         channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
@@ -633,6 +648,7 @@ mod tests {
                     open: HashMap::new(),
                     answer_close: self.answer_close,
                     rename_supported: self.rename_supported,
+                    rename_wait: self.rename_wait.clone(),
                     listed: std::collections::HashSet::new(),
                 },
             )
@@ -652,6 +668,7 @@ mod tests {
         listed: std::collections::HashSet<String>,
         answer_close: bool,
         rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl Files {
@@ -835,6 +852,10 @@ mod tests {
                 russh_sftp::de::from_bytes(&mut data.into()).map_err(|_| StatusCode::BadMessage)?;
             std::fs::rename(self.resolve(&paths.oldpath), self.resolve(&paths.newpath))
                 .map_err(|_| StatusCode::Failure)?;
+            if let Some(ready) = &self.rename_wait {
+                ready.notify_one();
+                std::future::pending::<()>().await;
+            }
             Ok(Status {
                 id,
                 status_code: StatusCode::Ok,
@@ -923,6 +944,15 @@ mod tests {
         answer_close: bool,
         rename_supported: bool,
     ) -> Connection {
+        served_with_rename_wait(root, answer_close, rename_supported, None).await
+    }
+
+    async fn served_with_rename_wait(
+        root: &Path,
+        answer_close: bool,
+        rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
+    ) -> Connection {
         let host_key =
             keys::PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519).unwrap();
         let pinned =
@@ -939,6 +969,7 @@ mod tests {
             root: root.to_path_buf(),
             answer_close,
             rename_supported,
+            rename_wait,
             channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         tokio::spawn(async move {
@@ -1092,7 +1123,8 @@ mod tests {
                 &path("/destination"),
                 &mut input(),
                 true,
-                Some(&path("/temporary"))
+                Some(&path("/temporary")),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await
             .unwrap_err(),
@@ -1107,7 +1139,8 @@ mod tests {
                 &path("/destination"),
                 &mut input(),
                 true,
-                Some(&path("/temporary"))
+                Some(&path("/temporary")),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .await
             .is_err()
@@ -1124,6 +1157,7 @@ mod tests {
             &mut input(),
             true,
             Some(&path("/temporary")),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1132,6 +1166,128 @@ mod tests {
             b"replacement\0"
         );
         assert!(!root.join("temporary").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_rename_preserves_unknown_outcome_and_local_cancellation() {
+        use crate::audit::Ledger;
+        use crate::clock::TestClock;
+        use crate::policy::{Engine, ReviewMode};
+        use crate::run::{Cancellation, Limits, Outcome, RunState, Runs, Settled};
+        use crate::session::{Lifetime, Purpose, SessionStore};
+        use crate::transfer::{Failure, Payload, PreparedUpload};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observed(std::sync::Mutex<Vec<Outcome>>);
+        impl Settled for Observed {
+            fn settled(&self, outcome: Outcome) {
+                self.0.lock().unwrap().push(outcome);
+            }
+        }
+        let root = scratch();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let connection =
+            Arc::new(served_with_rename_wait(&root, true, true, Some(Arc::clone(&ready))).await);
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 10000,
+                max: 60000,
+                grace: 5000,
+            },
+            1,
+        )
+        .open(
+            crate::PrincipalId::parse("alice").unwrap(),
+            HostId::parse("testhost").unwrap(),
+            RoleId::parse("readonly").unwrap(),
+            Purpose::parse("verify replacement interruption").unwrap(),
+            crate::AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        let observed = Arc::new(Observed(std::sync::Mutex::new(Vec::new())));
+        let runs = Runs::watched(
+            Limits {
+                wait: Duration::ZERO,
+                transfer_timeout: Duration::from_secs(2),
+                ..Limits::default()
+            },
+            Some(observed.clone()),
+        );
+        for cancel in [true, false] {
+            std::fs::write(root.join("destination"), b"old").unwrap();
+            let released = Arc::new(AtomicUsize::new(0));
+            let input = PreparedUpload::new("file://fixture".to_owned(), b"new".to_vec())
+                .unwrap()
+                .released_on_success({
+                    let released = Arc::clone(&released);
+                    move || {
+                        released.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            let action = crate::action::Action::upload_with_staging(
+                path("/destination"),
+                input.identity().clone(),
+                true,
+                Some(path("/temporary")),
+            )
+            .unwrap();
+            let receipt = ledger
+                .record_intent(
+                    Engine::new(ReviewMode::Disabled).decide_action(&session, action),
+                    crate::command::CommandIntent::parse("verify replacement interruption")
+                        .unwrap(),
+                )
+                .unwrap()
+                .into_parts()
+                .1
+                .unwrap();
+            let initial = runs
+                .transfer(connection.clone(), receipt, Payload::Upload(input))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), ready.notified())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(root.join("destination")).unwrap(), b"new");
+            if cancel {
+                runs.cancel(initial.run()).unwrap();
+            }
+            let outcome = runs
+                .wait(initial.run(), Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.state(),
+                RunState::TransferFailed {
+                    cause: Failure::ReplacementUnknown,
+                    remote_write_may_be_partial: true,
+                }
+            );
+            assert_eq!(
+                runs.progress(outcome.run()).unwrap().cancellation,
+                if cancel {
+                    Cancellation::TransferStopped
+                } else {
+                    Cancellation::NotRequested
+                }
+            );
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !runs.unfinished().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.0.lock().unwrap().last().unwrap().state(),
+                outcome.state()
+            );
+            assert!(runs.forget(outcome.run()));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -623,6 +623,8 @@ impl Runs {
         let transfer_bytes = Arc::clone(&live.transfer_bytes);
         let checksum_bytes = self.limits.checksum_bytes;
         tokio::spawn(async move {
+            let replacement = Arc::new(AtomicBool::new(false));
+            let attempted = Arc::clone(&replacement);
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
@@ -654,6 +656,7 @@ impl Runs {
                             &mut input,
                             overwrite,
                             staging_path.as_ref(),
+                            &attempted,
                         )
                         .await?;
                         Ok(Moved::Uploaded(input))
@@ -687,12 +690,21 @@ impl Runs {
                 },
                 transfer_timeout,
             )
-            .await
-            .map(|moved| match moved {
-                Moved::Downloaded(file) => (Some(file), None),
-                Moved::Uploaded(input) => (Some(input.succeeded()), None),
-                Moved::Inspected(info) => (None, Some(info)),
-            });
+            .await;
+            let cancelled = matches!(&result, Err(Failure::Cancelled));
+            let result = result
+                .map_err(|cause| {
+                    if replacement.load(Ordering::Acquire) {
+                        Failure::ReplacementUnknown
+                    } else {
+                        cause
+                    }
+                })
+                .map(|moved| match moved {
+                    Moved::Downloaded(file) => (Some(file), None),
+                    Moved::Uploaded(input) => (Some(input.succeeded()), None),
+                    Moved::Inspected(info) => (None, Some(info)),
+                });
             {
                 let mut record = live
                     .record
@@ -705,7 +717,7 @@ impl Runs {
                         record.state = RunState::Exited { code: 0 };
                     }
                     Err(cause) => {
-                        if cause == Failure::Cancelled {
+                        if cancelled {
                             live.cancellation.store(4, Ordering::Release);
                         }
                         record.state = RunState::TransferFailed {

@@ -94,7 +94,8 @@ modification timestamp reported by the peer.
 Checksums stream SHA-256 without publishing or returning file content. The
 `MCP_SSH_CHECKSUM_MAX_BYTES` setting defaults to 64 MiB and the existing file
 operation deadline also applies. A growing file is refused when the byte limit
-is exceeded. The digest describes the bytes observed during the read; concurrent
+is exceeded. Read-ahead is bounded by that limit plus one byte to detect an
+oversized file. The digest describes the bytes observed during the read; concurrent
 remote modification is not a filesystem snapshot.
 
 ## Staged replacement
@@ -113,8 +114,10 @@ an fsync or crash-durability guarantee. Uploads without `staging_path` keep the
 ordinary direct-write behavior.
 
 Cancellation, a deadline, or connection loss can leave the named temporary
-file. A lost rename acknowledgement reports `replacement_unknown`: inspect
-both paths before retrying. Failed cleanup reports `staging_cleanup_failed`;
+file. A lost rename acknowledgement, including cancellation or a deadline during
+replacement, reports `replacement_unknown`: inspect both paths before retrying.
+Local cancellation status remains available separately in progress.
+Failed cleanup reports `staging_cleanup_failed`;
 the service does not claim that removal succeeded. No mutation is replayed
 automatically.
 

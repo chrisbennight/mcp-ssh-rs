@@ -1,5 +1,7 @@
 //! Explicit upload replacement using the OpenSSH POSIX rename extension.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use russh_sftp::{
     client::RawSftpSession,
     protocol::{FileAttributes, OpenFlags, Packet, StatusCode},
@@ -17,6 +19,7 @@ pub(super) async fn upload(
     path: &RemotePath,
     stage: &RemotePath,
     input: &mut PreparedUpload,
+    replacement: &AtomicBool,
 ) -> Result<(), Failure> {
     let mut raw = RawSftpSession::new(binary_stream(connection).await?);
     let version = raw.init().await.map_err(|_| Failure::SftpUnavailable)?;
@@ -120,12 +123,18 @@ pub(super) async fn upload(
                 newpath: path.as_str(),
             })
             .map_err(|_| Failure::RemoteIo)?;
+            // Retained by the supervisor even if this future is interrupted
+            // after the request crosses the wire but before its reply arrives.
+            replacement.store(true, Ordering::Release);
             match raw
                 .extended("posix-rename@openssh.com", request.to_vec())
                 .await
             {
                 Ok(Packet::Status(status)) if status.status_code == StatusCode::Ok => Ok(()),
-                Ok(Packet::Status(_)) => Err(Failure::RemoteIo),
+                Ok(Packet::Status(_)) => {
+                    replacement.store(false, Ordering::Release);
+                    Err(Failure::RemoteIo)
+                }
                 Ok(_) | Err(_) => Err(Failure::ReplacementUnknown),
             }
         }

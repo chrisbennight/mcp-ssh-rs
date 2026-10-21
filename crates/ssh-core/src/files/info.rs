@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 
-use super::{RemotePath, binary_stream, download, elsewhere, failed, said};
+use super::{RemotePath, binary_stream, download_bounded, elsewhere, failed, said};
 use crate::{
     connect::Connection,
     transfer::{DownloadSink, Failure, TransferFuture},
@@ -127,7 +127,10 @@ pub(crate) async fn inspect(
             inner: Arc::new(ChecksumSink(checksum_limit)),
             bytes,
         };
-        let digest = download(connection, path, &sink, window).await?;
+        // One extra byte distinguishes an exact fit from an oversized file.
+        // Apply this budget to scheduling as well as the hashing sink.
+        let read_limit = checksum_limit.checked_add(1).ok_or(Failure::TooLarge)?;
+        let digest = download_bounded(connection, path, &sink, window, Some(read_limit)).await?;
         return Ok(FileInfo::Checksum {
             bytes: digest.bytes,
             sha256: digest.sha256,
