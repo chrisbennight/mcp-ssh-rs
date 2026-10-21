@@ -1898,6 +1898,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "delayed audit acknowledgement latency measurement; run explicitly"]
+    async fn audit_latency_benchmark() {
+        struct Delayed;
+        impl Records for Delayed {
+            fn wrote(&self, _: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                std::thread::sleep(Duration::from_millis(100));
+                Ok(())
+            }
+        }
+        for path in ["previous_sync", "async_state_worker"] {
+            for sample in 0..3 {
+                let bastion = bastion_recording(
+                    Arc::new(SystemClock::new().unwrap()),
+                    Limits::default(),
+                    Some(Arc::new(Delayed)),
+                )
+                .await;
+                let session = bastion
+                    .sessions
+                    .open(
+                        alice(),
+                        HostId::parse("dns1").unwrap(),
+                        RoleId::parse("readonly").unwrap(),
+                        Purpose::parse("measure delayed audit acknowledgement").unwrap(),
+                        AccessClass::ReadOnly,
+                    )
+                    .unwrap();
+                let started = Instant::now();
+                let acknowledge = async {
+                    if path == "previous_sync" {
+                        bastion.ledger.record_session_opened(&session).unwrap();
+                    } else {
+                        bastion
+                            .blocking(move |state| state.ledger.record_session_opened(&session))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                    started.elapsed()
+                };
+                let heartbeat = async {
+                    tokio::task::yield_now().await;
+                    started.elapsed()
+                };
+                let (ack, heartbeat) = tokio::join!(acknowledge, heartbeat);
+                let result = serde_json::json!({"path":path, "sample":sample, "sink_delay_ms":100, "ack_ms":ack.as_secs_f64() * 1000.0, "heartbeat_ms":heartbeat.as_secs_f64() * 1000.0});
+                use std::io::Write as _;
+                let mut output = std::io::stdout().lock();
+                serde_json::to_writer(&mut output, &result).unwrap();
+                output.write_all(b"\n").unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_slow_required_sink_does_not_block_unrelated_runtime_work() {
         struct Slow {
             entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
