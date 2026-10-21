@@ -16,10 +16,12 @@ use tokio::sync::Semaphore;
 const BODY_BYTES: usize = 256 * 1024;
 const READ_WITHIN: Duration = Duration::from_secs(10);
 const IN_FLIGHT: usize = 64;
+const POLLS_IN_FLIGHT: usize = 32;
 
 #[derive(Clone)]
 pub(crate) struct Limits {
     capacity: Arc<Semaphore>,
+    polls: Arc<Semaphore>,
     body_bytes: usize,
     read_within: Duration,
 }
@@ -28,6 +30,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             capacity: Arc::new(Semaphore::new(IN_FLIGHT)),
+            polls: Arc::new(Semaphore::new(POLLS_IN_FLIGHT)),
             body_bytes: BODY_BYTES,
             read_within: READ_WITHIN,
         }
@@ -49,18 +52,55 @@ pub(crate) async fn admit(State(limits): State<Limits>, request: Request, next: 
             Ok(Err(status)) => return refuse(status, "MCP request body was refused"),
             Err(_) => return refuse(StatusCode::REQUEST_TIMEOUT, "MCP request body timed out"),
         };
-    let response = next.run(Request::from_parts(parts, body)).await;
+    let poll_permit = if is_poll(&body) {
+        match Arc::clone(&limits.polls).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP polling capacity reached",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let response = next.run(Request::from_parts(parts, Body::from(body))).await;
     let (parts, body) = response.into_parts();
     // MCP can return a streaming response before its handler has completed.
     // Keep admission until that response completes or the caller drops it.
     let held = futures_util::stream::unfold(
-        (body.into_data_stream(), permit),
-        |(mut body, permit)| async move { body.next().await.map(|chunk| (chunk, (body, permit))) },
+        (body.into_data_stream(), permit, poll_permit),
+        |(mut body, permit, poll_permit)| async move {
+            body.next()
+                .await
+                .map(|chunk| (chunk, (body, permit, poll_permit)))
+        },
     );
     Response::from_parts(parts, Body::from_stream(held))
 }
 
-async fn collect(body: Body, limit: usize) -> Result<Body, StatusCode> {
+// Classification selects a resource budget; the MCP dispatcher still validates
+// and authorizes the request. Owned strings handle JSON escape spellings too.
+fn is_poll(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Call {
+        method: String,
+        params: Option<Parameters>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Parameters {
+        name: String,
+    }
+    serde_json::from_slice::<Call>(bytes).is_ok_and(|call| {
+        call.method == "tools/call"
+            && call
+                .params
+                .is_some_and(|params| params.name == crate::tools::POLL)
+    })
+}
+
+async fn collect(body: Body, limit: usize) -> Result<Vec<u8>, StatusCode> {
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -74,7 +114,7 @@ async fn collect(body: Body, limit: usize) -> Result<Body, StatusCode> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    Ok(Body::from(bytes))
+    Ok(bytes)
 }
 
 fn refuse(status: StatusCode, message: &'static str) -> Response {
@@ -101,6 +141,90 @@ mod tests {
             .uri("/")
             .body(body)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn polling_leaves_capacity_for_short_control_calls() {
+        for body in [
+            r#"{"method":"tools/call","params":{"name":"ssh_poll"}}"#,
+            r#"{"method":"tools/\u0063all","params":{"name":"\u0073sh_poll"}}"#,
+        ] {
+            let limits = Limits {
+                capacity: Arc::new(Semaphore::new(2)),
+                polls: Arc::new(Semaphore::new(1)),
+                ..Limits::default()
+            };
+            let app = app(limits.clone());
+            let held = app
+                .clone()
+                .oneshot(request(Body::from(body)))
+                .await
+                .unwrap();
+            assert_eq!(held.status(), StatusCode::OK);
+            assert_eq!(limits.polls.available_permits(), 0);
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Body::from(body)))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            let control = app
+                .clone()
+                .oneshot(request(Body::from(
+                    r#"{"method":"tools/call","params":{"name":"ssh_close_session"}}"#,
+                )))
+                .await
+                .unwrap();
+            assert_eq!(control.status(), StatusCode::OK);
+            drop(control);
+            drop(held);
+            assert_eq!(limits.capacity.available_permits(), 2);
+            assert_eq!(limits.polls.available_permits(), 1);
+            let response = app.oneshot(request(Body::from(body))).await.unwrap();
+            axum::body::to_bytes(response.into_body(), BODY_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(limits.capacity.available_permits(), 2);
+            assert_eq!(limits.polls.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_poll_releases_both_admission_budgets() {
+        let limits = Limits {
+            capacity: Arc::new(Semaphore::new(2)),
+            polls: Arc::new(Semaphore::new(1)),
+            ..Limits::default()
+        };
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                "/",
+                post({
+                    let entered = Arc::clone(&entered);
+                    move || {
+                        let entered = Arc::clone(&entered);
+                        async move {
+                            entered.notify_one();
+                            std::future::pending::<StatusCode>().await
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(limits.clone(), admit));
+        let task = tokio::spawn(app.oneshot(request(Body::from(
+            r#"{"method":"tools/call","params":{"name":"ssh_poll"}}"#,
+        ))));
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(limits.polls.available_permits(), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(limits.capacity.available_permits(), 2);
+        assert_eq!(limits.polls.available_permits(), 1);
     }
 
     #[tokio::test]
