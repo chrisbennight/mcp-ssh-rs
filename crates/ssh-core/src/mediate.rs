@@ -353,7 +353,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         let connection = self.connector.connect(&target).await?;
 
         let session = self
-            .blocking(move |state| {
+            .blocking(move |state| -> Result<_, MediationError> {
                 // The session and its connection become visible together, so a
                 // reconciliation cannot catch the session existing without its
                 // connection or the other way round.
@@ -367,11 +367,10 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
                         session.id.as_str().to_owned(),
                         Arc::new(tokio::sync::Mutex::new(Arc::new(connection))),
                     );
-                session
+                drop(_publishing);
+                state.ledger.record_session_opened(&session)?;
+                Ok(session)
             })
-            .await?;
-        let recorded_session = session.clone();
-        self.blocking_wait(move |state| state.ledger.record_session_opened(&recorded_session))
             .await??;
 
         // After the store has changed, not before: opening can itself evict a
@@ -815,6 +814,17 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         id: &SessionId,
         operator: &PrincipalId,
     ) -> Result<(), MediationError> {
+        let state = self.clone();
+        let id = id.clone();
+        let operator = operator.clone();
+        own_operation(async move { state.terminate_owned(&id, &operator).await }).await
+    }
+
+    async fn terminate_owned(
+        &self,
+        id: &SessionId,
+        operator: &PrincipalId,
+    ) -> Result<(), MediationError> {
         let id = id.clone();
         let operator = operator.clone();
         let connection = self
@@ -1171,6 +1181,18 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
     /// is to stop holding the handle, and the far end is entitled to have hung
     /// up first.
     async fn release_orphaned(&self) {
+        let state = self.clone();
+        if let Err(error) = own_operation(async move {
+            state.close_orphaned().await;
+            Ok(())
+        })
+        .await
+        {
+            tracing::error!(%error, "orphan connection cleanup did not finish");
+        }
+    }
+
+    async fn close_orphaned(&self) {
         let released = match self.blocking(|state| state.orphaned_connections()).await {
             Ok(released) => released,
             Err(error) => {
@@ -1307,6 +1329,17 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         principal: &PrincipalId,
         session: &SessionId,
     ) -> Result<(), MediationError> {
+        let state = self.clone();
+        let principal = principal.clone();
+        let session = session.clone();
+        own_operation(async move { state.close_owned(&principal, &session).await }).await
+    }
+
+    async fn close_owned(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+    ) -> Result<(), MediationError> {
         let principal = principal.clone();
         let session = session.clone();
         let connection = self
@@ -1427,6 +1460,17 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
     #[must_use]
     pub fn outstanding_runs(&self) -> Vec<RunId> {
         self.runs.outstanding()
+    }
+}
+
+/// Own state removal and network cleanup together across caller cancellation.
+async fn own_operation<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, MediationError>> + Send + 'static,
+) -> Result<T, MediationError> {
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(MediationError::Stopping),
     }
 }
 
@@ -1712,6 +1756,145 @@ mod tests {
             },
             records_to,
         )
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_published_open_does_not_skip_its_session_record() {
+        struct Boundary(tokio::sync::Notify);
+        impl Records for Boundary {
+            fn wrote(&self, entry: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                if matches!(entry.event, crate::audit::Event::SessionOpened { .. }) {
+                    self.0.notify_one();
+                }
+                Ok(())
+            }
+        }
+        let boundary = Arc::new(Boundary(tokio::sync::Notify::new()));
+        let gate = DialGate::default();
+        let mut bastion = bastion_dialling(
+            Arc::new(SystemClock::new().unwrap()),
+            Limits::default(),
+            Some(boundary.clone()),
+            gate.clone(),
+        )
+        .await;
+        bastion.blocking_capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        gate.arm();
+        let caller = bastion.clone();
+        let task = tokio::spawn(async move { session_for(&caller, AccessClass::ReadOnly).await });
+        gate.reached.notified().await;
+        let publishing = Arc::clone(&bastion.publishing);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _held = publishing.lock().unwrap();
+            let _ = entered.send(());
+            released.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        reached.await.unwrap();
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while bastion.blocking_capacity.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        release.send(()).unwrap();
+        blocker.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), boundary.0.notified())
+            .await
+            .unwrap();
+        let entries = bastion
+            .blocking_wait(|state| state.ledger.entries())
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry.event, crate::audit::Event::SessionOpened { .. }))
+        );
+        let session = bastion.sessions.live().pop().unwrap();
+        bastion.close_session(&alice(), &session).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_and_termination_still_close_a_retained_transport() {
+        struct Boundary {
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Records for Boundary {
+            fn wrote(&self, entry: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                if matches!(
+                    entry.event,
+                    crate::audit::Event::SessionClosed
+                        | crate::audit::Event::SessionTerminated { .. }
+                ) && let Some(entered) = self.entered.lock().unwrap().take()
+                {
+                    let _ = entered.send(());
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .map_err(|_| crate::audit::NotRecorded)?;
+                }
+                Ok(())
+            }
+        }
+        for terminate in [false, true] {
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let boundary = Arc::new(Boundary {
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(released),
+            });
+            let bastion = bastion_recording(
+                Arc::new(SystemClock::new().unwrap()),
+                Limits::default(),
+                Some(boundary),
+            )
+            .await;
+            let session = session_for(&bastion, AccessClass::ReadOnly).await;
+            let holder = bastion
+                .connections
+                .lock()
+                .unwrap()
+                .get(session.id.as_str())
+                .unwrap()
+                .clone();
+            let connection = holder.lock().await.clone();
+            let caller = bastion.clone();
+            let id = session.id.clone();
+            let task = tokio::spawn(async move {
+                if terminate {
+                    caller.terminate_session(&id, &alice()).await
+                } else {
+                    caller.close_session(&alice(), &id).await
+                }
+            });
+            reached.await.unwrap();
+            task.abort();
+            let _ = task.await;
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !connection.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!bastion.sessions.holds(&session.id));
+            assert!(
+                !bastion
+                    .connections
+                    .lock()
+                    .unwrap()
+                    .contains_key(session.id.as_str())
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
