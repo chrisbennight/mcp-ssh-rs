@@ -241,6 +241,25 @@ impl Transfers {
         self.local.is_some()
     }
 
+    pub fn storage_usage(&self) -> (u64, u64, u64) {
+        let items = self
+            .items
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len() as u64;
+        let snapshots = self
+            .local
+            .as_ref()
+            .map_or(0, |local| local.reserved_inputs());
+        (
+            items
+                .saturating_add(snapshots)
+                .saturating_mul(self.settings.max_bytes),
+            items,
+            snapshots,
+        )
+    }
+
     /// The validated byte ceiling shared by transfer admission and discovery.
     pub const fn max_bytes(&self) -> u64 {
         self.settings.max_bytes

@@ -103,6 +103,23 @@ impl SharedBearer {
         })
     }
 
+    pub fn accepts_authorization(&self, headers: &axum::http::HeaderMap) -> bool {
+        let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
+        }
+        let Ok(raw) = value.to_str() else {
+            return false;
+        };
+        let Some((scheme, token)) = raw.split_once(' ') else {
+            return false;
+        };
+        scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && self.accepts(token.as_bytes())
+    }
+
     /// Whether a presented value is one of the accepted credentials.
     ///
     /// Digests are compared rather than the credentials themselves, in

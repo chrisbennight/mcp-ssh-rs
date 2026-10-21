@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRequest as _, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -121,22 +121,7 @@ where
 }
 
 fn accepted(headers: &HeaderMap, evaluator: &EvaluatorSettings) -> bool {
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    let Ok(raw) = value.to_str() else {
-        return false;
-    };
-    let Some((scheme, token)) = raw.split_once(' ') else {
-        return false;
-    };
-    scheme.eq_ignore_ascii_case("bearer")
-        && !token.is_empty()
-        && evaluator.bearers.accepts(token.as_bytes())
+    evaluator.bearers.accepts_authorization(headers)
 }
 
 #[cfg(test)]
@@ -145,8 +130,8 @@ mod tests {
     use super::*;
     use crate::ingress::SharedBearer;
     use axum::body::Body;
-    use axum::http::HeaderValue;
     use axum::http::Request as HttpRequest;
+    use axum::http::{HeaderValue, header};
     use ssh_core::policy::Engine;
     use ssh_core::registry::Registry;
     use tower::ServiceExt as _;

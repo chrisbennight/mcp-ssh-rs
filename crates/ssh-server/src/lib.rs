@@ -15,6 +15,7 @@ pub mod evaluation;
 pub mod ingress;
 mod local_files;
 pub mod mcp;
+pub mod metrics;
 pub mod notify;
 pub mod process;
 mod request_limits;
@@ -39,6 +40,7 @@ use crate::mcp::SshMcp;
 use crate::settings::{Authentication, EvaluatorSettings, Settings};
 
 pub struct OptionalSurfaces {
+    pub metrics_bearers: Option<Arc<crate::ingress::SharedBearer>>,
     pub transfers: Option<Arc<crate::transfer::Transfers>>,
     pub evaluator: Option<EvaluatorSettings>,
     pub audit_reader: Arc<dyn crate::audit_history::ReadsAudit>,
@@ -133,7 +135,7 @@ where
         Router::new()
             .nest_service(MCP_PATH, mcp)
             .layer(axum::middleware::from_fn_with_state(
-                crate::request_limits::Limits::default(),
+                crate::request_limits::Limits::default().with_metrics(bastion.metrics()),
                 crate::request_limits::admit,
             ))
             .layer(axum::middleware::from_fn_with_state(
@@ -141,6 +143,11 @@ where
                 crate::ingress::require_mcp,
             ))
     });
+    let metrics_routes = optional
+        .metrics_bearers
+        .map_or_else(Router::new, |bearers| {
+            crate::metrics::routes(bastion.metrics(), optional.transfers.clone(), bearers)
+        });
     let evaluator_routes = optional.evaluator.map_or_else(Router::new, |settings| {
         crate::evaluation::routes(Arc::clone(&bastion), settings)
     });
@@ -178,6 +185,7 @@ where
         // This surface is outside both the agent and human-review layers, and
         // is absent unless a deployment explicitly configures it.
         .merge(evaluator_routes)
+        .merge(metrics_routes)
 }
 
 /// Liveness only.
@@ -305,6 +313,7 @@ pub async fn serve(
     let needs_http = settings.process.transport == Transport::Http
         || proxy.is_some()
         || settings.evaluator.is_some()
+        || settings.metrics_bearers.is_some()
         || transfers.as_ref().is_some_and(|store| !store.is_local());
     let listener = if needs_http {
         Some(tokio::net::TcpListener::bind(config.listen).await?)
@@ -348,6 +357,7 @@ pub async fn serve(
             notifier,
             settings.dashboard,
             OptionalSurfaces {
+                metrics_bearers: settings.metrics_bearers,
                 transfers: transfers.clone(),
                 evaluator: settings.evaluator,
                 audit_reader,
@@ -636,6 +646,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                metrics_bearers: None,
                 transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
@@ -660,6 +671,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                metrics_bearers: None,
                 transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
@@ -672,6 +684,7 @@ mod tests {
             "/dashboard/approvals",
             "/dashboard/assets/brand.svg",
             crate::evaluation::EVALUATION_API_PATH,
+            "/metrics",
         ] {
             let response = app
                 .clone()
@@ -734,6 +747,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                metrics_bearers: None,
                 transfers: Some(Arc::clone(&files)),
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),
@@ -1002,6 +1016,7 @@ mod tests {
             Arc::new(crate::notify::Silence),
             None,
             OptionalSurfaces {
+                metrics_bearers: None,
                 transfers: None,
                 evaluator: None,
                 audit_reader: Arc::new(crate::audit_history::Unavailable),

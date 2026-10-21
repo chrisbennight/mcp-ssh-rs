@@ -13,6 +13,7 @@ pub mod config;
 pub mod connect;
 pub mod files;
 pub mod mediate;
+pub mod metrics;
 pub mod policy;
 pub mod registry;
 pub mod run;

@@ -365,6 +365,7 @@ fn hex(bytes: &[u8]) -> String {
 /// Executions this service has started.
 pub struct Runs {
     limits: Limits,
+    metrics: Arc<crate::metrics::Metrics>,
     /// Told the moment a command finishes. Optional because a store can be used
     /// without a record - the tests in this module do - and because the store
     /// must not need to know what a record is.
@@ -500,6 +501,7 @@ impl Runs {
         rand::fill(&mut bytes);
         Self {
             limits,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             watcher,
             completions: Arc::new(tokio::sync::Semaphore::new(64)),
             minted_by: hex(&bytes),
@@ -507,6 +509,11 @@ impl Runs {
             stopping: AtomicBool::new(false),
             reading: Arc::new(Mutex::new(BTreeSet::new())),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Names one execution, unguessably.
@@ -615,6 +622,7 @@ impl Runs {
             reading: Arc::clone(&self.reading),
             id: id.0.clone(),
         };
+        let active = self.metrics.active_run();
         let watcher = self.watcher.clone();
         let completions = Arc::clone(&self.completions);
         let settled_id = id.clone();
@@ -622,6 +630,7 @@ impl Runs {
         let download_window = self.limits.download_window;
         let transfer_bytes = Arc::clone(&live.transfer_bytes);
         let checksum_bytes = self.limits.checksum_bytes;
+        let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let replacement = Arc::new(AtomicBool::new(false));
             let attempted = Arc::clone(&replacement);
@@ -705,6 +714,9 @@ impl Runs {
                     Moved::Uploaded(input) => (Some(input.succeeded()), None),
                     Moved::Inspected(info) => (None, Some(info)),
                 });
+            if let Ok((Some(file), _)) = &result {
+                metrics.transfer_completed(is_upload, file.bytes);
+            }
             {
                 let mut record = live
                     .record
@@ -734,6 +746,7 @@ impl Runs {
                     }
                 }
             }
+            drop(active);
             announce(settled_id, live, watcher, reading, completions).await;
         });
         self.wait(&id, self.limits.wait).await
@@ -815,6 +828,7 @@ impl Runs {
         // The reader outlives the caller on purpose. It is what makes a slow
         // command retrievable instead of orphaned: output keeps accumulating
         // and the exit status is recorded whenever it arrives.
+        let active = self.metrics.active_run();
         let watcher = self.watcher.clone();
         let completions = Arc::clone(&self.completions);
         let settled_id = id.clone();
@@ -838,6 +852,7 @@ impl Runs {
                     record.state = RunState::Indeterminate;
                 }
                 drop(source);
+                drop(active);
                 announce(settled_id, live, watcher, reading, completions).await;
                 return;
             }
@@ -934,6 +949,7 @@ impl Runs {
                     };
                 }
             }
+            drop(active);
             announce(settled_id, live, watcher, reading, completions).await;
         });
 

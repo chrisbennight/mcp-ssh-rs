@@ -24,6 +24,7 @@ pub(crate) struct Limits {
     polls: Arc<Semaphore>,
     body_bytes: usize,
     read_within: Duration,
+    metrics: Option<Arc<ssh_core::metrics::Metrics>>,
 }
 
 impl Default for Limits {
@@ -33,6 +34,19 @@ impl Default for Limits {
             polls: Arc::new(Semaphore::new(POLLS_IN_FLIGHT)),
             body_bytes: BODY_BYTES,
             read_within: READ_WITHIN,
+            metrics: None,
+        }
+    }
+}
+
+impl Limits {
+    pub(crate) fn with_metrics(mut self, metrics: Arc<ssh_core::metrics::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+    fn refused(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.admission_refused();
         }
     }
 }
@@ -40,6 +54,7 @@ impl Default for Limits {
 /// Mounted inside authentication and only on the MCP control route.
 pub(crate) async fn admit(State(limits): State<Limits>, request: Request, next: Next) -> Response {
     let Ok(permit) = Arc::clone(&limits.capacity).try_acquire_owned() else {
+        limits.refused();
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             "MCP request capacity reached",
@@ -56,6 +71,7 @@ pub(crate) async fn admit(State(limits): State<Limits>, request: Request, next: 
         match Arc::clone(&limits.polls).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
+                limits.refused();
                 return refuse(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "MCP polling capacity reached",

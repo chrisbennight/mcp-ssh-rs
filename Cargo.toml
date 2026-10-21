@@ -20,6 +20,7 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+prometheus-client = "0.25"
 rand = "0.10"
 rsa = "0.10.0-rc.18"
 rmcp = { version = "=2.2.0", default-features = false, features = [
