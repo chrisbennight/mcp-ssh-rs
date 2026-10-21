@@ -40,6 +40,14 @@ impl PreparedUpload {
         self
     }
 
+    pub(crate) fn counted(mut self, bytes: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.reader = Box::new(CountingReader {
+            inner: self.reader,
+            bytes,
+        });
+        self
+    }
+
     /// Ends an upload whose remote write succeeded and will be reported so.
     ///
     /// The reader is closed before the release runs, so the source is no
@@ -89,6 +97,44 @@ pub fn identity(uri: String, bytes: &[u8]) -> FileIdentity {
     }
 }
 
+pub(crate) struct CountingReader<R> {
+    pub inner: R,
+    pub bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.bytes.fetch_add(
+            buf.filled().len().saturating_sub(before) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        result
+    }
+}
+
+pub(crate) struct CountingSink {
+    pub inner: Arc<dyn DownloadSink>,
+    pub bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DownloadSink for CountingSink {
+    fn receive<'a>(&'a self, reader: &'a mut (dyn AsyncRead + Unpin + Send)) -> TransferFuture<'a> {
+        Box::pin(async move {
+            let mut reader = CountingReader {
+                inner: reader,
+                bytes: Arc::clone(&self.bytes),
+            };
+            self.inner.receive(&mut reader).await
+        })
+    }
+}
+
 pub(crate) enum Payload {
     Download(Arc<dyn DownloadSink>),
     Upload(PreparedUpload),
@@ -107,6 +153,7 @@ pub enum Failure {
     PublicationUnavailable,
     TimedOut,
     WorkerStopped,
+    Cancelled,
 }
 
 impl Failure {
@@ -121,6 +168,7 @@ impl Failure {
             Self::PublicationUnavailable => "publication_unavailable",
             Self::TimedOut => "timed_out",
             Self::WorkerStopped => "worker_stopped",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -137,6 +185,7 @@ impl Failure {
             }
             Self::TimedOut => "The transfer exceeded its time limit.",
             Self::WorkerStopped => "The transfer worker ended unexpectedly.",
+            Self::Cancelled => "The transfer was cancelled locally; remote work may be incomplete.",
         }
     }
 }

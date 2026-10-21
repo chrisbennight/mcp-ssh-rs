@@ -880,17 +880,25 @@ mod tests {
         use crate::session::{Lifetime, Purpose, SessionStore};
         use crate::transfer::{DownloadSink, Failure, Payload};
 
-        struct Unavailable(bool);
+        struct Unavailable {
+            panics: bool,
+            cancel: bool,
+            ready: Arc<tokio::sync::Notify>,
+        }
         impl DownloadSink for Unavailable {
             fn receive<'a>(
                 &'a self,
                 reader: &'a mut (dyn AsyncRead + Unpin + Send),
             ) -> crate::transfer::TransferFuture<'a> {
                 Box::pin(async move {
-                    assert!(!self.0, "synthetic transfer worker failure");
+                    assert!(!self.panics, "synthetic transfer worker failure");
                     let size = tokio::io::copy(&mut reader.take(9), &mut tokio::io::sink())
                         .await
                         .unwrap();
+                    if self.cancel {
+                        self.ready.notify_one();
+                        return std::future::pending().await;
+                    }
                     Err(if size > 8 {
                         Failure::TooLarge
                     } else {
@@ -929,12 +937,19 @@ mod tests {
             }
         }
         let observed = Arc::new(Observed(std::sync::Mutex::new(Vec::new())));
-        let runs = Runs::watched(Limits::default(), Some(observed.clone()));
+        let runs = Runs::watched(
+            Limits {
+                wait: Duration::from_millis(20),
+                ..Limits::default()
+            },
+            Some(observed.clone()),
+        );
         for (remote, cause, panics) in [
             ("/missing", Failure::NotFound, false),
             ("/large", Failure::TooLarge, false),
             ("/present", Failure::PublicationUnavailable, false),
             ("/present", Failure::WorkerStopped, true),
+            ("/present", Failure::Cancelled, false),
         ] {
             let action = crate::action::Action::download(path(remote)).unwrap();
             let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
@@ -947,14 +962,26 @@ mod tests {
                 .into_parts()
                 .1
                 .unwrap();
+            let ready = Arc::new(tokio::sync::Notify::new());
             let mut outcome = runs
                 .transfer(
                     connection.clone(),
                     receipt,
-                    Payload::Download(Arc::new(Unavailable(panics))),
+                    Payload::Download(Arc::new(Unavailable {
+                        panics,
+                        cancel: cause == Failure::Cancelled,
+                        ready: Arc::clone(&ready),
+                    })),
                 )
                 .await
                 .unwrap();
+            if cause == Failure::Cancelled {
+                tokio::time::timeout(Duration::from_secs(3), ready.notified())
+                    .await
+                    .unwrap();
+                assert!(outcome.still_running());
+                runs.cancel(outcome.run()).unwrap();
+            }
             if outcome.still_running() {
                 outcome = runs
                     .wait(outcome.run(), Duration::from_secs(10))
@@ -968,6 +995,14 @@ mod tests {
                     remote_write_may_be_partial: false
                 }
             );
+            if cause == Failure::Cancelled {
+                let progress = runs.progress(outcome.run()).unwrap();
+                assert_eq!(
+                    progress.cancellation,
+                    crate::run::Cancellation::TransferStopped
+                );
+                assert_eq!(progress.transfer_bytes_read, 5);
+            }
             assert!(outcome.file().is_none());
             assert!(!outcome.stderr().text.contains("private storage"));
             let later = runs.wait(outcome.run(), Duration::ZERO).await.unwrap();
@@ -985,7 +1020,7 @@ mod tests {
             );
             assert!(runs.forget(outcome.run()));
         }
-        assert_eq!(observed.0.lock().unwrap().len(), 4);
+        assert_eq!(observed.0.lock().unwrap().len(), 5);
         std::fs::remove_dir_all(root).unwrap();
     }
 

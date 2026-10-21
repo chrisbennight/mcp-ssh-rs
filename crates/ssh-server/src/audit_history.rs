@@ -592,6 +592,12 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             validate_recorded(object.get("stdout").ok_or(())?)?;
             validate_recorded(object.get("stderr").ok_or(())?)
         }
+        "cancellation_requested" => {
+            exact_keys(object, &["event", "run", "decided"])?;
+            RunId::parse(required_string(object, "run")?).map_err(|_| ())?;
+            required_u64(object, "decided")?;
+            Ok(())
+        }
         "session_closed" => exact_keys(object, &["event"]),
         "session_terminated" => {
             exact_keys(object, &["event", "operator"])?;

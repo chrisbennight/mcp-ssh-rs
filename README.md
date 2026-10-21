@@ -40,6 +40,10 @@ agent's stated purpose together in the browser. Try creating a file on a
 disposable target and collecting the approved result.
 [Follow the approval walkthrough](docs/quickstart.md#request-approval).
 
+**Inspect or cancel running work.** Read bounded counters without collecting the
+result, or explicitly request cancellation of a command or transfer.
+[Run control](docs/operations.md#approvals-and-recovery).
+
 **Move files over SFTP.** Upload a file or retrieve a binary artifact using file
 references, streaming through disk storage with a configurable 2 GB default file
 limit. [Set up file transfers](docs/file-transfers.md).

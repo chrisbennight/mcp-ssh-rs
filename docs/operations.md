@@ -164,8 +164,8 @@ sudo access to a role intended for diagnosis.
 
 Set every account's `access_class` to `read_only` or `privileged`; the service
 rejects missing or unrecognized classes. Discovery returns that configured class.
-Include `host`, `role`, and `access_class` when opening, executing, polling, or
-closing a session. The arguments must match the configured account and the
+Include `host`, `role`, and `access_class` when opening, executing, polling,
+inspecting, cancelling, or closing a session. The arguments must match the configured account and the
 session; they let an upstream gateway make an account-access decision.
 
 ## Local review and configuration changes
@@ -197,6 +197,20 @@ command returns an approval URL if configured. Review the actual arguments and
 target before approving. After approval, resubmit that held command once to
 collect the decision. If execution is still running, use `ssh_poll` with the
 returned run identifier. A completed poll result is consumed, so retain it.
+
+`ssh_progress` returns immediately with run state, time since registration, stream byte
+counts, transfer bytes read, and cancellation status. It does not release the
+result or expose output; use `ssh_poll` to collect it. Transfer bytes count
+source reads, not confirmed remote writes.
+
+`ssh_cancel` records an explicit cancellation request for an owned run. For a
+command, the reader sends SSH TERM and continues observing the channel. A
+`signal_sent` response means the signal request was sent; SSH servers may ignore
+it, and it does not prove termination. Use progress and the eventual poll result
+to learn what happened. For a transfer, cancellation stops the local worker;
+remote requests already sent may still finish and uploads may be partial.
+Cancelling an MCP wait alone leaves the operation running. Closing a session
+remains the way to close its connection and all associated work.
 
 If a connection ends with an unknown execution outcome, inspect the target or
 ask its administrator before repeating a consequential operation. An expired
