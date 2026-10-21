@@ -85,10 +85,14 @@ authentication.
 
 The authenticated MCP control route accepts request bodies up to 256 KiB,
 allows ten seconds to read a body, and admits at most 64 requests concurrently.
+At most 32 of those requests may be `ssh_poll` calls, leaving capacity for other
+control operations while clients wait for runs to finish.
 It returns HTTP 413 for excess bytes, 408 for a body-read timeout, 400 for a
 body transport error, or 503 when request capacity is occupied. Capacity is
-released on completion or cancellation. These limits apply before JSON decoding
-and are fixed service defaults. They do not limit command runtime or the
+released when responses are consumed or dropped, including cancelled requests.
+The body and overall concurrency limits apply before MCP dispatch; polling is
+classified from the bounded request body. These are fixed service defaults.
+They do not limit command runtime or the
 separate streaming file-byte routes; see [file transfer limits](file-transfers.md#limits-and-outcomes).
 
 ## Process-local audit retention
