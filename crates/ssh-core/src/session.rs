@@ -562,16 +562,18 @@ impl<C: Clock> SessionStore<C> {
         })
     }
 
-    /// Current usable slots and the configured per-principal limit.
+    /// Live sessions and pending opens against the configured principal limit.
     #[must_use]
     pub fn usage(&self, principal: &PrincipalId) -> (usize, usize) {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         (
             sessions
                 .values()
                 .filter(|session| &session.principal == principal && session.expiry(now).is_none())
-                .count(),
+                .count()
+                .saturating_add(pending.get(principal).copied().unwrap_or(0)),
             self.per_principal,
         )
     }
@@ -746,11 +748,14 @@ mod tests {
     fn pending_connections_share_capacity_and_release_it_on_drop() {
         let store = SessionStore::new(TestClock::at(1_000), LIFETIME, 1);
         let opening = store.reserve(principal("alice")).unwrap();
+        assert_eq!(store.usage(&principal("alice")), (1, 1));
         assert!(store.reserve(principal("alice")).is_err());
         assert!(store.live().is_empty());
         drop(store.reserve(principal("bob")).unwrap());
         drop(opening);
+        assert_eq!(store.usage(&principal("alice")), (0, 1));
         let session = open(&store, "alice");
+        assert_eq!(store.usage(&principal("alice")), (1, 1));
         assert!(store.reserve(principal("alice")).is_err());
         store.close(&session.id, &principal("alice")).unwrap();
         assert!(store.reserve(principal("alice")).is_ok());
