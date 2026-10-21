@@ -136,8 +136,12 @@ interruption can leave a remote upload partial; replacement is not an atomic
 remote transaction. An unknown result must be investigated before repeating an
 upload. The service never automatically replays a mutation.
 
-Downloads keep at most eight read chunks of up to 64 KiB in flight or awaiting
-delivery, a 512 KiB read-ahead budget independent of file size. Negotiated peer
+Downloads default to eight read chunks of up to 64 KiB in flight or awaiting
+delivery, a 512 KiB read-ahead budget independent of file size. Set
+`MCP_SSH_SFTP_READ_AHEAD` before startup to an integer from 1 through 64 to tune
+that window. The maximum schedules up to 4 MiB per active download. Larger
+windows can help higher-latency links and increase memory use; they do not
+guarantee higher throughput. Invalid values prevent startup. Negotiated peer
 limits can reduce chunk size. Responses are validated and delivered in offset
 order, including short reads; a slow consumer stops further requests once that
 window is occupied. Protocol framing and SSH have separate bounded buffers.

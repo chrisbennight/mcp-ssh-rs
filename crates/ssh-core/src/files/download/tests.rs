@@ -163,15 +163,17 @@ async fn ordered_delivery_preserves_short_reads_and_binary_data() {
         (Reply::Ordinary, 0),
         (Reply::Ordinary, 248),
     ] {
-        let (session, peer) = fixture(size, Duration::from_millis(1), mode, true).await;
-        let mut reader = Reader::new(session, "fixture".into(), 31, READ_AHEAD).unwrap();
-        let mut received = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut received))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&received, &*peer.bytes);
-        assert!(peer.maximum.load(Ordering::SeqCst) <= READ_AHEAD);
+        for window in [1, READ_AHEAD, super::super::DownloadWindow::MAX_REQUESTS] {
+            let (session, peer) = fixture(size, Duration::from_millis(1), mode, true).await;
+            let mut reader = Reader::new(session, "fixture".into(), 31, window).unwrap();
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&received, &*peer.bytes);
+            assert!(peer.maximum.load(Ordering::SeqCst) <= window);
+        }
     }
 }
 
@@ -236,7 +238,10 @@ async fn read_budgets_reject_zero_and_excess() {
         (0, 1),
         (CHUNK_BYTES.saturating_add(1), 1),
         (CHUNK_BYTES, 0),
-        (CHUNK_BYTES, READ_AHEAD.saturating_add(1)),
+        (
+            CHUNK_BYTES,
+            super::super::DownloadWindow::MAX_REQUESTS.saturating_add(1),
+        ),
     ] {
         assert!(Reader::new(Arc::clone(&session), "fixture".into(), size, window).is_err());
     }
@@ -278,7 +283,12 @@ async fn latency_benchmark() {
     for size in [256 << 10, 4 << 20] {
         for rtt_ms in [0, 10, 50, 100] {
             for sink_ms in [0, 5] {
-                for window in [1, READ_AHEAD] {
+                for window in [
+                    1,
+                    READ_AHEAD,
+                    32,
+                    super::super::DownloadWindow::MAX_REQUESTS,
+                ] {
                     let (session, peer) =
                         fixture(size, Duration::from_millis(rtt_ms), Reply::Ordinary, false).await;
                     let mut reader =
