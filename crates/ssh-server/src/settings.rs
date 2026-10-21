@@ -48,6 +48,7 @@ pub struct EvaluatorSettings {
 /// them, so only its presence is shown.
 pub struct Settings {
     pub sessions_per_principal: usize,
+    pub download_window: ssh_core::files::DownloadWindow,
     pub operator_header: axum::http::HeaderName,
     pub file_origin: Option<Url>,
     pub file_root: Option<PathBuf>,
@@ -110,6 +111,7 @@ impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Settings")
             .field("sessions_per_principal", &self.sessions_per_principal)
+            .field("download_window", &self.download_window)
             .field("registry", &self.registry)
             .field("bearers", &self.bearers)
             .field("proxy_bearers", &self.proxy_bearers)
@@ -127,6 +129,7 @@ impl std::fmt::Debug for Settings {
 impl Settings {
     pub const SESSIONS_PER_PRINCIPAL_VAR: &'static str = "MCP_SSH_SESSIONS_PER_PRINCIPAL";
     pub const DEFAULT_SESSIONS_PER_PRINCIPAL: usize = 32;
+    pub const SFTP_READ_AHEAD_VAR: &'static str = "MCP_SSH_SFTP_READ_AHEAD";
     pub const AUTH_MODE_VAR: &'static str = "MCP_SSH_AUTH_MODE";
     pub const STANDALONE_BEARER_VAR: &'static str = "MCP_SSH_BEARER";
     pub const PRINCIPAL_VAR: &'static str = "MCP_SSH_PRINCIPAL";
@@ -455,7 +458,19 @@ impl Settings {
             timeout: std::time::Duration::from_secs(seconds),
             staging: optional(&lookup, Self::STAGING_VAR)?.map_or(defaults.staging, PathBuf::from),
         };
+        let download_window = positive(
+            &lookup,
+            Self::SFTP_READ_AHEAD_VAR,
+            ssh_core::files::DownloadWindow::default().requests() as u64,
+        )?;
+        let download_window = usize::try_from(download_window)
+            .ok()
+            .and_then(ssh_core::files::DownloadWindow::new)
+            .ok_or(SettingsError::Unusable {
+                var: Self::SFTP_READ_AHEAD_VAR,
+            })?;
         Ok(Self {
+            download_window,
             sessions_per_principal: usize::try_from(positive(
                 &lookup,
                 Self::SESSIONS_PER_PRINCIPAL_VAR,
@@ -489,6 +504,7 @@ impl Settings {
         let mut bounds = bounds();
         bounds.sessions_per_principal = self.sessions_per_principal;
         bounds.run.transfer_timeout = self.transfers.timeout;
+        bounds.run.download_window = self.download_window;
         bounds
     }
 }
@@ -705,6 +721,43 @@ mod tests {
             (Settings::STANDALONE_BEARER_VAR, BEARER.to_owned()),
             (Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned()),
         ])
+    }
+
+    #[test]
+    fn download_read_ahead_is_bounded_and_reaches_effective_run_limits() {
+        for (configured, expected) in [
+            (None, 8),
+            (Some("1"), 1),
+            (Some("32"), 32),
+            (Some("64"), 64),
+        ] {
+            let mut vars = standalone();
+            if let Some(value) = configured {
+                vars.insert(Settings::SFTP_READ_AHEAD_VAR, value.to_owned());
+            }
+            let settings = Settings::from_lookup(read(&vars)).unwrap();
+            assert_eq!(settings.bounds().run.download_window.requests(), expected);
+        }
+        for value in [
+            "0",
+            "65",
+            "",
+            " ",
+            "-1",
+            "1.5",
+            " 8",
+            "8 ",
+            "18446744073709551616",
+        ] {
+            let mut vars = standalone();
+            vars.insert(Settings::SFTP_READ_AHEAD_VAR, value.to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&vars)),
+                Err(SettingsError::Unusable {
+                    var: Settings::SFTP_READ_AHEAD_VAR
+                })
+            ));
+        }
     }
 
     #[test]

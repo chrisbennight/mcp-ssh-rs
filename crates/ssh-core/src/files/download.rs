@@ -40,7 +40,10 @@ impl Reader {
         chunk_bytes: u32,
         window: usize,
     ) -> io::Result<Self> {
-        if chunk_bytes == 0 || chunk_bytes > CHUNK_BYTES || window == 0 || window > READ_AHEAD {
+        if chunk_bytes == 0
+            || chunk_bytes > CHUNK_BYTES
+            || super::DownloadWindow::new(window).is_none()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid SFTP read budget",

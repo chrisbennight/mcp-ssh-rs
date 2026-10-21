@@ -26,6 +26,32 @@ mod download;
 // larger declaration before the dependency sees it.
 const MAX_SFTP_FRAME_BYTES: u32 = (1 << 20) + (64 << 10);
 
+/// Bounded concurrent read requests for one SFTP download.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadWindow(usize);
+
+impl DownloadWindow {
+    pub const MAX_REQUESTS: usize = 64;
+
+    pub const fn new(requests: usize) -> Option<Self> {
+        if requests > 0 && requests <= Self::MAX_REQUESTS {
+            Some(Self(requests))
+        } else {
+            None
+        }
+    }
+
+    pub const fn requests(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for DownloadWindow {
+    fn default() -> Self {
+        Self(download::READ_AHEAD)
+    }
+}
+
 /// A transparent SFTP stream that validates each inbound frame before exposing
 /// its four-byte length header to the protocol decoder.
 ///
@@ -305,6 +331,7 @@ pub(crate) async fn download(
     connection: &Connection,
     path: &RemotePath,
     sink: &dyn crate::transfer::DownloadSink,
+    window: DownloadWindow,
 ) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
     let mut sftp = RawSftpSession::new(binary_stream(connection).await?);
     let version = sftp.init().await.map_err(|source| FileError::Unavailable {
@@ -360,7 +387,7 @@ pub(crate) async fn download(
             .map_err(|source| failed(path, &source))?
             .handle;
         let mut reader =
-            download::Reader::new(Arc::clone(&sftp), handle, chunk_bytes, download::READ_AHEAD)
+            download::Reader::new(Arc::clone(&sftp), handle, chunk_bytes, window.requests())
                 .map_err(|_| crate::transfer::Failure::RemoteIo)?;
         let received = sink.receive(&mut reader).await;
         drop(reader);
@@ -1082,7 +1109,12 @@ mod tests {
         let connection = served_with_close(&root, false).await;
         let received = tokio::time::timeout(
             Duration::from_secs(2),
-            download(&connection, &path("/binary"), &HashSink),
+            download(
+                &connection,
+                &path("/binary"),
+                &HashSink,
+                DownloadWindow::default(),
+            ),
         )
         .await
         .unwrap()
@@ -1106,7 +1138,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            download(&connection, &remote, &HashSink).await.unwrap(),
+            download(&connection, &remote, &HashSink, DownloadWindow::default())
+                .await
+                .unwrap(),
             crate::transfer::identity(String::new(), &bytes)
         );
         assert!(
@@ -1131,7 +1165,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            download(&connection, &remote, &HashSink).await.unwrap(),
+            download(&connection, &remote, &HashSink, DownloadWindow::default())
+                .await
+                .unwrap(),
             crate::transfer::identity(String::new(), b"replacement")
         );
         std::fs::remove_dir_all(root).unwrap();

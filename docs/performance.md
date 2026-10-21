@@ -11,7 +11,7 @@ cargo test -p ssh-core --locked latency_benchmark -- --ignored --nocapture --tes
 ```
 
 The fixture exchanges real SFTP packets over a local duplex stream. It compares
-serial downloads with the bounded concurrent reader and exercises the unchanged
+serial downloads with bounded windows of 8, 32, and 64 requests and exercises the unchanged
 dependency upload writer. Cases vary file size, response delay, and consumer
 delay. The response delays model round-trip latency; the consumer delay models
 storage backpressure. This isolates scheduling and does not measure SSH

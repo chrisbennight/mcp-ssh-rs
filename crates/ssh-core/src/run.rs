@@ -105,6 +105,8 @@ pub struct Limits {
     pub output_bytes: usize,
     /// Maximum elapsed time for one file operation.
     pub transfer_timeout: Duration,
+    /// Bounded read-ahead for each SFTP download.
+    pub download_window: crate::files::DownloadWindow,
     /// How long a caller waits before a run is handed back as still running.
     pub wait: Duration,
 }
@@ -114,6 +116,7 @@ impl Default for Limits {
         Self {
             output_bytes: 1 << 20,
             transfer_timeout: Duration::from_secs(1800),
+            download_window: crate::files::DownloadWindow::default(),
             wait: Duration::from_secs(30),
         }
     }
@@ -575,12 +578,13 @@ impl Runs {
         let watcher = self.watcher.clone();
         let settled_id = id.clone();
         let transfer_timeout = self.limits.transfer_timeout;
+        let download_window = self.limits.download_window;
         tokio::spawn(async move {
             let _reading = reading;
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
-                        crate::files::download(&connection, &path, &*sink)
+                        crate::files::download(&connection, &path, &*sink, download_window)
                             .await
                             .map(Moved::Downloaded)
                     }
