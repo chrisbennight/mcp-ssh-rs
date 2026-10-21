@@ -224,17 +224,21 @@ pub struct Outcome {
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<crate::action::FileIdentity>,
     #[serde(skip)]
-    stdout_bytes: Vec<u8>,
+    stdout_bytes: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
-    stderr_bytes: Vec<u8>,
+    stderr_bytes: Option<Arc<Vec<u8>>>,
 }
 
 impl Outcome {
     pub fn stdout_bytes(&self) -> &[u8] {
-        &self.stdout_bytes
+        self.stdout_bytes
+            .as_ref()
+            .map_or(&[], |bytes| bytes.as_slice())
     }
     pub fn stderr_bytes(&self) -> &[u8] {
-        &self.stderr_bytes
+        self.stderr_bytes
+            .as_ref()
+            .map_or(&[], |bytes| bytes.as_slice())
     }
 
     pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
@@ -289,8 +293,8 @@ impl Outcome {
             run,
             authorization,
             state,
-            stdout_bytes: stdout.text.as_bytes().to_vec(),
-            stderr_bytes: Vec::new(),
+            stdout_bytes: Some(Arc::new(stdout.text.as_bytes().to_vec())),
+            stderr_bytes: None,
             stdout,
             file: None,
             stderr: Stream {
@@ -398,7 +402,7 @@ struct Record {
 
 /// A bounded view of one stream.
 struct Collected {
-    kept: Vec<u8>,
+    kept: Arc<Vec<u8>>,
     seen: u64,
     limit: usize,
     /// What the whole stream looked like, decided as it went past.
@@ -411,7 +415,7 @@ struct Collected {
 impl Collected {
     fn new(limit: usize) -> Self {
         Self {
-            kept: Vec::new(),
+            kept: Arc::default(),
             seen: 0,
             limit,
             matched: None,
@@ -432,21 +436,13 @@ impl Collected {
         }
         let room = self.limit.saturating_sub(self.kept.len());
         if room > 0 {
-            self.kept
-                .extend_from_slice(data.get(..room).unwrap_or(data));
+            Arc::make_mut(&mut self.kept).extend_from_slice(data.get(..room).unwrap_or(data));
         }
     }
 
-    fn snapshot(&self, complete: bool) -> Stream {
+    fn snapshot(&self) -> Stream {
         Stream {
-            // Lossy because command output is bytes, not text, and truncating
-            // at a byte bound can split a character. Refusing to report output
-            // that is not valid UTF-8 would lose the output entirely.
-            text: if complete {
-                String::from_utf8_lossy(&self.kept).into_owned()
-            } else {
-                String::new()
-            },
+            text: String::new(),
             truncated: self.seen > self.kept.len() as u64,
             bytes: self.seen,
             matched: self.matched,
@@ -1049,24 +1045,36 @@ fn snapshot_of(id: &RunId, live: &Live) -> Outcome {
     // Running output is never delivered. Retain its counters without copying
     // the potentially large byte buffers or decoding text nobody can receive.
     let complete = record.state != RunState::Running;
-    Outcome {
+    let mut outcome = Outcome {
         run: id.clone(),
         authorization: live.authorization.clone(),
         state: record.state,
-        stdout: record.stdout.snapshot(complete),
-        stderr: record.stderr.snapshot(complete),
+        stdout: record.stdout.snapshot(),
+        stderr: record.stderr.snapshot(),
         file: record.file.clone(),
         stdout_bytes: if complete {
-            record.stdout.kept.clone()
+            Some(Arc::clone(&record.stdout.kept))
         } else {
-            Vec::new()
+            None
         },
         stderr_bytes: if complete {
-            record.stderr.kept.clone()
+            Some(Arc::clone(&record.stderr.kept))
         } else {
-            Vec::new()
+            None
         },
+    };
+    drop(record);
+    // Terminal streams are immutable. Decode only after releasing the record
+    // mutex; withheld audit output needs counters rather than a text copy.
+    if complete {
+        if outcome.stdout.matched.is_none() {
+            outcome.stdout.text = String::from_utf8_lossy(outcome.stdout_bytes()).into_owned();
+        }
+        if outcome.stderr.matched.is_none() {
+            outcome.stderr.text = String::from_utf8_lossy(outcome.stderr_bytes()).into_owned();
+        }
     }
+    outcome
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -1132,7 +1140,7 @@ mod tests {
             assert!(runs.finished(&id).is_none());
             let pending = runs.wait(&id, Duration::ZERO).await.unwrap();
             assert_eq!(pending.stdout.text.capacity(), 0);
-            assert_eq!(pending.stdout_bytes.capacity(), 0);
+            assert!(pending.stdout_bytes.is_none());
             assert!(pending.stdout.bytes > bytes.len() as u64);
             assert!(pending.stdout.truncated);
             assert!(pending.stdout.matched.is_some());
@@ -1150,16 +1158,43 @@ mod tests {
             while let Some(result) = waiters.join_next().await {
                 let result = result.unwrap();
                 assert_eq!(result.state(), RunState::Exited { code: 0 });
-                assert_eq!(result.stdout_bytes, bytes);
+                assert_eq!(result.stdout_bytes(), bytes);
             }
         })
         .await
         .unwrap();
         let completed = runs.wait(&id, Duration::from_secs(30)).await.unwrap();
-        assert_eq!(completed.stdout_bytes, bytes);
-        assert_eq!(completed.stdout.text, String::from_utf8_lossy(&bytes));
+        assert_eq!(completed.stdout_bytes(), bytes);
+        assert!(completed.stdout.text.is_empty());
         assert!(completed.stdout.matched.is_some());
-        assert_eq!(runs.finished(&id).unwrap().stdout_bytes, bytes);
+        let second = runs.finished(&id).unwrap();
+        assert_eq!(second.stdout_bytes(), bytes);
+        assert!(std::ptr::eq(
+            completed.stdout_bytes(),
+            second.stdout_bytes()
+        ));
+    }
+
+    #[test]
+    fn completed_snapshots_share_retained_bytes_and_decode_audit_text() {
+        let mut stdout = Collected::new(4096);
+        stdout.push(b"complete output");
+        let live = Live {
+            record: Mutex::new(Record {
+                file: None,
+                stdout,
+                stderr: Collected::new(4096),
+                state: RunState::Exited { code: 0 },
+            }),
+            authorization: recorded(&["true"]).authorization().clone(),
+            settled: Notify::new(),
+        };
+        let id = Runs::new(Limits::default()).mint_id();
+        let first = snapshot_of(&id, &live);
+        let second = snapshot_of(&id, &live);
+        assert_eq!(first.stdout.text, "complete output");
+        assert_eq!(second.stdout.text, first.stdout.text);
+        assert!(std::ptr::eq(first.stdout_bytes(), second.stdout_bytes()));
     }
 
     #[tokio::test]
@@ -1203,7 +1238,11 @@ mod tests {
     fn polling_benchmark() {
         use std::io::Write as _;
         for retained in [32, 1 << 20] {
-            for eager in [true, false] {
+            for path in [
+                "previous_eager_status",
+                "metadata_status",
+                "completed_shared_bytes",
+            ] {
                 let mut stdout = Collected::new(retained);
                 let mut stderr = Collected::new(retained);
                 stdout.push(&vec![b'x'; retained]);
@@ -1213,7 +1252,11 @@ mod tests {
                         file: None,
                         stdout,
                         stderr,
-                        state: RunState::Running,
+                        state: if path == "completed_shared_bytes" {
+                            RunState::Exited { code: 0 }
+                        } else {
+                            RunState::Running
+                        },
                     }),
                     authorization: recorded(&["true"]).authorization().clone(),
                     settled: Notify::new(),
@@ -1238,18 +1281,17 @@ mod tests {
                     start.wait();
                     let mut allocated = 0_usize;
                     for _ in 0..100 {
-                        let copied = if eager {
+                        let copied = if path == "previous_eager_status" {
                             // Reproduce the former status path's output copies
                             // under the same lock; exclude common metadata.
                             let record = live.record.lock().unwrap();
-                            let stdout = record.stdout.snapshot(true);
-                            let stderr = record.stderr.snapshot(true);
-                            let raw_out = record.stdout.kept.clone();
-                            let raw_err = record.stderr.kept.clone();
+                            let raw_out = record.stdout.kept.as_ref().clone();
+                            let raw_err = record.stderr.kept.as_ref().clone();
+                            let stdout = String::from_utf8_lossy(&raw_out).into_owned();
+                            let stderr = String::from_utf8_lossy(&raw_err).into_owned();
                             let size = stdout
-                                .text
                                 .capacity()
-                                .saturating_add(stderr.text.capacity())
+                                .saturating_add(stderr.capacity())
                                 .saturating_add(raw_out.capacity())
                                 .saturating_add(raw_err.capacity());
                             std::hint::black_box((stdout, stderr, raw_out, raw_err));
@@ -1260,9 +1302,7 @@ mod tests {
                                 .stdout
                                 .text
                                 .capacity()
-                                .saturating_add(outcome.stderr.text.capacity())
-                                .saturating_add(outcome.stdout_bytes.capacity())
-                                .saturating_add(outcome.stderr_bytes.capacity());
+                                .saturating_add(outcome.stderr.text.capacity());
                             std::hint::black_box(outcome);
                             size
                         };
@@ -1270,7 +1310,7 @@ mod tests {
                     }
                     (allocated, writer.join().unwrap())
                 });
-                let result = serde_json::json!({"path":if eager {"previous_eager_status"} else {"metadata_status"}, "retained_bytes_per_stream":retained, "polls":100, "output_allocation_capacity_bytes":allocated, "seconds":started.elapsed().as_secs_f64(), "writer_lock_wait_seconds":writer_wait.as_secs_f64()});
+                let result = serde_json::json!({"path":path, "retained_bytes_per_stream":retained, "polls":100, "output_allocation_capacity_bytes":allocated, "seconds":started.elapsed().as_secs_f64(), "writer_lock_wait_seconds":writer_wait.as_secs_f64()});
                 let mut output = std::io::stdout().lock();
                 serde_json::to_writer(&mut output, &result).unwrap();
                 output.write_all(b"\n").unwrap();

@@ -38,12 +38,14 @@ cargo test -p ssh-core --locked polling_benchmark -- --ignored --nocapture --tes
 ```
 
 The fixture compares the former eager output-copying operation with the current
-running-status snapshot on small and full retained streams. It measures output
-buffer allocation capacity and time while another thread contends for the record
+running-status snapshot and completed snapshots that share retained bytes, on
+small and full retained streams. It measures output buffer allocation capacity
+and time while another thread contends for the record
 mutex. The allocation figure is the actual capacity of the copied output
-buffers, excluding common metadata and allocator overhead; it is not a claim of
-zero total allocations. Lock-wait time is the competing thread's observed total
-and depends on scheduling. Both paths use the same retained input and process.
+buffers, excluding shared byte storage, common metadata, and allocator overhead;
+it is not a claim of zero total allocations. Lock-wait time is the competing
+thread's observed total and depends on scheduling. All paths use the same
+retained input and process.
 
 Record the compiler, build profile, host load, and measured results with any
 performance claim. A latency-controlled fixture supports conclusions about its
