@@ -131,7 +131,10 @@ output directory belonging to that stopped process. Do not remove another live
 process's directory or user input files.
 
 SFTP work uses the existing run tracker, survives a cancelled MCP call, and can
-be polled with `ssh_poll`. File operations have a bounded runtime. Failure or
+be polled with `ssh_poll`. Use `ssh_progress` for counters without collecting
+the result, or `ssh_cancel` to request cancellation. Cancelled uploads may have
+partial remote writes; inspect the outcome before retrying. File operations
+have a bounded runtime. Failure or
 interruption can leave a remote upload partial; replacement is not an atomic
 remote transaction. An unknown result must be investigated before repeating an
 upload. The service never automatically replays a mutation.

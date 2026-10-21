@@ -349,6 +349,10 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<crate::action::FileIdentity>,
     },
+    CancellationRequested {
+        run: RunId,
+        decided: u64,
+    },
     SessionClosed,
     SessionTerminated {
         operator: PrincipalId,
@@ -1142,6 +1146,24 @@ impl<C: Clock> Ledger<C> {
                 access_class: session.access_class,
             },
         )
+    }
+
+    pub(crate) fn record_cancellation(
+        &self,
+        run: &RunId,
+        authorization: &Authorization,
+    ) -> Result<Entry, AuditError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        this_records_decision(&state, authorization)?;
+        self.append_to(
+            &mut state,
+            authorization.who.clone(),
+            Event::CancellationRequested {
+                run: run.clone(),
+                decided: authorization.sequence(),
+            },
+        )
+        .map(|written| (*written.entry).clone())
     }
 
     pub fn record_session_closed(&self, session: &Session) -> Result<Entry, AuditError> {

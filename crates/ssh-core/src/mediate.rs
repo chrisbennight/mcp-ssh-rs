@@ -898,6 +898,42 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         revoked
     }
 
+    /// Inspects an owned run without collecting its output.
+    pub fn progress(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        run: &RunId,
+    ) -> Result<crate::run::Progress, MediationError> {
+        let session = self.sessions.use_session(session, principal)?;
+        if !self.runs.belongs_to(run, &session.id) {
+            return Err(RunError::Unknown {
+                run: run.as_str().to_owned(),
+            }
+            .into());
+        }
+        Ok(self.runs.progress(run)?)
+    }
+
+    /// Records an explicit owner cancellation request before notifying the worker.
+    pub fn cancel(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        run: &RunId,
+    ) -> Result<crate::run::Progress, MediationError> {
+        self.progress(principal, session, run)?;
+        let authorization = self
+            .runs
+            .authorization(run)
+            .ok_or_else(|| RunError::Unknown {
+                run: run.as_str().to_owned(),
+            })?;
+        self.ledger.record_cancellation(run, &authorization)?;
+        self.sessions.use_session(session, principal)?;
+        Ok(self.runs.cancel(run)?)
+    }
+
     /// Asks again about a command that outlived its caller's wait.
     pub async fn poll(
         &self,
@@ -1645,6 +1681,70 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn progress_and_cancellation_require_the_owning_session_and_audit_acknowledgement() {
+        struct Boundary(AtomicBool);
+        impl Records for Boundary {
+            fn wrote(&self, entry: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                if matches!(
+                    entry.event,
+                    crate::audit::Event::CancellationRequested { .. }
+                ) && self.0.load(Ordering::SeqCst)
+                {
+                    return Err(crate::audit::NotRecorded);
+                }
+                Ok(())
+            }
+        }
+        let boundary = Arc::new(Boundary(AtomicBool::new(false)));
+        let bastion = bastion_recording(
+            Arc::new(SystemClock::new().unwrap()),
+            Limits {
+                wait: Duration::from_millis(10),
+                ..Limits::default()
+            },
+            Some(boundary.clone()),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        let other = session_for(&bastion, AccessClass::ReadOnly).await;
+        let Executed::Ran { outcome, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["sleep", "2"]))
+            .await
+            .unwrap()
+        else {
+            panic!("run starts");
+        };
+        let id = outcome.run();
+        let stranger = PrincipalId::parse("stranger").unwrap();
+        assert!(bastion.progress(&stranger, &session.id, id).is_err());
+        assert!(bastion.cancel(&alice(), &other.id, id).is_err());
+        assert!(bastion.progress(&alice(), &other.id, id).is_err());
+        assert_eq!(
+            bastion
+                .progress(&alice(), &session.id, id)
+                .unwrap()
+                .cancellation,
+            crate::run::Cancellation::NotRequested
+        );
+        boundary.0.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            bastion.cancel(&alice(), &session.id, id),
+            Err(MediationError::Audit(AuditError::NotRecorded))
+        ));
+        assert_eq!(
+            bastion
+                .progress(&alice(), &session.id, id)
+                .unwrap()
+                .cancellation,
+            crate::run::Cancellation::NotRequested
+        );
+        boundary.0.store(false, Ordering::SeqCst);
+        bastion.cancel(&alice(), &session.id, id).unwrap();
+        assert!(bastion.ledger.entries().iter().any(|entry| matches!(entry.event, crate::audit::Event::CancellationRequested { ref run, .. } if run == id)));
+        bastion.close_session(&alice(), &session.id).await.unwrap();
     }
 
     #[tokio::test]

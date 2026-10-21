@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -198,6 +198,29 @@ impl RunState {
             Self::TransferFailed { .. } => "failed to transfer",
         }
     }
+}
+
+/// A bounded view that does not collect or release a result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Progress {
+    pub run: RunId,
+    pub state: RunState,
+    pub elapsed_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// Bytes consumed from the transfer source, not acknowledged remote writes.
+    pub transfer_bytes_read: u64,
+    pub cancellation: Cancellation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cancellation {
+    NotRequested,
+    Requested,
+    SignalSent,
+    SignalFailed,
+    TransferStopped,
 }
 
 /// What a caller learns about an execution.
@@ -391,6 +414,10 @@ struct Live {
     authorization: Authorization,
     /// Signalled when the execution reaches a terminal state.
     settled: Notify,
+    started: Instant,
+    cancel: Notify,
+    cancellation: AtomicU8,
+    transfer_bytes: Arc<AtomicU64>,
 }
 
 struct Record {
@@ -552,6 +579,10 @@ impl Runs {
             }),
             authorization: recorded.authorization().clone(),
             settled: Notify::new(),
+            started: Instant::now(),
+            cancel: Notify::new(),
+            cancellation: AtomicU8::new(0),
+            transfer_bytes: Arc::new(AtomicU64::new(0)),
         });
         {
             let mut records = self
@@ -575,14 +606,23 @@ impl Runs {
         let settled_id = id.clone();
         let transfer_timeout = self.limits.transfer_timeout;
         let download_window = self.limits.download_window;
+        let transfer_bytes = Arc::clone(&live.transfer_bytes);
         tokio::spawn(async move {
             let _reading = reading;
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
-                        crate::files::download(&connection, &path, &*sink, download_window)
-                            .await
-                            .map(Moved::Downloaded)
+                        crate::files::download(
+                            &connection,
+                            &path,
+                            &crate::transfer::CountingSink {
+                                inner: sink,
+                                bytes: transfer_bytes,
+                            },
+                            download_window,
+                        )
+                        .await
+                        .map(Moved::Downloaded)
                     }
                     (
                         Operation::Upload {
@@ -590,8 +630,9 @@ impl Runs {
                             source: _,
                             overwrite,
                         },
-                        Payload::Upload(mut input),
+                        Payload::Upload(input),
                     ) => {
+                        let mut input = input.counted(transfer_bytes);
                         crate::files::upload(&connection, &path, &mut input, overwrite)
                             .await
                             .map_err(Failure::from)?;
@@ -603,13 +644,22 @@ impl Runs {
             // An upload's source is released only after the deadline can no
             // longer turn its success into a timeout, and by this task rather
             // than the caller, which may have stopped waiting by now.
-            let result =
-                supervise_transfer(work, transfer_timeout)
-                    .await
-                    .map(|moved| match moved {
-                        Moved::Downloaded(file) => file,
-                        Moved::Uploaded(input) => input.succeeded(),
-                    });
+            let cancelling = Arc::clone(&live);
+            let result = supervise_transfer(
+                async move {
+                    tokio::select! {
+                        biased;
+                        () = cancellation_requested(&cancelling) => Err(Failure::Cancelled),
+                        result = work => result,
+                    }
+                },
+                transfer_timeout,
+            )
+            .await
+            .map(|moved| match moved {
+                Moved::Downloaded(file) => file,
+                Moved::Uploaded(input) => input.succeeded(),
+            });
             {
                 let mut record = live
                     .record
@@ -621,6 +671,9 @@ impl Runs {
                         record.state = RunState::Exited { code: 0 };
                     }
                     Err(cause) => {
+                        if cause == Failure::Cancelled {
+                            live.cancellation.store(4, Ordering::Release);
+                        }
                         record.state = RunState::TransferFailed {
                             cause,
                             remote_write_may_be_partial: is_upload,
@@ -693,6 +746,10 @@ impl Runs {
             }),
             authorization: recorded.authorization().clone(),
             settled: Notify::new(),
+            started: Instant::now(),
+            cancel: Notify::new(),
+            cancellation: AtomicU8::new(0),
+            transfer_bytes: Arc::new(AtomicU64::new(0)),
         });
         {
             // Refusing, registering the run, and registering its reader happen
@@ -757,7 +814,18 @@ impl Runs {
             // running command can produce counts: its output, its exit status,
             // the signal that killed it.
             let mut began = false;
-            while let Some(message) = channel.wait().await {
+            loop {
+                let message = tokio::select! {
+                    message = channel.wait() => message,
+                    () = cancellation_requested(&live), if live.cancellation.load(Ordering::Acquire) < 2 => {
+                        let sent = tokio::time::timeout(Duration::from_secs(5), channel.signal(russh::Sig::TERM)).await;
+                        live.cancellation.store(if matches!(sent, Ok(Ok(()))) { 2 } else { 3 }, Ordering::Release);
+                        continue;
+                    }
+                };
+                let Some(message) = message else {
+                    break;
+                };
                 let mut record = live.record.lock().unwrap_or_else(|e| e.into_inner());
                 match message {
                     // The positive reply to the exec request.
@@ -853,6 +921,57 @@ impl Runs {
             .unwrap_or_else(|e| e.into_inner())
             .get(id.as_str())
             .is_some_and(|live| live.authorization.session() == session)
+    }
+
+    /// Reads counters and status without copying output or releasing the run.
+    pub fn progress(&self, id: &RunId) -> Result<Progress, RunError> {
+        let live = self
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| RunError::Unknown {
+                run: id.as_str().to_owned(),
+            })?;
+        let record = live.record.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Progress {
+            run: id.clone(),
+            state: record.state,
+            elapsed_ms: u64::try_from(live.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            stdout_bytes: record.stdout.seen,
+            stderr_bytes: record.stderr.seen,
+            transfer_bytes_read: live.transfer_bytes.load(Ordering::Relaxed),
+            cancellation: match live.cancellation.load(Ordering::Acquire) {
+                0 => Cancellation::NotRequested,
+                1 => Cancellation::Requested,
+                2 => Cancellation::SignalSent,
+                3 => Cancellation::SignalFailed,
+                _ => Cancellation::TransferStopped,
+            },
+        })
+    }
+
+    /// Called only after the owner check and required cancellation record.
+    pub(crate) fn cancel(&self, id: &RunId) -> Result<Progress, RunError> {
+        let live = self
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id.as_str())
+            .cloned()
+            .ok_or_else(|| RunError::Unknown {
+                run: id.as_str().to_owned(),
+            })?;
+        let record = live.record.lock().unwrap_or_else(|e| e.into_inner());
+        if record.state == RunState::Running {
+            let _ = live
+                .cancellation
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            live.cancel.notify_one();
+        }
+        drop(record);
+        self.progress(id)
     }
 
     /// What authorized a run, without waiting for it.
@@ -1001,6 +1120,13 @@ impl Runs {
     }
 }
 
+async fn cancellation_requested(live: &Live) {
+    let notified = live.cancel.notified();
+    if live.cancellation.load(Ordering::Acquire) == 0 {
+        notified.await;
+    }
+}
+
 /// A transfer whose remote work finished.
 ///
 /// An upload hands its source back instead of releasing it, so that the
@@ -1131,6 +1257,10 @@ mod tests {
             }),
             authorization: recorded(&["true"]).authorization().clone(),
             settled: Notify::new(),
+            started: Instant::now(),
+            cancel: Notify::new(),
+            cancellation: AtomicU8::new(0),
+            transfer_bytes: Arc::new(AtomicU64::new(0)),
         });
         runs.records
             .lock()
@@ -1188,6 +1318,10 @@ mod tests {
             }),
             authorization: recorded(&["true"]).authorization().clone(),
             settled: Notify::new(),
+            started: Instant::now(),
+            cancel: Notify::new(),
+            cancellation: AtomicU8::new(0),
+            transfer_bytes: Arc::new(AtomicU64::new(0)),
         };
         let id = Runs::new(Limits::default()).mint_id();
         let first = snapshot_of(&id, &live);
@@ -1195,6 +1329,74 @@ mod tests {
         assert_eq!(first.stdout.text, "complete output");
         assert_eq!(second.stdout.text, first.stdout.text);
         assert!(std::ptr::eq(first.stdout_bytes(), second.stdout_bytes()));
+    }
+
+    #[tokio::test]
+    async fn explicit_command_cancellation_sends_term_and_progress_preserves_output() {
+        let harness = harness_answering(Exec::Silent).await;
+        let runs = runs(Limits {
+            wait: Duration::from_millis(10),
+            ..Limits::default()
+        });
+        let outcome = runs
+            .run(&harness.connection, recorded(&["test-command"]))
+            .await
+            .unwrap();
+        let id = outcome.run();
+        assert_eq!(
+            runs.progress(id).unwrap().cancellation,
+            Cancellation::NotRequested
+        );
+        assert_eq!(
+            runs.cancel(id).unwrap().cancellation,
+            Cancellation::Requested
+        );
+        let completed = runs.wait(id, Duration::from_secs(3)).await.unwrap();
+        assert_eq!(completed.state(), RunState::Exited { code: 143 });
+        assert_eq!(
+            runs.progress(id).unwrap().cancellation,
+            Cancellation::SignalSent
+        );
+        assert!(runs.finished(id).is_some(), "progress consumed the result");
+    }
+
+    #[tokio::test]
+    async fn transfer_cancellation_drops_the_active_future() {
+        let live = Arc::new(Live {
+            record: Mutex::new(Record {
+                file: None,
+                stdout: Collected::new(16),
+                stderr: Collected::new(16),
+                state: RunState::Running,
+            }),
+            authorization: recorded(&["true"]).authorization().clone(),
+            settled: Notify::new(),
+            started: Instant::now(),
+            cancel: Notify::new(),
+            cancellation: AtomicU8::new(1),
+            transfer_bytes: Arc::new(AtomicU64::new(0)),
+        });
+        let bytes = Arc::clone(&live.transfer_bytes);
+        let mut input = crate::transfer::CountingReader {
+            inner: std::io::Cursor::new(b"binary\0data"),
+            bytes: Arc::clone(&bytes),
+        };
+        let mut buffer = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut input, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(bytes.load(Ordering::Relaxed), 11);
+        let result = supervise_transfer::<()>(
+            async move {
+                tokio::select! {
+                    () = cancellation_requested(&live) => Err(crate::transfer::Failure::Cancelled),
+                    result = std::future::pending() => result,
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result, Err(crate::transfer::Failure::Cancelled));
     }
 
     #[tokio::test]
@@ -1260,6 +1462,10 @@ mod tests {
                     }),
                     authorization: recorded(&["true"]).authorization().clone(),
                     settled: Notify::new(),
+                    started: Instant::now(),
+                    cancel: Notify::new(),
+                    cancellation: AtomicU8::new(0),
+                    transfer_bytes: Arc::new(AtomicU64::new(0)),
                 };
                 let id = Runs::new(Limits::default()).mint_id();
                 let start = std::sync::Barrier::new(2);
@@ -1393,6 +1599,19 @@ mod tests {
                 return Ok(());
             }
             reply.accept().await;
+            Ok(())
+        }
+
+        async fn signal(
+            &mut self,
+            channel: ChannelId,
+            signal: russh::Sig,
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            if self.0 == Exec::Silent && matches!(signal, russh::Sig::TERM) {
+                session.exit_status_request(channel, 143)?;
+                session.close(channel)?;
+            }
             Ok(())
         }
 

@@ -1,10 +1,7 @@
 //! The tools an agent can call, and what calling them means.
 //!
-//! Discover hosts, open a session, execute, poll, and close the session.
+//! Discover hosts, open a session, execute, inspect or cancel a run, and close the session.
 //! Configuring a byte channel also enables binary downloads and uploads.
-//! Typed per-operation tools were considered and deferred — until real traffic
-//! says which operations matter, a larger surface is a guess with maintenance
-//! attached.
 //!
 //! # Identity is not an argument
 //!
@@ -45,6 +42,8 @@ pub const HOSTS: &str = "ssh_hosts";
 pub const OPEN_SESSION: &str = "ssh_open_session";
 pub const EXEC: &str = "ssh_exec";
 pub const POLL: &str = "ssh_poll";
+pub const PROGRESS: &str = "ssh_progress";
+pub const CANCEL: &str = "ssh_cancel";
 pub const CLOSE_SESSION: &str = "ssh_close_session";
 
 /// How long `poll` waits before answering "still running" again.
@@ -131,6 +130,54 @@ pub struct PollArgs {
     /// exactly as it was returned. Identifiers are issued by this service and
     /// are not constructed by a caller.
     pub run: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ProgressResult {
+    pub run: String,
+    pub status: String,
+    pub exit: Option<u32>,
+    pub cancellation: String,
+    pub elapsed_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub transfer_bytes_read: u64,
+    pub remote_write_may_be_partial: bool,
+}
+
+impl From<ssh_core::run::Progress> for ProgressResult {
+    fn from(progress: ssh_core::run::Progress) -> Self {
+        use ssh_core::run::{Cancellation, RunState};
+        let (status, exit, partial) = match progress.state {
+            RunState::Running => ("running", None, false),
+            RunState::Exited { code } => ("exited", Some(code), false),
+            RunState::Ended => ("ended", None, false),
+            RunState::Refused => ("refused", None, false),
+            RunState::Indeterminate => ("unknown", None, false),
+            RunState::TransferFailed {
+                remote_write_may_be_partial,
+                ..
+            } => ("transfer_failed", None, remote_write_may_be_partial),
+        };
+        Self {
+            run: progress.run.as_str().to_owned(),
+            status: status.to_owned(),
+            exit,
+            cancellation: match progress.cancellation {
+                Cancellation::NotRequested => "not_requested",
+                Cancellation::Requested => "requested",
+                Cancellation::SignalSent => "signal_sent",
+                Cancellation::SignalFailed => "signal_failed",
+                Cancellation::TransferStopped => "transfer_stopped",
+            }
+            .to_owned(),
+            elapsed_ms: progress.elapsed_ms,
+            stdout_bytes: progress.stdout_bytes,
+            stderr_bytes: progress.stderr_bytes,
+            transfer_bytes_read: progress.transfer_bytes_read,
+            remote_write_may_be_partial: partial,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -451,6 +498,23 @@ pub fn catalog() -> ListToolsResult {
                     // handed over, but they are not this service's news.
                     .open_world(true),
             ),
+            tool::<PollArgs, ProgressResult>(
+                PROGRESS,
+                "Inspect an owned run immediately without collecting output. Counters do not expose stream contents. Collect the final result with ssh_poll.",
+                ToolAnnotations::new()
+                    .read_only(true)
+                    .idempotent(true)
+                    .open_world(true),
+            ),
+            tool::<PollArgs, ProgressResult>(
+                CANCEL,
+                "Record an owned run cancellation request. Commands receive a TERM signal request; peer support and termination are not guaranteed. Transfers stop locally and remote writes may be partial. Inspect progress and collect with ssh_poll; do not repeat execution automatically.",
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(false)
+                    .open_world(true),
+            ),
             tool::<CloseSessionArgs, Empty>(
                 CLOSE_SESSION,
                 "End a session and release its connection. Anything still \
@@ -750,6 +814,29 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
                     announce(notifier, dashboard, &executed);
                     ok(&exec_result_with_files(executed, dashboard, files, principal).await)
                 }
+                Err(error) => without_an_outcome(&error),
+            }
+        }
+        PROGRESS | CANCEL => {
+            let args: PollArgs = parse(arguments)?;
+            let session = session_named(&args.session)?;
+            bastion
+                .check_session_account(
+                    principal,
+                    &session,
+                    &HostId::parse(&args.host).map_err(bad_request)?,
+                    &RoleId::parse(&args.role).map_err(bad_request)?,
+                    args.access_class.into(),
+                )
+                .map_err(bad_request)?;
+            let run = RunId::parse(&args.run).map_err(bad_request)?;
+            let result = if params.name.as_ref() == CANCEL {
+                bastion.cancel(principal, &session, &run)
+            } else {
+                bastion.progress(principal, &session, &run)
+            };
+            match result {
+                Ok(progress) => ok(&ProgressResult::from(progress)),
                 Err(error) => without_an_outcome(&error),
             }
         }
@@ -1870,7 +1957,7 @@ mod tests {
             serde_json::to_vec(&catalog_with_files(Some(&files)))
                 .unwrap()
                 .len()
-                < 32_000
+                < 40_000
         );
         let result = ok(&ExecResult::Unknown {
             run: "retained-run".to_owned(),
@@ -1919,16 +2006,26 @@ mod tests {
         assert_eq!(annotations.open_world_hint, Some(false));
     }
 
-    /// The surface stays small on purpose. Typed per-operation tools are
-    /// deferred until real traffic says which operations earn one.
+    /// Run inspection and cancellation are available independently of byte channels.
     #[test]
-    fn the_surface_is_the_five_tools_it_claims() {
+    fn the_surface_includes_run_control() {
         let names: Vec<_> = catalog()
             .tools
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect();
-        assert_eq!(names, vec![HOSTS, OPEN_SESSION, EXEC, POLL, CLOSE_SESSION]);
+        assert_eq!(
+            names,
+            vec![
+                HOSTS,
+                OPEN_SESSION,
+                EXEC,
+                POLL,
+                PROGRESS,
+                CANCEL,
+                CLOSE_SESSION
+            ]
+        );
     }
 
     /// Every tool publishes an output schema, so a caller knows the shape of a
