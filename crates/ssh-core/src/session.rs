@@ -6,7 +6,8 @@
 //! attribute it to and a human approving work has something to approve.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -280,14 +281,30 @@ pub struct SessionStore<C: Clock> {
     lifetime: Lifetime,
     per_principal: usize,
     sessions: Mutex<HashMap<String, Session>>,
-    pending: Mutex<HashMap<PrincipalId, usize>>,
+    pending: Mutex<HashMap<PrincipalId, Arc<AtomicUsize>>>,
 }
 
 /// A slot held while connection setup is in flight.
 pub(crate) struct Opening<'a, C: Clock> {
-    store: &'a SessionStore<C>,
+    store: StoreRef<'a, C>,
+    reservation: Arc<AtomicUsize>,
     principal: PrincipalId,
     active: bool,
+}
+
+enum StoreRef<'a, C: Clock> {
+    Borrowed(&'a SessionStore<C>),
+    Owned(Arc<SessionStore<C>>),
+}
+
+impl<C: Clock> std::ops::Deref for StoreRef<'_, C> {
+    type Target = SessionStore<C>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(store) => store,
+            Self::Owned(store) => store,
+        }
+    }
 }
 
 impl<C: Clock> Opening<'_, C> {
@@ -301,7 +318,7 @@ impl<C: Clock> Opening<'_, C> {
         let id = SessionId(new_identifier());
         // Reservation and publication use the same lock order, so a slot is
         // transferred rather than counted twice or briefly made available.
-        let mut pending = self.store.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let _pending = self.store.pending.lock().unwrap_or_else(|e| e.into_inner());
         let mut sessions = self
             .store
             .sessions
@@ -320,7 +337,7 @@ impl<C: Clock> Opening<'_, C> {
             lifetime: self.store.lifetime,
         };
         sessions.insert(session.id.0.clone(), session.clone());
-        release_pending(&mut pending, &self.principal);
+        self.reservation.fetch_sub(1, Ordering::Relaxed);
         self.active = false;
         session
     }
@@ -329,17 +346,7 @@ impl<C: Clock> Opening<'_, C> {
 impl<C: Clock> Drop for Opening<'_, C> {
     fn drop(&mut self) {
         if self.active {
-            let mut pending = self.store.pending.lock().unwrap_or_else(|e| e.into_inner());
-            release_pending(&mut pending, &self.principal);
-        }
-    }
-}
-
-fn release_pending(pending: &mut HashMap<PrincipalId, usize>, principal: &PrincipalId) {
-    if let Some(count) = pending.get_mut(principal) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            pending.remove(principal);
+            self.reservation.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -417,7 +424,9 @@ impl<C: Clock> SessionStore<C> {
             .values()
             .filter(|held| held.principal == principal)
             .count();
-        let opening = pending.get(&principal).copied().unwrap_or(0);
+        pending.retain(|_, count| count.load(Ordering::Relaxed) != 0);
+        let reservation = Arc::clone(pending.entry(principal.clone()).or_default());
+        let opening = reservation.load(Ordering::Relaxed);
         if held.saturating_add(opening) >= self.per_principal {
             // A lapsed session gives up its slot rather than denying one.
             // Remembering what a session was for is worth keeping; it is not
@@ -436,9 +445,30 @@ impl<C: Clock> SessionStore<C> {
             };
             sessions.remove(&stale);
         }
-        pending.insert(principal.clone(), opening.saturating_add(1));
+        reservation.fetch_add(1, Ordering::Relaxed);
         Ok(Opening {
-            store: self,
+            store: StoreRef::Borrowed(self),
+            reservation,
+            principal,
+            active: true,
+        })
+    }
+
+    pub(crate) fn reserve_owned(
+        self: Arc<Self>,
+        principal: PrincipalId,
+    ) -> Result<Opening<'static, C>, TooManySessions>
+    where
+        C: 'static,
+    {
+        let mut borrowed = self.reserve(principal)?;
+        let principal = borrowed.principal.clone();
+        let reservation = Arc::clone(&borrowed.reservation);
+        borrowed.active = false;
+        drop(borrowed);
+        Ok(Opening {
+            store: StoreRef::Owned(self),
+            reservation,
             principal,
             active: true,
         })
@@ -573,7 +603,11 @@ impl<C: Clock> SessionStore<C> {
                 .values()
                 .filter(|session| &session.principal == principal && session.expiry(now).is_none())
                 .count()
-                .saturating_add(pending.get(principal).copied().unwrap_or(0)),
+                .saturating_add(
+                    pending
+                        .get(principal)
+                        .map_or(0, |count| count.load(Ordering::Relaxed)),
+                ),
             self.per_principal,
         )
     }
@@ -744,6 +778,29 @@ mod tests {
             .expect("within the per-principal limit")
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_owned_opening_does_not_wait_for_the_pending_map() {
+        let store = Arc::new(SessionStore::new(TestClock::at(1_000), LIFETIME, 1));
+        let opening = Arc::clone(&store)
+            .reserve_owned(principal("alice"))
+            .unwrap();
+        let blocker = Arc::clone(&store);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _held = blocker.pending.lock().unwrap();
+            let _ = entered.send(());
+            released
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok()
+        });
+        reached.await.unwrap();
+        drop(opening);
+        release.send(()).unwrap();
+        assert!(thread.join().unwrap());
+        assert_eq!(store.usage(&principal("alice")), (0, 1));
+    }
+
     #[test]
     fn pending_connections_share_capacity_and_release_it_on_drop() {
         let store = SessionStore::new(TestClock::at(1_000), LIFETIME, 1);
@@ -759,7 +816,7 @@ mod tests {
         assert!(store.reserve(principal("alice")).is_err());
         store.close(&session.id, &principal("alice")).unwrap();
         assert!(store.reserve(principal("alice")).is_ok());
-        assert!(store.pending.lock().unwrap().is_empty());
+        assert_eq!(store.usage(&principal("alice")), (0, 1));
     }
 
     #[test]

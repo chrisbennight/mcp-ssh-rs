@@ -63,3 +63,26 @@ retained input and process.
 Record the compiler, build profile, host load, and measured results with any
 performance claim. A latency-controlled fixture supports conclusions about its
 workload; it does not establish production WAN throughput or a universal speedup.
+
+## Audit acknowledgement responsiveness
+
+```sh
+cargo test -p ssh-core --locked audit_latency_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+The fixture compares a synchronous ledger call with the asynchronous state
+worker on a single-thread Tokio runtime. A fake required sink delays each write
+by 100 ms. It records acknowledgement duration and when an unrelated async
+heartbeat can run. There is no timing threshold.
+
+An example run used Rust 1.98.1, unoptimized tests on Linux, and three samples
+per path. Host load was not controlled. Observed ranges, in milliseconds:
+
+| Path | Acknowledgement | Unrelated heartbeat |
+| --- | ---: | ---: |
+| Synchronous ledger call | 110.131–110.269 | 110.355–110.456 |
+| Asynchronous state worker | 103.153–111.358 | 0.094–0.351 |
+
+The acknowledgement still waits for the sink. This result measures runtime
+responsiveness under the injected delay; it does not measure production sink,
+SSH, or network latency. Ledger access still serializes behind a pending write.

@@ -1338,6 +1338,14 @@ async fn brand_asset(Path(name): Path<String>) -> Response {
         .into_response()
 }
 
+fn state_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        message_html("Service state is busy. Try again shortly."),
+    )
+        .into_response()
+}
+
 async fn inventory<C, S>(
     State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
@@ -1346,34 +1354,42 @@ where
     C: Clock + 'static,
     S: CredentialSource,
 {
-    let mut live_by_host = HashMap::<String, usize>::new();
-    for snapshot in bastion.recent_session_snapshots(OPERATIONS_RESULT_LIMIT) {
-        if snapshot.status == SessionStatus::Live {
-            let count = live_by_host
-                .entry(snapshot.session.host.as_str().to_owned())
-                .or_default();
-            *count = count.saturating_add(1);
-        }
-    }
-    let inventory = bastion
-        .inventory()
-        .into_iter()
-        .map(|(host, roles)| InventoryShown {
-            host: visible(host.as_str()),
-            roles: roles
+    let inventory = match bastion
+        .blocking(|bastion| {
+            let mut live_by_host = HashMap::<String, usize>::new();
+            for snapshot in bastion.recent_session_snapshots(OPERATIONS_RESULT_LIMIT) {
+                if snapshot.status == SessionStatus::Live {
+                    let count = live_by_host
+                        .entry(snapshot.session.host.as_str().to_owned())
+                        .or_default();
+                    *count = count.saturating_add(1);
+                }
+            }
+            bastion
+                .inventory()
                 .into_iter()
-                .map(|role| visible(role.as_str()))
-                .collect(),
-            live_sessions: live_by_host.get(host.as_str()).copied().unwrap_or_default(),
-            history_url: host_audit_url(host.as_str()),
-            sessions_url: format!(
-                "/dashboard/sessions?{}",
-                url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("host", host.as_str())
-                    .finish()
-            ),
+                .map(|(host, roles)| InventoryShown {
+                    host: visible(host.as_str()),
+                    roles: roles
+                        .into_iter()
+                        .map(|role| visible(role.as_str()))
+                        .collect(),
+                    live_sessions: live_by_host.get(host.as_str()).copied().unwrap_or_default(),
+                    history_url: host_audit_url(host.as_str()),
+                    sessions_url: format!(
+                        "/dashboard/sessions?{}",
+                        url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("host", host.as_str())
+                            .finish()
+                    ),
+                })
+                .collect()
         })
-        .collect();
+        .await
+    {
+        Ok(inventory) => inventory,
+        Err(_) => return state_unavailable(),
+    };
     let mut page = OperationsPage::new(operator.0, "Host and role inventory");
     page.inventory_active = true;
     page.inventory = inventory;
@@ -1411,11 +1427,19 @@ where
         )
             .into_response();
     };
-    let sessions = bastion
-        .session_snapshots(OPERATIONS_RESULT_LIMIT, host.as_ref(), principal.as_ref())
-        .into_iter()
-        .map(|snapshot| session_shown(&bastion, snapshot))
-        .collect();
+    let sessions = match bastion
+        .blocking(move |bastion| {
+            bastion
+                .session_snapshots(OPERATIONS_RESULT_LIMIT, host.as_ref(), principal.as_ref())
+                .into_iter()
+                .map(|snapshot| session_shown(&bastion, snapshot))
+                .collect()
+        })
+        .await
+    {
+        Ok(sessions) => sessions,
+        Err(_) => return state_unavailable(),
+    };
     let mut page = OperationsPage::new(operator.0, "Sessions");
     page.sessions_active = true;
     page.sessions = sessions;
@@ -1542,8 +1566,30 @@ where
     let Ok(session) = SessionId::parse(&raw_session) else {
         return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
-    let snapshot = bastion.session_snapshot(&session);
-    let current = snapshot.map(|snapshot| session_shown(&bastion, snapshot));
+    let viewed = session.clone();
+    let (current, standing, running, waiting) = match bastion
+        .blocking(move |bastion| {
+            let current = bastion
+                .session_snapshot(&viewed)
+                .map(|snapshot| session_shown(&bastion, snapshot));
+            let standing = bastion
+                .standing_approvals()
+                .into_iter()
+                .filter(|(agreement, _)| agreement.session == viewed)
+                .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
+                .collect();
+            (
+                current,
+                standing,
+                bastion.runs_in_flight_with_authorization(),
+                bastion.waiting_for_approval(),
+            )
+        })
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => return state_unavailable(),
+    };
     let mut page = OperationsPage::new(
         operator.0,
         current.as_ref().map_or_else(
@@ -1554,12 +1600,7 @@ where
     page.transcript_active = true;
     page.transcript_session = session.as_str().to_owned();
     page.current = current;
-    page.standing = bastion
-        .standing_approvals()
-        .into_iter()
-        .filter(|(agreement, _)| agreement.session == session)
-        .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
-        .collect();
+    page.standing = standing;
     if query.source == ActivitySource::Current
         || (query.source == ActivitySource::Auto
             && page.current.is_some()
@@ -1575,10 +1616,18 @@ where
             )
                 .into_response();
         };
-        let (entries, next) =
-            bastion
-                .ledger()
-                .session_activity(&session, before, audit_history::PAGE_SIZE);
+        let viewed = session.clone();
+        let (entries, next) = match bastion
+            .blocking(move |bastion| {
+                bastion
+                    .ledger()
+                    .session_activity(&viewed, before, audit_history::PAGE_SIZE)
+            })
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return state_unavailable(),
+        };
         let entries: Result<Vec<_>, _> = entries.iter().map(|entry| current_entry(entry)).collect();
         let Ok(entries) = entries else {
             return (
@@ -1589,8 +1638,6 @@ where
         };
         page.journeys = wire_journeys(&entries, &session, 0, 0, 0);
         let observed_at = bastion.now();
-        let running = bastion.runs_in_flight_with_authorization();
-        let waiting = bastion.waiting_for_approval();
         for journey in &mut page.journeys {
             if running.iter().any(|(_, authorization)| {
                 authorization.session() == &session
@@ -1716,13 +1763,14 @@ where
         page.output_back_url = format!("/dashboard/sessions/{}?source=current", session.as_str());
         page.source_notice = "Output held by this service. The capture limit is shown below if any output was discarded.".to_owned();
         page.verification = "Current service".to_owned();
-        match bastion
-            .ledger()
-            .session_output(&session, &run)
-            .as_deref()
-            .map(current_entry)
-            .transpose()
+        let output = match bastion
+            .blocking(move |bastion| bastion.ledger().session_output(&session, &run))
+            .await
         {
+            Ok(output) => output,
+            Err(_) => return state_unavailable(),
+        };
+        match output.as_deref().map(current_entry).transpose() {
             Ok(Some(entry)) => {
                 page.output = entry
                     .event
@@ -2066,19 +2114,25 @@ where
     C: Clock + 'static,
     S: CredentialSource,
 {
-    let page = ApprovalsPage {
-        operator: operator.0,
-        action: format!("{DASHBOARD_PATH}/approvals"),
-        waiting: bastion
-            .waiting_for_approval()
-            .into_iter()
-            .map(Pending::from)
-            .collect(),
-        standing: bastion
-            .standing_approvals()
-            .into_iter()
-            .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
-            .collect(),
+    let page = match bastion
+        .blocking(move |bastion| ApprovalsPage {
+            operator: operator.0,
+            action: format!("{DASHBOARD_PATH}/approvals"),
+            waiting: bastion
+                .waiting_for_approval()
+                .into_iter()
+                .map(Pending::from)
+                .collect(),
+            standing: bastion
+                .standing_approvals()
+                .into_iter()
+                .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
+                .collect(),
+        })
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return state_unavailable(),
     };
     match page.render() {
         Ok(html) => Html(html).into_response(),
@@ -2135,7 +2189,13 @@ where
                 )
                     .into_response();
             };
-            return match bastion.approve_session(&id, operator.0.clone(), for_millis) {
+            let request = id.clone();
+            let who = operator.0.clone();
+            let result = bastion
+                .blocking(move |bastion| bastion.approve_session(&request, who, for_millis))
+                .await
+                .and_then(|result| result);
+            return match result {
                 Ok(agreement) => {
                     tracing::info!(
                         operator = operator.0,
@@ -2159,7 +2219,12 @@ where
     let by = Approver::Human {
         who: operator.0.clone(),
     };
-    match bastion.decide(&id, by, agreed) {
+    let request = id.clone();
+    match bastion
+        .blocking(move |bastion| bastion.decide(&request, by, agreed))
+        .await
+        .and_then(|result| result)
+    {
         Ok(()) => {
             tracing::info!(
                 operator = operator.0,
@@ -2227,7 +2292,15 @@ where
         )
             .into_response();
     };
-    if bastion.revoke_standing(&agreement) {
+    let requested = agreement.clone();
+    let revoked = match bastion
+        .blocking(move |bastion| bastion.revoke_standing(&requested))
+        .await
+    {
+        Ok(revoked) => revoked,
+        Err(_) => return state_unavailable(),
+    };
+    if revoked {
         tracing::info!(
             operator = operator.0,
             agreement = agreement.as_str(),

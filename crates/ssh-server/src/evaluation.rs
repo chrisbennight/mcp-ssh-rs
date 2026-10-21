@@ -67,7 +67,21 @@ where
         Err(why) => return (StatusCode::BAD_REQUEST, why.to_string()).into_response(),
     };
     let evaluation_id = artifact.evaluation_id().to_owned();
-    match state.bastion.record_evaluation(artifact) {
+    let recorded = match state
+        .bastion
+        .blocking(move |bastion| bastion.record_evaluation(artifact))
+        .await
+    {
+        Ok(recorded) => recorded,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit worker capacity unavailable",
+            )
+                .into_response();
+        }
+    };
+    match recorded {
         Ok(entry) => (
             StatusCode::CREATED,
             Json(Accepted {

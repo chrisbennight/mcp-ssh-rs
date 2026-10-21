@@ -425,6 +425,27 @@ pub struct AccountEntry {
     pub access_class: AccessClassArg,
 }
 
+async fn check_session_account<C: Clock + 'static, S: CredentialSource>(
+    bastion: &Bastion<C, S>,
+    principal: &ssh_core::PrincipalId,
+    session: &SessionId,
+    host: &str,
+    role: &str,
+    access_class: AccessClassArg,
+) -> Result<(), McpError> {
+    let host = HostId::parse(host).map_err(bad_request)?;
+    let role = RoleId::parse(role).map_err(bad_request)?;
+    let principal = principal.clone();
+    let session = session.clone();
+    bastion
+        .blocking(move |state| {
+            state.check_session_account(&principal, &session, &host, &role, access_class.into())
+        })
+        .await
+        .map_err(bad_request)?
+        .map_err(bad_request)
+}
+
 /// The tools this service publishes.
 ///
 /// Annotations describe consequences honestly. `ssh_exec` is not read-only and
@@ -677,15 +698,15 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         "ssh_download" => {
             let args: DownloadArgs = parse(arguments)?;
             let session = session_named(&args.session)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             let path = ssh_core::files::RemotePath::parse(&args.path).map_err(bad_request)?;
             let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
             let store = files.ok_or_else(|| {
@@ -709,15 +730,15 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         "ssh_upload" => {
             let args: UploadArgs = parse(arguments)?;
             let session = session_named(&args.session)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             let path = ssh_core::files::RemotePath::parse(&args.path).map_err(bad_request)?;
             let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
             let store = files.ok_or_else(|| {
@@ -791,15 +812,15 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         }
         EXEC => {
             let args: ExecArgs = parse(arguments)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session_named(&args.session)?,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session_named(&args.session)?,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
             match bastion
                 .exec_intended(
@@ -820,21 +841,28 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         PROGRESS | CANCEL => {
             let args: PollArgs = parse(arguments)?;
             let session = session_named(&args.session)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             let run = RunId::parse(&args.run).map_err(bad_request)?;
-            let result = if params.name.as_ref() == CANCEL {
-                bastion.cancel(principal, &session, &run)
-            } else {
-                bastion.progress(principal, &session, &run)
-            };
+            let cancel = params.name.as_ref() == CANCEL;
+            let principal = principal.clone();
+            let result = bastion
+                .blocking(move |state| {
+                    if cancel {
+                        state.cancel(&principal, &session, &run)
+                    } else {
+                        state.progress(&principal, &session, &run)
+                    }
+                })
+                .await
+                .and_then(|result| result);
             match result {
                 Ok(progress) => ok(&ProgressResult::from(progress)),
                 Err(error) => without_an_outcome(&error),
@@ -842,15 +870,15 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         }
         POLL => {
             let args: PollArgs = parse(arguments)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session_named(&args.session)?,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session_named(&args.session)?,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             match bastion
                 .poll(
                     principal,
@@ -868,15 +896,15 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
         }
         CLOSE_SESSION => {
             let args: CloseSessionArgs = parse(arguments)?;
-            bastion
-                .check_session_account(
-                    principal,
-                    &session_named(&args.session)?,
-                    &HostId::parse(&args.host).map_err(bad_request)?,
-                    &RoleId::parse(&args.role).map_err(bad_request)?,
-                    args.access_class.into(),
-                )
-                .map_err(bad_request)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session_named(&args.session)?,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
             match bastion
                 .close_session(principal, &session_named(&args.session)?)
                 .await
