@@ -361,6 +361,7 @@ pub struct Runs {
     /// without a record - the tests in this module do - and because the store
     /// must not need to know what a record is.
     watcher: Option<Arc<dyn Settled>>,
+    completions: Arc<tokio::sync::Semaphore>,
     /// What every identifier from this store begins with.
     ///
     /// A record can be fed by more than one store, and two of them numbering
@@ -491,6 +492,7 @@ impl Runs {
         Self {
             limits,
             watcher,
+            completions: Arc::new(tokio::sync::Semaphore::new(64)),
             minted_by: hex(&bytes),
             records: Mutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
@@ -603,12 +605,12 @@ impl Runs {
             id: id.0.clone(),
         };
         let watcher = self.watcher.clone();
+        let completions = Arc::clone(&self.completions);
         let settled_id = id.clone();
         let transfer_timeout = self.limits.transfer_timeout;
         let download_window = self.limits.download_window;
         let transfer_bytes = Arc::clone(&live.transfer_bytes);
         tokio::spawn(async move {
-            let _reading = reading;
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
@@ -687,10 +689,7 @@ impl Runs {
                     }
                 }
             }
-            live.settled.notify_waiters();
-            if let Some(watcher) = watcher {
-                watcher.settled(snapshot_of(&settled_id, &live));
-            }
+            announce(settled_id, live, watcher, reading, completions).await;
         });
         self.wait(&id, self.limits.wait).await
     }
@@ -771,6 +770,7 @@ impl Runs {
         // command retrievable instead of orphaned: output keeps accumulating
         // and the exit status is recorded whenever it arrives.
         let watcher = self.watcher.clone();
+        let completions = Arc::clone(&self.completions);
         let settled_id = id.clone();
         let reading = Reading {
             reading: Arc::clone(&self.reading),
@@ -779,15 +779,6 @@ impl Runs {
         tokio::spawn(async move {
             // Held for the reader's whole life, including the announcing: the
             // count says "still to be recorded", not "still running".
-            let _reading = reading;
-            // Whoever is watching is told once, at the moment this run reaches
-            // a terminal state, whatever brought it there.
-            let announce = |live: &Arc<Live>| {
-                live.settled.notify_waiters();
-                if let Some(watcher) = &watcher {
-                    watcher.settled(snapshot_of(&settled_id, live));
-                }
-            };
             // The vector becomes one string here and nowhere else: SSH carries
             // a command string, and `Command::to_wire` is what makes a shell
             // parse it back into the vector that was authorized.
@@ -801,7 +792,7 @@ impl Runs {
                     record.state = RunState::Indeterminate;
                 }
                 drop(source);
-                announce(&live);
+                announce(settled_id, live, watcher, reading, completions).await;
                 return;
             }
             let mut code = None;
@@ -897,7 +888,7 @@ impl Runs {
                     };
                 }
             }
-            announce(&live);
+            announce(settled_id, live, watcher, reading, completions).await;
         });
 
         Ok(id)
@@ -1124,6 +1115,34 @@ async fn cancellation_requested(live: &Live) {
     let notified = live.cancel.notified();
     if live.cancellation.load(Ordering::Acquire) == 0 {
         notified.await;
+    }
+}
+
+async fn announce(
+    id: RunId,
+    live: Arc<Live>,
+    watcher: Option<Arc<dyn Settled>>,
+    reading: Reading,
+    capacity: Arc<tokio::sync::Semaphore>,
+) {
+    live.settled.notify_waiters();
+    let Some(watcher) = watcher else {
+        return;
+    };
+    let Ok(permit) = capacity.acquire_owned().await else {
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _reading = reading;
+        let _permit = permit;
+        watcher.settled(snapshot_of(&id, &live));
+    })
+    .await;
+    if let Err(error) = result {
+        if error.is_panic() {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        tracing::error!("completion recording worker was stopped");
     }
 }
 

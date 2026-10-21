@@ -32,7 +32,7 @@ mod rsa;
 /// manager, and this module's job is to use one, not to know where it came
 /// from. Implementations hand back a [`Secret`], so a credential cannot be
 /// logged on the way through.
-pub trait CredentialSource: Send + Sync {
+pub trait CredentialSource: Send + Sync + 'static {
     fn fetch(
         &self,
         reference: &CredentialRef,

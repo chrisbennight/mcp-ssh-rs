@@ -6,7 +6,7 @@
 //! attribute it to and a human approving work has something to approve.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -285,9 +285,24 @@ pub struct SessionStore<C: Clock> {
 
 /// A slot held while connection setup is in flight.
 pub(crate) struct Opening<'a, C: Clock> {
-    store: &'a SessionStore<C>,
+    store: StoreRef<'a, C>,
     principal: PrincipalId,
     active: bool,
+}
+
+enum StoreRef<'a, C: Clock> {
+    Borrowed(&'a SessionStore<C>),
+    Owned(Arc<SessionStore<C>>),
+}
+
+impl<C: Clock> std::ops::Deref for StoreRef<'_, C> {
+    type Target = SessionStore<C>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(store) => store,
+            Self::Owned(store) => store,
+        }
+    }
 }
 
 impl<C: Clock> Opening<'_, C> {
@@ -438,7 +453,25 @@ impl<C: Clock> SessionStore<C> {
         }
         pending.insert(principal.clone(), opening.saturating_add(1));
         Ok(Opening {
-            store: self,
+            store: StoreRef::Borrowed(self),
+            principal,
+            active: true,
+        })
+    }
+
+    pub(crate) fn reserve_owned(
+        self: Arc<Self>,
+        principal: PrincipalId,
+    ) -> Result<Opening<'static, C>, TooManySessions>
+    where
+        C: 'static,
+    {
+        let mut borrowed = self.reserve(principal)?;
+        let principal = borrowed.principal.clone();
+        borrowed.active = false;
+        drop(borrowed);
+        Ok(Opening {
+            store: StoreRef::Owned(self),
             principal,
             active: true,
         })

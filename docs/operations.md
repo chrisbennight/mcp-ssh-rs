@@ -95,6 +95,14 @@ classified from the bounded request body. These are fixed service defaults.
 They do not limit command runtime or the
 separate streaming file-byte routes; see [file transfer limits](file-transfers.md#limits-and-outcomes).
 
+Required audit acknowledgements run on bounded blocking workers. Request state
+work and completion recording have separate capacity limits, and async handlers
+wait without occupying runtime threads. At capacity, new request state work is
+refused; completion recording waits for a slot. A caller disconnecting does not
+free a slot while its synchronous worker is still running. A slow sink still
+serializes ledger operations and can increase response latency; inspect the
+configured audit destination when requests report capacity pressure.
+
 ## Process-local audit retention
 
 The process-local audit view keeps at most 4096 entries and 16 MiB of encoded

@@ -169,13 +169,13 @@ type SessionConnection = Arc<tokio::sync::Mutex<Arc<Connection>>>;
 /// The mediated service.
 pub struct Bastion<C: Clock, S: CredentialSource> {
     clock: Arc<C>,
-    sessions: SessionStore<Arc<C>>,
-    approvals: Approvals<Arc<C>>,
+    sessions: Arc<SessionStore<Arc<C>>>,
+    approvals: Arc<Approvals<Arc<C>>>,
     ledger: Arc<Ledger<Arc<C>>>,
-    engine: Engine,
-    registry: Registry,
-    connector: Connector<S>,
-    runs: Runs,
+    engine: Arc<Engine>,
+    registry: Arc<Registry>,
+    connector: Arc<Connector<S>>,
+    runs: Arc<Runs>,
     /// One connection per session, held for its life — see
     /// [`SessionConnection`] for why the connection itself sits behind a
     /// second lock rather than in this map directly.
@@ -183,7 +183,7 @@ pub struct Bastion<C: Clock, S: CredentialSource> {
     /// A caller takes a handle and releases this lock before awaiting on it.
     /// Holding it across an await would serialise every session behind
     /// whichever command is currently running.
-    connections: Mutex<HashMap<String, SessionConnection>>,
+    connections: Arc<Mutex<HashMap<String, SessionConnection>>>,
     /// The longest a standing session agreement can answer for.
     standing_cap: Millis,
     /// Set once the service is stopping, and never unset.
@@ -193,7 +193,7 @@ pub struct Bastion<C: Clock, S: CredentialSource> {
     /// listener is not enough: requests already accepted are still being
     /// handled, and one of them can reach here. So the refusal is here, where
     /// starting a command actually happens.
-    stopping: AtomicBool,
+    stopping: Arc<AtomicBool>,
     /// Held while a session and its connection are published together, and
     /// while they are reconciled against each other.
     ///
@@ -201,10 +201,72 @@ pub struct Bastion<C: Clock, S: CredentialSource> {
     /// the other can see a session opened in between as a connection belonging
     /// to nobody, and close a connection that is in use. Nothing is awaited
     /// under this, so it serialises only the moment of publishing.
-    publishing: Mutex<()>,
+    publishing: Arc<Mutex<()>>,
+    blocking_capacity: Arc<tokio::sync::Semaphore>,
 }
 
-impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
+impl<C: Clock, S: CredentialSource> Clone for Bastion<C, S> {
+    fn clone(&self) -> Self {
+        Self {
+            clock: Arc::clone(&self.clock),
+            sessions: Arc::clone(&self.sessions),
+            approvals: Arc::clone(&self.approvals),
+            ledger: Arc::clone(&self.ledger),
+            engine: Arc::clone(&self.engine),
+            registry: Arc::clone(&self.registry),
+            connector: Arc::clone(&self.connector),
+            runs: Arc::clone(&self.runs),
+            connections: Arc::clone(&self.connections),
+            standing_cap: self.standing_cap,
+            stopping: Arc::clone(&self.stopping),
+            publishing: Arc::clone(&self.publishing),
+            blocking_capacity: Arc::clone(&self.blocking_capacity),
+        }
+    }
+}
+
+impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
+    /// Runs synchronous state work without occupying an async runtime thread.
+    /// Capacity stays with the worker if its caller stops waiting.
+    pub async fn blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Self) -> T + Send + 'static,
+    ) -> Result<T, MediationError> {
+        let permit = Arc::clone(&self.blocking_capacity)
+            .try_acquire_owned()
+            .map_err(|_| MediationError::Busy)?;
+        self.blocking_with_permit(permit, work).await
+    }
+
+    async fn blocking_wait<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Self) -> T + Send + 'static,
+    ) -> Result<T, MediationError> {
+        let permit = Arc::clone(&self.blocking_capacity)
+            .acquire_owned()
+            .await
+            .map_err(|_| MediationError::Stopping)?;
+        self.blocking_with_permit(permit, work).await
+    }
+
+    async fn blocking_with_permit<T: Send + 'static>(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        work: impl FnOnce(Self) -> T + Send + 'static,
+    ) -> Result<T, MediationError> {
+        let owned = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(owned)
+        })
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(MediationError::Stopping),
+        }
+    }
+
     pub fn new(
         clock: Arc<C>,
         registry: Registry,
@@ -235,29 +297,33 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         });
         Self {
             standing_cap: bounds.standing_cap(),
-            sessions: SessionStore::new(
+            sessions: Arc::new(SessionStore::new(
                 Arc::clone(&clock),
                 bounds.lifetime,
                 bounds.sessions_per_principal,
-            ),
-            approvals: Approvals::new(
+            )),
+            approvals: Arc::new(Approvals::new(
                 Arc::clone(&clock),
                 bounds.approval,
                 bounds.waiting_per_session,
-            ),
+            )),
             ledger: Arc::clone(&ledger),
-            engine,
-            registry,
-            connector: Connector::new(connector, crate::connect::Timeouts::default()),
-            runs: Runs::watched(
+            engine: Arc::new(engine),
+            registry: Arc::new(registry),
+            connector: Arc::new(Connector::new(
+                connector,
+                crate::connect::Timeouts::default(),
+            )),
+            runs: Arc::new(Runs::watched(
                 bounds.run,
                 Some(Arc::new(WritesCompletions {
                     ledger: Arc::clone(&ledger),
                 })),
-            ),
-            connections: Mutex::new(HashMap::new()),
-            stopping: AtomicBool::new(false),
-            publishing: Mutex::new(()),
+            )),
+            connections: Arc::new(Mutex::new(HashMap::new())),
+            stopping: Arc::new(AtomicBool::new(false)),
+            publishing: Arc::new(Mutex::new(())),
+            blocking_capacity: Arc::new(tokio::sync::Semaphore::new(64)),
             clock,
         }
     }
@@ -278,28 +344,35 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     ) -> Result<Session, MediationError> {
         self.check_account(&host, &role, access_class)?;
         let target = self.registry.resolve(&host, &role)?;
-        let opening = self.sessions.reserve(principal)?;
+        let opening = self
+            .blocking(move |state| state.sessions.reserve_owned(principal))
+            .await??;
         // The target carries the host and role it was resolved for, so the
         // connection is labelled by the lookup that produced its address and
         // credential rather than by anything passed alongside.
         let connection = self.connector.connect(&target).await?;
 
-        let session = {
-            // The session and its connection become visible together, so a
-            // reconciliation cannot catch the session existing without its
-            // connection or the other way round.
-            let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
-            let session = opening.open(host, role, purpose, access_class);
-            self.connections
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    session.id.as_str().to_owned(),
-                    Arc::new(tokio::sync::Mutex::new(Arc::new(connection))),
-                );
-            session
-        };
-        self.ledger.record_session_opened(&session)?;
+        let session = self
+            .blocking(move |state| {
+                // The session and its connection become visible together, so a
+                // reconciliation cannot catch the session existing without its
+                // connection or the other way round.
+                let _publishing = state.publishing.lock().unwrap_or_else(|e| e.into_inner());
+                let session = opening.open(host, role, purpose, access_class);
+                state
+                    .connections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        session.id.as_str().to_owned(),
+                        Arc::new(tokio::sync::Mutex::new(Arc::new(connection))),
+                    );
+                session
+            })
+            .await?;
+        let recorded_session = session.clone();
+        self.blocking_wait(move |state| state.ledger.record_session_opened(&recorded_session))
+            .await??;
 
         // After the store has changed, not before: opening can itself evict a
         // lapsed session to make room, and reconciling first would leave what
@@ -360,10 +433,15 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         agent_intent: CommandIntent,
         argv: Vec<String>,
     ) -> Result<Executed, MediationError> {
-        let (session, admission) =
-            self.authorize_action(principal, session, agent_intent, || {
-                Command::new(argv).map(crate::action::Action::execute)
-            })?;
+        let principal = principal.clone();
+        let session = session.clone();
+        let (session, admission) = self
+            .blocking(move |state| {
+                state.authorize_action(&principal, &session, agent_intent, || {
+                    Command::new(argv).map(crate::action::Action::execute)
+                })
+            })
+            .await??;
         match admission {
             Admission::Held(executed) => Ok(executed),
             Admission::Ready {
@@ -374,7 +452,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                 let outcome = self.run_it(&session, *receipt).await?;
                 Ok(Executed::Ran {
                     decision,
-                    outcome: Box::new(self.account_for(outcome)?),
+                    outcome: Box::new(self.account_for_async(outcome).await?),
                     approved_by,
                 })
             }
@@ -493,10 +571,15 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         path: crate::files::RemotePath,
         sink: Arc<dyn crate::transfer::DownloadSink>,
     ) -> Result<Executed, MediationError> {
-        let (session, admission) =
-            self.authorize_action(principal, session, agent_intent, || {
-                crate::action::Action::download(path)
-            })?;
+        let principal = principal.clone();
+        let session = session.clone();
+        let (session, admission) = self
+            .blocking(move |state| {
+                state.authorize_action(&principal, &session, agent_intent, || {
+                    crate::action::Action::download(path)
+                })
+            })
+            .await??;
         self.transfer_admitted(session, admission, crate::transfer::Payload::Download(sink))
             .await
     }
@@ -511,10 +594,16 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         input: crate::transfer::PreparedUpload,
         overwrite: bool,
     ) -> Result<Executed, MediationError> {
-        let (session, admission) =
-            self.authorize_action(principal, session, agent_intent, || {
-                crate::action::Action::upload(path, input.identity().clone(), overwrite)
-            })?;
+        let principal = principal.clone();
+        let session = session.clone();
+        let source = input.identity().clone();
+        let (session, admission) = self
+            .blocking(move |state| {
+                state.authorize_action(&principal, &session, agent_intent, || {
+                    crate::action::Action::upload(path, source, overwrite)
+                })
+            })
+            .await??;
         self.transfer_admitted(session, admission, crate::transfer::Payload::Upload(input))
             .await
     }
@@ -536,7 +625,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                 let outcome = self.runs.transfer(connection, *receipt, payload).await?;
                 Ok(Executed::Ran {
                     decision,
-                    outcome: Box::new(self.account_for(outcome)?),
+                    outcome: Box::new(self.account_for_async(outcome).await?),
                     approved_by,
                 })
             }
@@ -594,7 +683,10 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         // a holder nothing owns any more: the command would run for a session
         // that had expired or been closed, and the connection it ran on would
         // be one no cleanup can reach.
-        self.still_the_live_session_connection(session, &held)?;
+        let checked = session.clone();
+        let holder = Arc::clone(&held);
+        self.blocking(move |state| state.still_the_live_session_connection(&checked, &holder))
+            .await??;
         if !connection.is_closed() {
             return Ok(Arc::clone(&connection));
         }
@@ -612,7 +704,13 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         // And asked again after the dial, which is the long wait of the two and
         // the one a deadline is most likely to pass during: a session can end
         // while its own replacement is still being established.
-        if let Err(ended) = self.still_the_live_session_connection(session, &held) {
+        let checked = session.clone();
+        let holder = Arc::clone(&held);
+        if let Err(ended) = self
+            .blocking(move |state| state.still_the_live_session_connection(&checked, &holder))
+            .await
+            .and_then(|result| result)
+        {
             // Closed rather than dropped. Nothing else knows this connection
             // exists, so letting it fall out of scope would leave the target
             // holding an authenticated session for a grant that is already
@@ -717,18 +815,24 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         id: &SessionId,
         operator: &PrincipalId,
     ) -> Result<(), MediationError> {
-        let connection = {
-            let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
-            self.sessions
-                .remove_recorded(id, |session| -> Result<(), MediationError> {
-                    self.ledger.record_session_terminated(session, operator)?;
-                    Ok(())
-                })?;
-            self.connections
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(id.as_str())
-        };
+        let id = id.clone();
+        let operator = operator.clone();
+        let connection = self
+            .blocking(move |state| -> Result<_, MediationError> {
+                let _publishing = state.publishing.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .sessions
+                    .remove_recorded(&id, |session| -> Result<(), MediationError> {
+                        state.ledger.record_session_terminated(session, &operator)?;
+                        Ok(())
+                    })?;
+                Ok(state
+                    .connections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id.as_str()))
+            })
+            .await??;
         if let Some(connection) = connection {
             let _ = connection.lock().await.close().await;
         }
@@ -944,7 +1048,11 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     ) -> Result<Outcome, MediationError> {
         // Claimed again: a run belongs to the session that started it, and the
         // session belongs to a principal.
-        let session = self.sessions.use_session(session, principal)?;
+        let principal = principal.clone();
+        let session = session.clone();
+        let session = self
+            .blocking(move |state| state.sessions.use_session(&session, &principal))
+            .await??;
         // Whether this session may ask at all, decided before anything is
         // waited on. Owning some session is not owning every run: without this
         // an identifier would be a capability anyone holding one could redeem,
@@ -965,7 +1073,7 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         }
 
         let outcome = self.runs.wait(run, wait).await?;
-        self.account_for(outcome)
+        self.account_for_async(outcome).await
     }
 
     /// Accounts for and lets go of what sessions that no longer exist left
@@ -999,6 +1107,12 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         // Liveness is reconciled against the store rather than reacting to any
         // one route out, for the reason `release_orphaned` gives: sessions stop
         // existing several ways, and asking what is left covers all of them.
+        if let Err(error) = self.blocking(|state| state.reclaim_records()).await {
+            tracing::error!(%error, "audit maintenance could not be scheduled");
+        }
+    }
+
+    fn reclaim_records(&self) {
         self.approvals.sweep(|session| self.sessions.holds(session));
 
         // Driven from what the run store actually holds rather than from this
@@ -1008,10 +1122,6 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         // recorded or released. The store knows every run; the index only
         // knows the ones that were handed back.
         for run in self.runs.outstanding() {
-            // Recording one completion can wait for the deployment boundary.
-            // Yield between runs so a caller can enforce one deadline around
-            // the whole pass rather than only around each individual write.
-            tokio::task::yield_now().await;
             let Some(authorized) = self.runs.authorization(&run) else {
                 continue;
             };
@@ -1061,8 +1171,21 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     /// is to stop holding the handle, and the far end is entitled to have hung
     /// up first.
     async fn release_orphaned(&self) {
+        let released = match self.blocking(|state| state.orphaned_connections()).await {
+            Ok(released) => released,
+            Err(error) => {
+                tracing::error!(%error, "connection maintenance could not be scheduled");
+                return;
+            }
+        };
+        for connection in released {
+            let _ = connection.lock().await.close().await;
+        }
+    }
+
+    fn orphaned_connections(&self) -> Vec<SessionConnection> {
         self.sessions.sweep();
-        let released: Vec<SessionConnection> = {
+        {
             // Both sides read under the hold that publishing takes. Reading the
             // sessions and then the connections as two separate steps cannot
             // answer a question about both: an open landing in between looks
@@ -1085,9 +1208,6 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
                 .iter()
                 .filter_map(|id| connections.remove(id))
                 .collect()
-        };
-        for connection in released {
-            let _ = connection.lock().await.close().await;
         }
     }
 
@@ -1098,6 +1218,16 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
     /// has finished is recorded and then released — its output has reached the
     /// record, and holding it a second time would mean the service kept every
     /// command any caller ever ran.
+    async fn account_for_async(&self, outcome: Outcome) -> Result<Outcome, MediationError> {
+        if outcome.still_running() {
+            return Ok(outcome);
+        }
+        // Work may already have changed the target. Wait for bounded worker
+        // capacity rather than returning an admission refusal after the effect.
+        self.blocking_wait(move |state| state.account_for(outcome))
+            .await?
+    }
+
     fn account_for(&self, outcome: Outcome) -> Result<Outcome, MediationError> {
         if outcome.still_running() {
             return Ok(outcome);
@@ -1177,21 +1307,26 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
         principal: &PrincipalId,
         session: &SessionId,
     ) -> Result<(), MediationError> {
-        let connection = {
-            // Claiming the session, writing that it closed, and removing it are
-            // one step. Split apart, two callers closing at once can both find
-            // the session and both write that it closed, leaving a record that
-            // verifies and says a session ended twice. The same hold covers
-            // publishing, so a close and an open cannot interleave either.
-            let _publishing = self.publishing.lock().unwrap_or_else(|e| e.into_inner());
-            let held = self.sessions.use_session(session, principal)?;
-            self.ledger.record_session_closed(&held)?;
-            self.sessions.close(session, principal)?;
-            self.connections
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(session.as_str())
-        };
+        let principal = principal.clone();
+        let session = session.clone();
+        let connection = self
+            .blocking(move |state| -> Result<_, MediationError> {
+                // Claiming the session, writing that it closed, and removing it are
+                // one step. Split apart, two callers closing at once can both find
+                // the session and both write that it closed, leaving a record that
+                // verifies and says a session ended twice. The same hold covers
+                // publishing, so a close and an open cannot interleave either.
+                let _publishing = state.publishing.lock().unwrap_or_else(|e| e.into_inner());
+                let held = state.sessions.use_session(&session, &principal)?;
+                state.ledger.record_session_closed(&held)?;
+                state.sessions.close(&session, &principal)?;
+                Ok(state
+                    .connections
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(session.as_str()))
+            })
+            .await??;
         if let Some(connection) = connection {
             // A target that has already gone away is not a failure to close.
             let _ = connection.lock().await.close().await;
@@ -1299,6 +1434,8 @@ impl<C: Clock + 'static, S: CredentialSource> Bastion<C, S> {
 pub enum MediationError {
     #[error("the requested account access class does not match configuration")]
     AccountMismatch,
+    #[error("synchronous state work is at capacity; try again later")]
+    Busy,
     #[error("the service is stopping and is not starting new work")]
     Stopping,
     #[error(transparent)]
@@ -1575,6 +1712,120 @@ mod tests {
             },
             records_to,
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_required_sink_does_not_block_unrelated_runtime_work() {
+        struct Slow {
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Records for Slow {
+            fn wrote(&self, entry: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                if matches!(entry.event, crate::audit::Event::Decided { .. })
+                    && let Some(entered) = self.entered.lock().unwrap().take()
+                {
+                    let _ = entered.send(());
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .map_err(|_| crate::audit::NotRecorded)?;
+                }
+                Ok(())
+            }
+        }
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let sink = Arc::new(Slow {
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(released),
+        });
+        let bastion = bastion_recording(
+            Arc::new(SystemClock::new().unwrap()),
+            Limits::default(),
+            Some(sink),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        let principal = alice();
+        let execution = bastion.exec(&principal, &session.id, argv(&["printf", "done"]));
+        let heartbeat = async {
+            reached.await.unwrap();
+            tokio::task::yield_now().await;
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(execution, heartbeat);
+        assert!(matches!(result.unwrap(), Executed::Ran { .. }));
+        assert!(bastion.ledger.verify().is_ok());
+    }
+
+    #[tokio::test]
+    async fn completed_output_waits_for_state_capacity_instead_of_becoming_an_admission_refusal() {
+        let mut bastion = bastion_running(Limits {
+            wait: Duration::from_millis(10),
+            ..Limits::default()
+        })
+        .await;
+        bastion.blocking_capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        let Executed::Ran { outcome, .. } = bastion
+            .exec(
+                &alice(),
+                &session.id,
+                argv(&["sh", "-c", "sleep .1; printf done"]),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("run starts");
+        };
+        let completed = bastion
+            .runs
+            .wait(outcome.run(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(!completed.still_running());
+        let permit = bastion.blocking_capacity.acquire().await.unwrap();
+        let release = async {
+            tokio::task::yield_now().await;
+            drop(permit);
+        };
+        let (result, ()) = tokio::join!(bastion.account_for_async(completed), release);
+        assert_eq!(result.unwrap().stdout().text, "done");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_state_wait_keeps_worker_capacity_until_completion() {
+        let mut bastion = bastion().await;
+        bastion.blocking_capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, ended) = tokio::sync::oneshot::channel();
+        let caller = bastion.clone();
+        let task = tokio::spawn(async move {
+            caller
+                .blocking(move |_| {
+                    let _ = entered.send(());
+                    released.recv_timeout(Duration::from_secs(3)).unwrap();
+                    let _ = finished.send(());
+                })
+                .await
+        });
+        reached.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(
+            bastion.blocking(|_| ()).await,
+            Err(MediationError::Busy)
+        ));
+        release.send(()).unwrap();
+        ended.await.unwrap();
+        // The worker sends before dropping its permit. Acquiring the permit
+        // establishes that cleanup, without guessing how long it takes.
+        let permit = bastion.blocking_capacity.acquire().await.unwrap();
+        drop(permit);
+        assert!(bastion.blocking(|_| ()).await.is_ok());
     }
 
     #[tokio::test]
@@ -1875,7 +2126,7 @@ mod tests {
     async fn pending_opens_refuse_excess_work_before_fetch_and_cancelled_opens_release_slots() {
         let clock = Arc::new(TestClock::at(1_000));
         let (mut bastion, gate) = bastion_gated(Arc::clone(&clock)).await;
-        bastion.sessions = SessionStore::new(clock, LIFETIME, 1);
+        bastion.sessions = Arc::new(SessionStore::new(clock, LIFETIME, 1));
         let bastion = Arc::new(bastion);
         gate.arm();
         let opening = tokio::spawn({
