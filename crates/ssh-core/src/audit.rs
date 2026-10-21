@@ -667,6 +667,7 @@ pub trait Records: Send + Sync {
 pub struct NotRecorded;
 
 pub struct Ledger<C: Clock> {
+    metrics: Arc<crate::metrics::Metrics>,
     clock: C,
     /// Where entries must be written before they join this process-local chain.
     ///
@@ -724,10 +725,15 @@ impl<C: Clock> Ledger<C> {
         Self {
             clock,
             records_to: None,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             state: Mutex::new(State::new(genesis.clone())),
             genesis,
             limits: Limits::default(),
         }
+    }
+
+    pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// A record that also hands every entry to something that outlives it.
@@ -1237,9 +1243,11 @@ impl<C: Clock> Ledger<C> {
         // all — rather than to be acted upon while the boundary has no complete
         // entry for it.
         if let Some(records_to) = &self.records_to {
-            records_to
-                .wrote(&entry)
-                .map_err(|_| AuditError::NotRecorded)?;
+            let _timer = self.metrics.audit_ack();
+            records_to.wrote(&entry).map_err(|_| {
+                self.metrics.audit_failed();
+                AuditError::NotRecorded
+            })?;
         }
         state.commit(entry, prepared, pin)
     }

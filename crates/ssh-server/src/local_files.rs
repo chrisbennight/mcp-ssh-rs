@@ -9,6 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+const MAX_INPUT_SNAPSHOTS: usize = 16;
+
 pub struct LocalFiles {
     root: PathBuf,
     root_fd: File,
@@ -55,8 +57,12 @@ impl LocalFiles {
             root,
             root_fd,
             output,
-            active: Arc::new(Semaphore::new(16)),
+            active: Arc::new(Semaphore::new(MAX_INPUT_SNAPSHOTS)),
         })
+    }
+
+    pub fn reserved_inputs(&self) -> u64 {
+        MAX_INPUT_SNAPSHOTS.saturating_sub(self.active.available_permits()) as u64
     }
 
     pub fn uri(&self, name: &str) -> std::io::Result<String> {

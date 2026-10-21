@@ -234,7 +234,10 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
     ) -> Result<T, MediationError> {
         let permit = Arc::clone(&self.blocking_capacity)
             .try_acquire_owned()
-            .map_err(|_| MediationError::Busy)?;
+            .map_err(|_| {
+                self.ledger.metrics().admission_refused();
+                MediationError::Busy
+            })?;
         self.blocking_with_permit(permit, work).await
     }
 
@@ -295,6 +298,7 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
             Some(records_to) => Ledger::recording_to(Arc::clone(&clock), records_to),
             None => Ledger::new(Arc::clone(&clock)),
         });
+        let metrics = ledger.metrics();
         Self {
             standing_cap: bounds.standing_cap(),
             sessions: Arc::new(SessionStore::new(
@@ -310,16 +314,19 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
             ledger: Arc::clone(&ledger),
             engine: Arc::new(engine),
             registry: Arc::new(registry),
-            connector: Arc::new(Connector::new(
-                connector,
-                crate::connect::Timeouts::default(),
-            )),
-            runs: Arc::new(Runs::watched(
-                bounds.run,
-                Some(Arc::new(WritesCompletions {
-                    ledger: Arc::clone(&ledger),
-                })),
-            )),
+            connector: Arc::new(
+                Connector::new(connector, crate::connect::Timeouts::default())
+                    .with_metrics(Arc::clone(&metrics)),
+            ),
+            runs: Arc::new(
+                Runs::watched(
+                    bounds.run,
+                    Some(Arc::new(WritesCompletions {
+                        ledger: Arc::clone(&ledger),
+                    })),
+                )
+                .with_metrics(metrics),
+            ),
             connections: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
             publishing: Arc::new(Mutex::new(())),
@@ -345,7 +352,12 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         self.check_account(&host, &role, access_class)?;
         let target = self.registry.resolve(&host, &role)?;
         let opening = self
-            .blocking(move |state| state.sessions.reserve_owned(principal))
+            .blocking(move |state| {
+                state
+                    .sessions
+                    .reserve_owned(principal)
+                    .inspect_err(|_| state.ledger.metrics().admission_refused())
+            })
             .await??;
         // The target carries the host and role it was resolved for, so the
         // connection is labelled by the lookup that produced its address and
@@ -379,6 +391,10 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         // where it also lets go.
         self.reclaim().await;
         Ok(session)
+    }
+
+    pub fn metrics(&self) -> Arc<crate::metrics::Metrics> {
+        self.ledger.metrics()
     }
 
     /// Validates the caller's account label against administrator configuration.
@@ -2009,6 +2025,39 @@ mod tests {
                 output.write_all(b"\n").unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn operational_metrics_observe_connection_audit_and_capacity_without_request_labels() {
+        struct Sink;
+        impl Records for Sink {
+            fn wrote(&self, _: &Entry) -> Result<(), crate::audit::NotRecorded> {
+                Ok(())
+            }
+        }
+        let mut bastion = bastion_recording(
+            Arc::new(SystemClock::new().unwrap()),
+            Limits::default(),
+            Some(Arc::new(Sink)),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::ReadOnly).await;
+        bastion
+            .exec(&alice(), &session.id, argv(&["printf", "done"]))
+            .await
+            .unwrap();
+        bastion.blocking_capacity = Arc::new(tokio::sync::Semaphore::new(0));
+        assert!(matches!(
+            bastion.blocking(|_| ()).await,
+            Err(MediationError::Busy)
+        ));
+        let text = bastion.metrics().encode().unwrap();
+        assert!(text.contains("ssh_connection_setup_seconds_count 1"));
+        assert!(text.contains("ssh_audit_ack_seconds_count 3"));
+        assert!(text.contains("ssh_admission_refusals_total 1"));
+        assert!(!text.contains("dns1"));
+        assert!(!text.contains("printf"));
+        assert!(!text.contains("alice"));
     }
 
     #[tokio::test(flavor = "current_thread")]

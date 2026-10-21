@@ -81,6 +81,7 @@ impl Default for Timeouts {
 pub struct Connector<S> {
     credentials: S,
     timeouts: Timeouts,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 /// An authenticated connection to one host as one role.
@@ -102,7 +103,13 @@ impl<S: CredentialSource> Connector<S> {
         Self {
             credentials,
             timeouts,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Opens an authenticated connection to a target.
@@ -112,6 +119,7 @@ impl<S: CredentialSource> Connector<S> {
     /// a caller label a connection with one identity while it holds another's
     /// capability, and the record would report the label.
     pub async fn connect(&self, target: &Target<'_>) -> Result<Connection, ConnectError> {
+        let _timer = self.metrics.connection_setup();
         tokio::time::timeout(self.timeouts.connect, self.connect_within(target))
             .await
             .map_err(|_| ConnectError::Unreachable {

@@ -262,6 +262,39 @@ may be interrupted; detached remote processes may continue. The recorded event
 names the operator who ended the session. **Revoke session approval** only changes
 approval for future commands; it does not end the session or release its slot.
 
+## Operational metrics
+
+Set `MCP_SSH_METRICS_BEARER` to enable `GET /metrics` on the configured HTTP
+listener. It uses OpenMetrics text format and requires its own bearer
+credential, distinct from agent, operator, and evaluator credentials. Use a
+secret reference in deployment configuration and present the credential through
+an authenticated monitoring client. `MCP_SSH_PREVIOUS_METRICS_BEARER` supports
+rotation. Protect network requests with the deployment's TLS proxy.
+
+The route is absent when unconfigured. Enabling it in stdio mode also starts
+the HTTP listener; stdout remains reserved for MCP. Responses use `no-store`.
+There are no caller-defined metric labels: account names, principals, commands,
+paths, intent, and credential values are omitted.
+
+| Measurement | Metric |
+| --- | --- |
+| Complete connection setup, including failed or cancelled attempts | `ssh_connection_setup_seconds` histogram |
+| Required sink acknowledgement | `ssh_audit_ack_seconds` histogram |
+| Required sink failures | `ssh_audit_failures_total` |
+| Operation readers still executing | `ssh_active_runs` |
+| Session, state-worker, and HTTP control capacity refusals | `ssh_admission_refusals_total` |
+| Successfully completed logical transfer bytes | `ssh_upload_bytes_total`, `ssh_download_bytes_total` |
+| Transfer and local-input reserved allowances | `ssh_storage_reserved_bytes` |
+| Reserved transfer items and local input snapshots | `ssh_storage_items`, `ssh_local_input_snapshots` |
+
+Use rates of completed-byte counters to observe transfer throughput over a
+window. They advance on successful completion and do not measure instantaneous
+network traffic or failed partial writes. Storage metrics report quota charges,
+not physical filesystem usage. Audit latency measures the sink call, including
+its writer queue; waiting for the ledger lock is outside that histogram.
+Measurements reset on restart and supplement the audit record and diagnostics.
+The exporter uses the [official Rust Prometheus client](https://github.com/prometheus/client_rust).
+
 ## Logs and optional integrations
 
 Collect the configured JSON audit destination with appropriate access control

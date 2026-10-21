@@ -72,6 +72,7 @@ pub struct Settings {
     /// either credential here would let a decision participant manufacture
     /// evidence under the evaluator's name.
     pub evaluator: Option<EvaluatorSettings>,
+    pub metrics_bearers: Option<Arc<SharedBearer>>,
     /// Internal, read-only endpoint for the deployment-owned durable audit
     /// source. Absent leaves historical dashboard views explicitly unavailable.
     pub audit_query: Option<Url>,
@@ -118,6 +119,7 @@ impl std::fmt::Debug for Settings {
             .field("bearers", &self.bearers)
             .field("proxy_bearers", &self.proxy_bearers)
             .field("evaluator_configured", &self.evaluator.is_some())
+            .field("metrics_configured", &self.metrics_bearers.is_some())
             .field("audit_query_configured", &self.audit_query.is_some())
             .field("identity", &self.identity)
             .field("notify_configured", &self.notify.is_some())
@@ -143,6 +145,8 @@ impl Settings {
     pub const PREVIOUS_BEARER_VAR: &'static str = "MCP_SSH_GATEWAY_BEARER_PREVIOUS";
     pub const PROXY_BEARER_VAR: &'static str = "MCP_SSH_PROXY_BEARER_CURRENT";
     pub const PREVIOUS_PROXY_BEARER_VAR: &'static str = "MCP_SSH_PROXY_BEARER_PREVIOUS";
+    pub const METRICS_BEARER_VAR: &'static str = "MCP_SSH_METRICS_BEARER";
+    pub const PREVIOUS_METRICS_BEARER_VAR: &'static str = "MCP_SSH_PREVIOUS_METRICS_BEARER";
     pub const EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_CURRENT";
     pub const PREVIOUS_EVALUATOR_BEARER_VAR: &'static str = "MCP_SSH_EVALUATOR_BEARER_PREVIOUS";
     pub const EVALUATOR_NAME_VAR: &'static str = "MCP_SSH_EVALUATOR_NAME";
@@ -256,6 +260,8 @@ impl Settings {
                 });
             }
         }
+        let metrics_current = optional(&lookup, Self::METRICS_BEARER_VAR)?;
+        let metrics_previous = optional(&lookup, Self::PREVIOUS_METRICS_BEARER_VAR)?;
         let evaluator_current = optional(&lookup, Self::EVALUATOR_BEARER_VAR)?;
         let evaluator_previous = optional(&lookup, Self::PREVIOUS_EVALUATOR_BEARER_VAR)?;
         let evaluator_name = optional(&lookup, Self::EVALUATOR_NAME_VAR)?;
@@ -308,6 +314,34 @@ impl Settings {
                 });
             }
         }
+        for (value, var) in [
+            (metrics_current.as_deref(), Self::METRICS_BEARER_VAR),
+            (
+                metrics_previous.as_deref(),
+                Self::PREVIOUS_METRICS_BEARER_VAR,
+            ),
+        ] {
+            if value.is_some_and(|value| {
+                agent_values
+                    .iter()
+                    .chain(&operator_values)
+                    .chain(&[evaluator_current.as_deref(), evaluator_previous.as_deref()])
+                    .flatten()
+                    .any(|held| *held == value)
+            }) {
+                return Err(SettingsError::Invalid {
+                    var,
+                    source: IngressError::BearersSharedAcrossSurfaces,
+                });
+            }
+        }
+        let metrics_bearers = bearer_pair(
+            metrics_current,
+            metrics_previous,
+            Self::METRICS_BEARER_VAR,
+            Self::PREVIOUS_METRICS_BEARER_VAR,
+        )?
+        .map(Arc::new);
         let bearers = bearer_pair(current, previous, current_var, Self::PREVIOUS_BEARER_VAR)?;
         let proxy_bearers = bearer_pair(
             proxy_current,
@@ -480,6 +514,7 @@ impl Settings {
         }
         Ok(Self {
             checksum_bytes,
+            metrics_bearers,
             download_window,
             sessions_per_principal: usize::try_from(positive(
                 &lookup,
@@ -1058,6 +1093,50 @@ mod tests {
                 source: IngressError::BearersSharedAcrossSurfaces,
             }
         ));
+    }
+
+    #[test]
+    fn metrics_are_optional_rotatable_and_separate_from_other_surface_credentials() {
+        let mut vars = complete();
+        assert!(
+            Settings::from_lookup(read(&vars))
+                .unwrap()
+                .metrics_bearers
+                .is_none()
+        );
+        let current = "metrics-current-fixture-0123456789";
+        let previous = "metrics-previous-fixture-0123456789";
+        vars.insert(Settings::METRICS_BEARER_VAR, current.to_owned());
+        vars.insert(Settings::PREVIOUS_METRICS_BEARER_VAR, previous.to_owned());
+        let settings = Settings::from_lookup(read(&vars)).unwrap();
+        let metrics = settings.metrics_bearers.unwrap();
+        assert!(metrics.accepts(current.as_bytes()));
+        assert!(metrics.accepts(previous.as_bytes()));
+        assert!(!metrics.accepts(BEARER.as_bytes()));
+        for shared in [BEARER, PROXY_BEARER] {
+            vars.insert(Settings::METRICS_BEARER_VAR, shared.to_owned());
+            assert!(matches!(
+                Settings::from_lookup(read(&vars)),
+                Err(SettingsError::Invalid {
+                    source: IngressError::BearersSharedAcrossSurfaces,
+                    ..
+                })
+            ));
+        }
+        vars.insert(Settings::METRICS_BEARER_VAR, current.to_owned());
+        vars.insert(Settings::EVALUATOR_BEARER_VAR, current.to_owned());
+        vars.insert(Settings::EVALUATOR_NAME_VAR, "fixture".to_owned());
+        assert!(matches!(
+            Settings::from_lookup(read(&vars)),
+            Err(SettingsError::Invalid {
+                source: IngressError::BearersSharedAcrossSurfaces,
+                ..
+            })
+        ));
+        vars.remove(Settings::METRICS_BEARER_VAR);
+        vars.remove(Settings::EVALUATOR_BEARER_VAR);
+        vars.remove(Settings::EVALUATOR_NAME_VAR);
+        assert!(Settings::from_lookup(read(&vars)).is_err());
     }
 
     #[test]

@@ -56,6 +56,10 @@ when the SFTP peer supports it. [File operations](docs/file-transfers.md#metadat
 context and retrieve it through the configured byte channel.
 [Choose a file channel](docs/file-transfers.md).
 
+**Measure service load.** Export connection and audit latency, active work,
+completed transfer bytes, and reserved storage through an optional authenticated
+[metrics endpoint](docs/operations.md#operational-metrics).
+
 ## Try it locally
 
 This is an early 0.1 project; interfaces and configuration may change.
