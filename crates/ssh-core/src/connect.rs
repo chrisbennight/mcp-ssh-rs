@@ -523,6 +523,13 @@ mod tests {
     struct TestServer {
         answer: Answer,
         seen: Arc<Mutex<Vec<(String, String)>>>,
+        disconnected: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.disconnected.notify_one();
+        }
     }
 
     impl server::Server for TestServer {
@@ -567,6 +574,7 @@ mod tests {
         host_key: PinnedHostKey,
         /// Every (account, public key) the server was asked to authenticate.
         seen: Arc<Mutex<Vec<(String, String)>>>,
+        disconnected: Arc<tokio::sync::Notify>,
     }
 
     /// Starts an SSH server on loopback with a freshly generated host key.
@@ -602,9 +610,11 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let disconnected = Arc::new(tokio::sync::Notify::new());
         let mut server = TestServer {
             answer,
             seen: Arc::clone(&seen),
+            disconnected: Arc::clone(&disconnected),
         };
         tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -614,6 +624,7 @@ mod tests {
             address,
             host_key: pinned,
             seen,
+            disconnected,
         }
     }
 
@@ -752,8 +763,36 @@ mod tests {
         );
     }
 
-    /// The whole promise, end to end: the service authenticates to a real
-    /// target as a named account, using material the agent never saw.
+    /// A fresh transport has no channels retaining its outbound control sender.
+    #[tokio::test]
+    async fn dropping_an_unpublished_authenticated_transport_disconnects_the_peer() {
+        for cancelled_wait in [false, true] {
+            let server = start_server(Answer::Accept).await;
+            let key = client_key();
+            let connector = connector(FakeStore::with(REFERENCE, &key));
+            let registry = registry_for(&server.address, &server.host_key);
+            let connection = connector
+                .connect(&registry.resolve(&host(), &role()).unwrap())
+                .await
+                .unwrap();
+            if cancelled_wait {
+                let task = tokio::spawn(async move {
+                    let _fresh = Arc::new(connection);
+                    std::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+                task.abort();
+                let _ = task.await;
+            } else {
+                drop(connection);
+            }
+            tokio::time::timeout(Duration::from_secs(3), server.disconnected.notified())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The service authenticates as the configured account with its credential.
     #[tokio::test]
     async fn authenticates_to_a_target_as_the_role_s_account() {
         let server = start_server(Answer::Accept).await;
