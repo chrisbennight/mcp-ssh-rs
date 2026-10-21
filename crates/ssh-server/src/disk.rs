@@ -13,7 +13,7 @@ use std::{fs::File, io, os::unix::fs::FileExt as _, path::Path, sync::Arc};
 use tokio::{io::AsyncReadExt as _, sync::OwnedSemaphorePermit};
 use tokio_util::io::StreamReader;
 
-pub const CHUNK: usize = 64 * 1024;
+pub const CHUNK: usize = 256 * 1024;
 
 pub struct DiskFile {
     file: File,
@@ -79,26 +79,43 @@ pub async fn receive(
     let mut digest = Sha256::new();
     let mut buffer = vec![0; CHUNK];
     loop {
-        let count = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|_| Failure::RemoteIo)?;
-        if count == 0 {
+        let mut filled = 0_usize;
+        while filled < buffer.len() {
+            let count = reader
+                .read(buffer.get_mut(filled..).ok_or(Failure::RemoteIo)?)
+                .await
+                .map_err(|_| Failure::RemoteIo)?;
+            if count == 0 {
+                break;
+            }
+            filled = filled.checked_add(count).ok_or(Failure::TooLarge)?;
+            size.checked_add(filled as u64)
+                .filter(|size| *size <= limit)
+                .ok_or(Failure::TooLarge)?;
+        }
+        if filled == 0 {
             break;
         }
-        let next = size
-            .checked_add(count as u64)
-            .filter(|size| *size <= limit)
-            .ok_or(Failure::TooLarge)?;
-        let bytes = buffer.get(..count).ok_or(Failure::RemoteIo)?;
+        let next = size.checked_add(filled as u64).ok_or(Failure::TooLarge)?;
+        let bytes = buffer.get(..filled).ok_or(Failure::RemoteIo)?;
         digest.update(bytes);
         let disk = Arc::clone(&disk);
-        let bytes = bytes.to_vec();
-        tokio::task::spawn_blocking(move || disk.file.write_all_at(&bytes, size))
-            .await
-            .map_err(|_| Failure::PublicationUnavailable)?
-            .map_err(|_| Failure::PublicationUnavailable)?;
+        buffer = tokio::task::spawn_blocking(move || {
+            disk.file.write_all_at(
+                buffer
+                    .get(..filled)
+                    .ok_or_else(|| io::Error::other("invalid write batch"))?,
+                size,
+            )?;
+            Ok::<_, io::Error>(buffer)
+        })
+        .await
+        .map_err(|_| Failure::PublicationUnavailable)?
+        .map_err(|_| Failure::PublicationUnavailable)?;
         size = next;
+        if filled < CHUNK {
+            break;
+        }
     }
     Ok(Arc::new(Snapshot {
         disk,
@@ -210,6 +227,89 @@ mod tests {
             receive(disk, &mut std::io::Cursor::new(b"too large"), 8).await,
             Err(Failure::TooLarge)
         ));
+    }
+
+    #[tokio::test]
+    async fn fragmented_streams_preserve_complete_batches_and_the_final_partial_batch() {
+        let bytes: Vec<u8> = (0..CHUNK.saturating_mul(2).saturating_add(17))
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        let chunks: Vec<_> = bytes
+            .chunks(4093)
+            .map(|chunk| Ok::<_, io::Error>(axum::body::Bytes::copy_from_slice(chunk)))
+            .collect();
+        let mut reader = StreamReader::new(stream::iter(chunks));
+        let disk = allocate(directory(&std::env::temp_dir()).unwrap(), None, false)
+            .await
+            .unwrap();
+        let snapshot = receive(disk, &mut reader, bytes.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.identity(String::new()),
+            ssh_core::transfer::identity(String::new(), &bytes)
+        );
+        let mut received = Vec::new();
+        snapshot.reader().read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, bytes);
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated disk batching measurement; run explicitly with --nocapture"]
+    async fn disk_batch_benchmark() {
+        use std::io::Write as _;
+        let bytes: Vec<u8> = (0..4_usize << 20)
+            .map(|offset| (offset % 251) as u8)
+            .collect();
+        for batched in [false, true] {
+            let chunks: Vec<_> = bytes
+                .chunks(64 << 10)
+                .map(|chunk| Ok::<_, io::Error>(axum::body::Bytes::copy_from_slice(chunk)))
+                .collect();
+            let mut reader = StreamReader::new(stream::iter(chunks));
+            let disk = allocate(directory(&std::env::temp_dir()).unwrap(), None, false)
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let snapshot = if batched {
+                receive(disk, &mut reader, bytes.len() as u64)
+                    .await
+                    .unwrap()
+            } else {
+                let mut size = 0_u64;
+                let mut digest = Sha256::new();
+                let mut buffer = vec![0; 64 << 10];
+                loop {
+                    let count = reader.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    let chunk = buffer.get(..count).unwrap();
+                    digest.update(chunk);
+                    let chunk = chunk.to_vec();
+                    let disk = Arc::clone(&disk);
+                    tokio::task::spawn_blocking(move || disk.file.write_all_at(&chunk, size))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    size = size.saturating_add(count as u64);
+                }
+                Arc::new(Snapshot {
+                    disk,
+                    size,
+                    digest: digest.finalize().into(),
+                })
+            };
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(
+                snapshot.identity(String::new()),
+                ssh_core::transfer::identity(String::new(), &bytes)
+            );
+            let record = serde_json::json!({"path": if batched { "batched_buffer_reuse" } else { "previous_chunk_copy" }, "bytes": bytes.len(), "seconds": elapsed, "mib_per_second": bytes.len() as f64 / 1048576.0 / elapsed});
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer(&mut output, &record).unwrap();
+            output.write_all(b"\n").unwrap();
+        }
     }
 
     #[tokio::test]

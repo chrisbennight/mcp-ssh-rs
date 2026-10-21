@@ -31,6 +31,19 @@ invalid responses, disconnection, backpressure, cancellation, worker failure,
 and transfer outcomes. Performance measurements are not correctness gates, and
 no wall-clock speed threshold is enforced on shared builders.
 
+## Disk transfer batching
+
+```sh
+cargo test -p ssh-server --locked disk_batch_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+This fixture compares the former per-chunk copying writer with bounded write
+batches that return their buffer for reuse. Both paths receive the same small
+binary stream and check the resulting size and digest. It measures local disk
+scheduling and copying, including filesystem caching, without SSH or network
+traffic. Ordinary tests cover fragmented input, a final partial batch, byte
+limits, independent readers, and storage failure. Timing is not a CI threshold.
+
 ## Polling output and lock contention
 
 ```sh
