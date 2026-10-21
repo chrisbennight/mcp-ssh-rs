@@ -107,6 +107,7 @@ pub struct Limits {
     pub transfer_timeout: Duration,
     /// Bounded read-ahead for each SFTP download.
     pub download_window: crate::files::DownloadWindow,
+    pub checksum_bytes: u64,
     /// How long a caller waits before a run is handed back as still running.
     pub wait: Duration,
 }
@@ -117,6 +118,7 @@ impl Default for Limits {
             output_bytes: 1 << 20,
             transfer_timeout: Duration::from_secs(1800),
             download_window: crate::files::DownloadWindow::default(),
+            checksum_bytes: 64 << 20,
             wait: Duration::from_secs(30),
         }
     }
@@ -246,6 +248,7 @@ pub struct Outcome {
     stderr: Stream,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<crate::action::FileIdentity>,
+    info: Option<crate::files::FileInfo>,
     #[serde(skip)]
     stdout_bytes: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
@@ -262,6 +265,10 @@ impl Outcome {
         self.stderr_bytes
             .as_ref()
             .map_or(&[], |bytes| bytes.as_slice())
+    }
+
+    pub const fn info(&self) -> Option<&crate::files::FileInfo> {
+        self.info.as_ref()
     }
 
     pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
@@ -320,6 +327,7 @@ impl Outcome {
             stderr_bytes: None,
             stdout,
             file: None,
+            info: None,
             stderr: Stream {
                 text: String::new(),
                 truncated: false,
@@ -423,6 +431,7 @@ struct Live {
 
 struct Record {
     file: Option<crate::action::FileIdentity>,
+    info: Option<crate::files::FileInfo>,
     stdout: Collected,
     stderr: Collected,
     state: RunState,
@@ -564,6 +573,7 @@ impl Runs {
         }
         match (recorded.action().operation(), &payload) {
             (Operation::Download { .. }, Payload::Download(_)) => {}
+            (Operation::FileInfo { .. }, Payload::FileInfo) => {}
             (Operation::Upload { source, .. }, Payload::Upload(input))
                 if source.bytes == input.identity().bytes
                     && source.sha256 == input.identity().sha256 => {}
@@ -575,6 +585,7 @@ impl Runs {
         let live = Arc::new(Live {
             record: Mutex::new(Record {
                 file: None,
+                info: None,
                 stdout: Collected::new(self.limits.output_bytes),
                 stderr: Collected::new(self.limits.output_bytes),
                 state: RunState::Running,
@@ -610,7 +621,10 @@ impl Runs {
         let transfer_timeout = self.limits.transfer_timeout;
         let download_window = self.limits.download_window;
         let transfer_bytes = Arc::clone(&live.transfer_bytes);
+        let checksum_bytes = self.limits.checksum_bytes;
         tokio::spawn(async move {
+            let replacement = Arc::new(AtomicBool::new(false));
+            let attempted = Arc::clone(&replacement);
             let work = async move {
                 match (operation, payload) {
                     (Operation::Download { path }, Payload::Download(sink)) => {
@@ -631,14 +645,33 @@ impl Runs {
                             path,
                             source: _,
                             overwrite,
+                            staging_path,
                         },
                         Payload::Upload(input),
                     ) => {
                         let mut input = input.counted(transfer_bytes);
-                        crate::files::upload(&connection, &path, &mut input, overwrite)
-                            .await
-                            .map_err(Failure::from)?;
+                        crate::files::upload_with_staging(
+                            &connection,
+                            &path,
+                            &mut input,
+                            overwrite,
+                            staging_path.as_ref(),
+                            &attempted,
+                        )
+                        .await?;
                         Ok(Moved::Uploaded(input))
+                    }
+                    (Operation::FileInfo { path, operation }, Payload::FileInfo) => {
+                        crate::files::inspect(
+                            &connection,
+                            &path,
+                            operation,
+                            checksum_bytes,
+                            download_window,
+                            transfer_bytes,
+                        )
+                        .await
+                        .map(Moved::Inspected)
                     }
                     _ => unreachable!("transfer payload was validated before registration"),
                 }
@@ -657,31 +690,43 @@ impl Runs {
                 },
                 transfer_timeout,
             )
-            .await
-            .map(|moved| match moved {
-                Moved::Downloaded(file) => file,
-                Moved::Uploaded(input) => input.succeeded(),
-            });
+            .await;
+            let cancelled = matches!(&result, Err(Failure::Cancelled));
+            let result = result
+                .map_err(|cause| {
+                    if replacement.load(Ordering::Acquire) {
+                        Failure::ReplacementUnknown
+                    } else {
+                        cause
+                    }
+                })
+                .map(|moved| match moved {
+                    Moved::Downloaded(file) => (Some(file), None),
+                    Moved::Uploaded(input) => (Some(input.succeeded()), None),
+                    Moved::Inspected(info) => (None, Some(info)),
+                });
             {
                 let mut record = live
                     .record
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 match result {
-                    Ok(file) => {
-                        record.file = Some(file);
+                    Ok((file, info)) => {
+                        record.file = file;
+                        record.info = info;
                         record.state = RunState::Exited { code: 0 };
                     }
                     Err(cause) => {
-                        if cause == Failure::Cancelled {
+                        if cancelled {
                             live.cancellation.store(4, Ordering::Release);
                         }
                         record.state = RunState::TransferFailed {
                             cause,
-                            remote_write_may_be_partial: is_upload,
+                            remote_write_may_be_partial: is_upload
+                                && cause != Failure::UnsupportedOperation,
                         };
                         record.stderr.push(cause.message().as_bytes());
-                        if is_upload {
+                        if is_upload && cause != Failure::UnsupportedOperation {
                             record.stderr.push(
                                 b" A remote write may be partial; do not automatically retry.",
                             );
@@ -739,6 +784,7 @@ impl Runs {
         let live = Arc::new(Live {
             record: Mutex::new(Record {
                 file: None,
+                info: None,
                 stdout: Collected::new(self.limits.output_bytes),
                 stderr: Collected::new(self.limits.output_bytes),
                 state: RunState::Running,
@@ -1153,6 +1199,7 @@ async fn announce(
 /// the worker got before its deadline.
 enum Moved {
     Downloaded(crate::action::FileIdentity),
+    Inspected(crate::files::FileInfo),
     Uploaded(crate::transfer::PreparedUpload),
 }
 
@@ -1197,6 +1244,7 @@ fn snapshot_of(id: &RunId, live: &Live) -> Outcome {
         stdout: record.stdout.snapshot(),
         stderr: record.stderr.snapshot(),
         file: record.file.clone(),
+        info: record.info.clone(),
         stdout_bytes: if complete {
             Some(Arc::clone(&record.stdout.kept))
         } else {
@@ -1270,6 +1318,7 @@ mod tests {
         let live = Arc::new(Live {
             record: Mutex::new(Record {
                 file: None,
+                info: None,
                 stdout,
                 stderr: Collected::new(1 << 20),
                 state: RunState::Running,
@@ -1331,6 +1380,7 @@ mod tests {
         let live = Live {
             record: Mutex::new(Record {
                 file: None,
+                info: None,
                 stdout,
                 stderr: Collected::new(4096),
                 state: RunState::Exited { code: 0 },
@@ -1384,6 +1434,7 @@ mod tests {
         let live = Arc::new(Live {
             record: Mutex::new(Record {
                 file: None,
+                info: None,
                 stdout: Collected::new(16),
                 stderr: Collected::new(16),
                 state: RunState::Running,
@@ -1471,6 +1522,7 @@ mod tests {
                 let live = Live {
                     record: Mutex::new(Record {
                         file: None,
+                        info: None,
                         stdout,
                         stderr,
                         state: if path == "completed_shared_bytes" {

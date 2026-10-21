@@ -348,6 +348,8 @@ pub enum Event {
         stderr: Recorded,
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<crate::action::FileIdentity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info: Option<crate::files::FileInfo>,
     },
     CancellationRequested {
         run: RunId,
@@ -1061,6 +1063,7 @@ impl<C: Clock> Ledger<C> {
                 stdout: record_output(outcome.stdout()),
                 stderr: record_output(outcome.stderr()),
                 file: outcome.file().cloned(),
+                info: outcome.info().cloned(),
             },
         )?;
         authorized.proof.completed.store(true, Ordering::Relaxed);

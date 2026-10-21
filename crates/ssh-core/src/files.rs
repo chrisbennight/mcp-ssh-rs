@@ -13,6 +13,10 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use crate::connect::Connection;
 
 mod download;
+mod info;
+mod staged;
+pub(crate) use info::inspect;
+pub use info::{DirectoryEntry, FileInfo, FileKind, InfoOperation, Metadata};
 
 // Enough for the result tag, field names, byte count, quotes, and punctuation.
 
@@ -333,6 +337,16 @@ pub(crate) async fn download(
     sink: &dyn crate::transfer::DownloadSink,
     window: DownloadWindow,
 ) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
+    download_bounded(connection, path, sink, window, None).await
+}
+
+async fn download_bounded(
+    connection: &Connection,
+    path: &RemotePath,
+    sink: &dyn crate::transfer::DownloadSink,
+    window: DownloadWindow,
+    read_limit: Option<u64>,
+) -> Result<crate::action::FileIdentity, crate::transfer::Failure> {
     let mut sftp = RawSftpSession::new(binary_stream(connection).await?);
     let version = sftp.init().await.map_err(|source| FileError::Unavailable {
         detail: source.to_string(),
@@ -389,6 +403,9 @@ pub(crate) async fn download(
         let mut reader =
             download::Reader::new(Arc::clone(&sftp), handle, chunk_bytes, window.requests())
                 .map_err(|_| crate::transfer::Failure::RemoteIo)?;
+        if let Some(limit) = read_limit {
+            reader = reader.bounded(limit);
+        }
         let received = sink.receive(&mut reader).await;
         drop(reader);
         // This dedicated session releases its read handle on teardown. Do not
@@ -398,6 +415,23 @@ pub(crate) async fn download(
     .await;
     let _ = sftp.close_session();
     result
+}
+
+pub(crate) async fn upload_with_staging(
+    connection: &Connection,
+    path: &RemotePath,
+    input: &mut crate::transfer::PreparedUpload,
+    overwrite: bool,
+    stage: Option<&RemotePath>,
+    replacement: &std::sync::atomic::AtomicBool,
+) -> Result<(), crate::transfer::Failure> {
+    if let Some(stage) = stage {
+        staged::upload(connection, path, stage, input, replacement).await
+    } else {
+        upload(connection, path, input, overwrite)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// A failed upload may have changed the remote file; callers must never replay it automatically.
@@ -559,6 +593,8 @@ mod tests {
     struct FileServer {
         root: PathBuf,
         answer_close: bool,
+        rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
         /// Channels kept until their subsystem request arrives, because the
         /// SFTP server takes the channel itself rather than a channel id.
         channels: Arc<tokio::sync::Mutex<HashMap<ChannelId, Channel<Msg>>>>,
@@ -611,6 +647,9 @@ mod tests {
                     root: self.root.clone(),
                     open: HashMap::new(),
                     answer_close: self.answer_close,
+                    rename_supported: self.rename_supported,
+                    rename_wait: self.rename_wait.clone(),
+                    listed: std::collections::HashSet::new(),
                 },
             )
             .await;
@@ -626,7 +665,10 @@ mod tests {
     struct Files {
         root: PathBuf,
         open: HashMap<String, PathBuf>,
+        listed: std::collections::HashSet<String>,
         answer_close: bool,
+        rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl Files {
@@ -659,7 +701,13 @@ mod tests {
             _version: u32,
             _extensions: HashMap<String, String>,
         ) -> Result<Version, Self::Error> {
-            Ok(Version::new())
+            let mut version = Version::new();
+            if self.rename_supported {
+                version
+                    .extensions
+                    .insert("posix-rename@openssh.com".to_owned(), "1".to_owned());
+            }
+            Ok(version)
         }
 
         async fn open(
@@ -745,6 +793,78 @@ mod tests {
             })
         }
 
+        async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+            let path = self.resolve(&path);
+            if !path.is_dir() {
+                return Err(StatusCode::NoSuchFile);
+            }
+            let handle = format!("d{id}");
+            self.open.insert(handle.clone(), path);
+            Ok(Handle { id, handle })
+        }
+
+        async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+            if !self.listed.insert(handle.clone()) {
+                return Err(StatusCode::Eof);
+            }
+            let path = self.open.get(&handle).ok_or(StatusCode::Failure)?;
+            let mut paths: Vec<_> = std::fs::read_dir(path)
+                .map_err(|_| StatusCode::Failure)?
+                .collect::<Result<_, _>>()
+                .map_err(|_| StatusCode::Failure)?;
+            paths.sort_by_key(|entry| entry.file_name());
+            let files = paths
+                .into_iter()
+                .map(|entry| File {
+                    filename: entry.file_name().to_string_lossy().into_owned(),
+                    longname: String::new(),
+                    attrs: Files::attributes(&entry.path()).unwrap(),
+                })
+                .collect();
+            Ok(Name { id, files })
+        }
+
+        async fn remove(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+            std::fs::remove_file(self.resolve(&path)).map_err(|_| StatusCode::Failure)?;
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        }
+
+        async fn extended(
+            &mut self,
+            id: u32,
+            request: String,
+            data: Vec<u8>,
+        ) -> Result<russh_sftp::protocol::Packet, Self::Error> {
+            if request != "posix-rename@openssh.com" || !self.rename_supported {
+                return Err(StatusCode::OpUnsupported);
+            }
+            #[derive(serde::Deserialize)]
+            struct Rename {
+                oldpath: String,
+                newpath: String,
+            }
+            let paths: Rename =
+                russh_sftp::de::from_bytes(&mut data.into()).map_err(|_| StatusCode::BadMessage)?;
+            std::fs::rename(self.resolve(&paths.oldpath), self.resolve(&paths.newpath))
+                .map_err(|_| StatusCode::Failure)?;
+            if let Some(ready) = &self.rename_wait {
+                ready.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok(Status {
+                id,
+                status_code: StatusCode::Ok,
+                error_message: String::new(),
+                language_tag: String::new(),
+            }
+            .into())
+        }
+
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
             let resolved = self.resolve(&path);
             Ok(Attrs {
@@ -765,7 +885,9 @@ mod tests {
             };
             attrs.set_dir(meta.is_dir());
             attrs.set_regular(meta.is_file());
-            attrs.set_symlink(meta.file_type().is_symlink());
+            if meta.file_type().is_symlink() {
+                attrs.set_symlink(true);
+            }
             Ok(Attrs { id, attrs })
         }
 
@@ -814,6 +936,23 @@ mod tests {
     }
 
     async fn served_with_close(root: &Path, answer_close: bool) -> Connection {
+        served_with_options(root, answer_close, true).await
+    }
+
+    async fn served_with_options(
+        root: &Path,
+        answer_close: bool,
+        rename_supported: bool,
+    ) -> Connection {
+        served_with_rename_wait(root, answer_close, rename_supported, None).await
+    }
+
+    async fn served_with_rename_wait(
+        root: &Path,
+        answer_close: bool,
+        rename_supported: bool,
+        rename_wait: Option<Arc<tokio::sync::Notify>>,
+    ) -> Connection {
         let host_key =
             keys::PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519).unwrap();
         let pinned =
@@ -829,6 +968,8 @@ mod tests {
         let mut target_server = FileServer {
             root: root.to_path_buf(),
             answer_close,
+            rename_supported,
+            rename_wait,
             channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         tokio::spawn(async move {
@@ -869,6 +1010,285 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn bounded_metadata_listing_and_checksums_use_sftp_without_publishing_contents() {
+        let root = scratch();
+        let content = b"binary\0data";
+        std::fs::write(root.join("binary"), content).unwrap();
+        std::fs::create_dir(root.join("many")).unwrap();
+        for index in 0..140 {
+            std::fs::write(root.join("many").join(format!("entry-{index:03}")), []).unwrap();
+        }
+        let connection = served(&root).await;
+        let observed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stat = inspect(
+            &connection,
+            &path("/binary"),
+            InfoOperation::Stat,
+            64,
+            DownloadWindow::default(),
+            observed.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            stat,
+            FileInfo::Stat {
+                metadata: Metadata {
+                    bytes: Some(11),
+                    kind: FileKind::File,
+                    ..
+                }
+            }
+        ));
+        let listing = inspect(
+            &connection,
+            &path("/many"),
+            InfoOperation::List,
+            64,
+            DownloadWindow::default(),
+            observed.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(listing.is_bounded());
+        let FileInfo::List { entries, truncated } = listing else {
+            panic!("directory result");
+        };
+        assert_eq!(entries.len(), 128);
+        assert!(truncated);
+        let checksum = inspect(
+            &connection,
+            &path("/binary"),
+            InfoOperation::Checksum,
+            11,
+            DownloadWindow::default(),
+            observed.clone(),
+        )
+        .await
+        .unwrap();
+        let expected = crate::transfer::identity(String::new(), content);
+        assert_eq!(
+            checksum,
+            FileInfo::Checksum {
+                bytes: 11,
+                sha256: expected.sha256
+            }
+        );
+        assert_eq!(observed.load(std::sync::atomic::Ordering::Relaxed), 11);
+        assert_eq!(
+            inspect(
+                &connection,
+                &path("/binary"),
+                InfoOperation::Checksum,
+                10,
+                DownloadWindow::default(),
+                observed.clone()
+            )
+            .await
+            .unwrap_err(),
+            crate::transfer::Failure::TooLarge
+        );
+        std::os::unix::fs::symlink("binary", root.join("link-file")).unwrap();
+        assert_eq!(
+            inspect(
+                &connection,
+                &path("/link-file"),
+                InfoOperation::Stat,
+                64,
+                DownloadWindow::default(),
+                observed
+            )
+            .await
+            .unwrap_err(),
+            crate::transfer::Failure::SymbolicLink
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_replacement_requires_peer_support_and_preserves_existing_temporary_files() {
+        use crate::transfer::{Failure, PreparedUpload};
+        let root = scratch();
+        std::fs::write(root.join("destination"), b"old").unwrap();
+        let supported = served(&root).await;
+        let unsupported = served_with_options(&root, true, false).await;
+        let input =
+            || PreparedUpload::new("file://fixture".to_owned(), b"replacement\0".to_vec()).unwrap();
+        assert_eq!(
+            upload_with_staging(
+                &unsupported,
+                &path("/destination"),
+                &mut input(),
+                true,
+                Some(&path("/temporary")),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await
+            .unwrap_err(),
+            Failure::UnsupportedOperation
+        );
+        assert!(!root.join("temporary").exists());
+        assert_eq!(std::fs::read(root.join("destination")).unwrap(), b"old");
+        std::fs::write(root.join("temporary"), b"someone else's file").unwrap();
+        assert!(
+            upload_with_staging(
+                &supported,
+                &path("/destination"),
+                &mut input(),
+                true,
+                Some(&path("/temporary")),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.join("temporary")).unwrap(),
+            b"someone else's file"
+        );
+        assert_eq!(std::fs::read(root.join("destination")).unwrap(), b"old");
+        std::fs::remove_file(root.join("temporary")).unwrap();
+        upload_with_staging(
+            &supported,
+            &path("/destination"),
+            &mut input(),
+            true,
+            Some(&path("/temporary")),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("destination")).unwrap(),
+            b"replacement\0"
+        );
+        assert!(!root.join("temporary").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_rename_preserves_unknown_outcome_and_local_cancellation() {
+        use crate::audit::Ledger;
+        use crate::clock::TestClock;
+        use crate::policy::{Engine, ReviewMode};
+        use crate::run::{Cancellation, Limits, Outcome, RunState, Runs, Settled};
+        use crate::session::{Lifetime, Purpose, SessionStore};
+        use crate::transfer::{Failure, Payload, PreparedUpload};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Observed(std::sync::Mutex<Vec<Outcome>>);
+        impl Settled for Observed {
+            fn settled(&self, outcome: Outcome) {
+                self.0.lock().unwrap().push(outcome);
+            }
+        }
+        let root = scratch();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let connection =
+            Arc::new(served_with_rename_wait(&root, true, true, Some(Arc::clone(&ready))).await);
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 10000,
+                max: 60000,
+                grace: 5000,
+            },
+            1,
+        )
+        .open(
+            crate::PrincipalId::parse("alice").unwrap(),
+            HostId::parse("testhost").unwrap(),
+            RoleId::parse("readonly").unwrap(),
+            Purpose::parse("verify replacement interruption").unwrap(),
+            crate::AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        let observed = Arc::new(Observed(std::sync::Mutex::new(Vec::new())));
+        let runs = Runs::watched(
+            Limits {
+                wait: Duration::ZERO,
+                transfer_timeout: Duration::from_secs(2),
+                ..Limits::default()
+            },
+            Some(observed.clone()),
+        );
+        for cancel in [true, false] {
+            std::fs::write(root.join("destination"), b"old").unwrap();
+            let released = Arc::new(AtomicUsize::new(0));
+            let input = PreparedUpload::new("file://fixture".to_owned(), b"new".to_vec())
+                .unwrap()
+                .released_on_success({
+                    let released = Arc::clone(&released);
+                    move || {
+                        released.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            let action = crate::action::Action::upload_with_staging(
+                path("/destination"),
+                input.identity().clone(),
+                true,
+                Some(path("/temporary")),
+            )
+            .unwrap();
+            let receipt = ledger
+                .record_intent(
+                    Engine::new(ReviewMode::Disabled).decide_action(&session, action),
+                    crate::command::CommandIntent::parse("verify replacement interruption")
+                        .unwrap(),
+                )
+                .unwrap()
+                .into_parts()
+                .1
+                .unwrap();
+            let initial = runs
+                .transfer(connection.clone(), receipt, Payload::Upload(input))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), ready.notified())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(root.join("destination")).unwrap(), b"new");
+            if cancel {
+                runs.cancel(initial.run()).unwrap();
+            }
+            let outcome = runs
+                .wait(initial.run(), Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.state(),
+                RunState::TransferFailed {
+                    cause: Failure::ReplacementUnknown,
+                    remote_write_may_be_partial: true,
+                }
+            );
+            assert_eq!(
+                runs.progress(outcome.run()).unwrap().cancellation,
+                if cancel {
+                    Cancellation::TransferStopped
+                } else {
+                    Cancellation::NotRequested
+                }
+            );
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !runs.unfinished().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.0.lock().unwrap().last().unwrap().state(),
+                outcome.state()
+            );
+            assert!(runs.forget(outcome.run()));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
