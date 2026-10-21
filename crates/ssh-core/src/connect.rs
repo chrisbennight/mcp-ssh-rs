@@ -42,7 +42,7 @@ pub trait CredentialSource: Send + Sync {
 /// How long the service waits at each stage of opening a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
-    /// Establishing the transport and completing key exchange.
+    /// Total budget for credential retrieval, transport setup, and authentication.
     pub connect: Duration,
     /// Silence on an established connection before it is dropped.
     ///
@@ -112,6 +112,15 @@ impl<S: CredentialSource> Connector<S> {
     /// a caller label a connection with one identity while it holds another's
     /// capability, and the record would report the label.
     pub async fn connect(&self, target: &Target<'_>) -> Result<Connection, ConnectError> {
+        tokio::time::timeout(self.timeouts.connect, self.connect_within(target))
+            .await
+            .map_err(|_| ConnectError::Unreachable {
+                address: target.address().to_owned(),
+                detail: "connection setup timed out".to_owned(),
+            })?
+    }
+
+    async fn connect_within(&self, target: &Target<'_>) -> Result<Connection, ConnectError> {
         // Before anything is dialled: an unreadable pin means there is nothing
         // to verify against, and connecting anyway would be an unauthenticated
         // target with a configuration file that claims otherwise.
@@ -156,15 +165,7 @@ impl<S: CredentialSource> Connector<S> {
             mismatch: Arc::clone(&mismatch),
         };
 
-        let dialled = tokio::time::timeout(
-            self.timeouts.connect,
-            client::connect(config, target.address(), verifier),
-        )
-        .await
-        .map_err(|_| ConnectError::Unreachable {
-            address: target.address().to_owned(),
-            detail: "timed out".to_owned(),
-        })?;
+        let dialled = client::connect(config, target.address(), verifier).await;
 
         let mut handle = match dialled {
             Ok(handle) => handle,
@@ -515,6 +516,7 @@ mod tests {
         /// This is the difference between a credential being refused and
         /// authentication not completing at all, and they are separate errors.
         Fail,
+        Wait,
     }
 
     #[derive(Clone)]
@@ -545,6 +547,7 @@ mod tests {
                 Answer::Accept => Ok(Auth::Accept),
                 Answer::Reject => Ok(Auth::reject()),
                 Answer::Fail => Err(russh::Error::Disconnect),
+                Answer::Wait => std::future::pending().await,
             }
         }
 
@@ -700,6 +703,53 @@ mod tests {
                 keepalive: Duration::from_secs(10),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_includes_credential_retrieval() {
+        struct WaitingStore;
+        impl CredentialSource for WaitingStore {
+            async fn fetch(&self, _: &CredentialRef) -> Result<Secret<String>, CredentialError> {
+                std::future::pending().await
+            }
+        }
+        let server = start_server(Answer::Accept).await;
+        let registry = registry_for(&server.address, &server.host_key);
+        let target = registry.resolve(&host(), &role()).unwrap();
+        let connector = Connector::new(
+            WaitingStore,
+            Timeouts {
+                connect: Duration::from_millis(10),
+                ..Timeouts::default()
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), connector.connect(&target))
+            .await
+            .expect("credential retrieval must have a setup deadline");
+        assert!(matches!(result, Err(ConnectError::Unreachable { .. })));
+        assert!(server.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setup_deadline_includes_authentication() {
+        let server = start_server(Answer::Wait).await;
+        let registry = registry_for(&server.address, &server.host_key);
+        let target = registry.resolve(&host(), &role()).unwrap();
+        let connector = Connector::new(
+            FakeStore::with(REFERENCE, &client_key()),
+            Timeouts {
+                connect: Duration::from_secs(2),
+                ..Timeouts::default()
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), connector.connect(&target))
+            .await
+            .expect("authentication must have a setup deadline");
+        assert!(matches!(result, Err(ConnectError::Unreachable { .. })));
+        assert!(
+            !server.seen.lock().unwrap().is_empty(),
+            "the peer was reached before the deadline"
+        );
     }
 
     /// The whole promise, end to end: the service authenticates to a real
