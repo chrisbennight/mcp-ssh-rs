@@ -459,18 +459,18 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
     }
 
     /// Account ownership is checked before validation, review, or recording.
-    fn authorize_action(
+    fn authorize_action<E: Into<MediationError>>(
         &self,
         principal: &PrincipalId,
         session: &SessionId,
         agent_intent: CommandIntent,
-        action: impl FnOnce() -> Result<crate::action::Action, CommandError>,
+        action: impl FnOnce() -> Result<crate::action::Action, E>,
     ) -> Result<(Session, Admission), MediationError> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(MediationError::Stopping);
         }
         let session = self.sessions.use_session(session, principal)?;
-        let action = action()?;
+        let action = action().map_err(Into::into)?;
         let decision = self.engine.decide_action(&session, action.clone());
         let intended = self.ledger.record_intent(decision, agent_intent)?;
         let admission = match intended.decision().verdict() {
@@ -583,6 +583,27 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
             .await
     }
 
+    pub async fn file_info_intended(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        agent_intent: CommandIntent,
+        path: crate::files::RemotePath,
+        operation: crate::files::InfoOperation,
+    ) -> Result<Executed, MediationError> {
+        let principal = principal.clone();
+        let session = session.clone();
+        let (session, admission) = self
+            .blocking(move |state| {
+                state.authorize_action(&principal, &session, agent_intent, || {
+                    crate::action::Action::file_info(path, operation)
+                })
+            })
+            .await??;
+        self.transfer_admitted(session, admission, crate::transfer::Payload::FileInfo)
+            .await
+    }
+
     /// The approval binds immutable content identity and the explicit replacement choice.
     pub async fn upload_intended(
         &self,
@@ -593,13 +614,47 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         input: crate::transfer::PreparedUpload,
         overwrite: bool,
     ) -> Result<Executed, MediationError> {
+        self.upload_with_staging_intended(
+            principal,
+            session,
+            agent_intent,
+            path,
+            input,
+            overwrite,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_with_staging_intended(
+        &self,
+        principal: &PrincipalId,
+        session: &SessionId,
+        agent_intent: CommandIntent,
+        path: crate::files::RemotePath,
+        input: crate::transfer::PreparedUpload,
+        overwrite: bool,
+        staging_path: Option<crate::files::RemotePath>,
+    ) -> Result<Executed, MediationError> {
         let principal = principal.clone();
         let session = session.clone();
         let source = input.identity().clone();
         let (session, admission) = self
             .blocking(move |state| {
                 state.authorize_action(&principal, &session, agent_intent, || {
-                    crate::action::Action::upload(path, source, overwrite)
+                    if staging_path.as_ref().is_some_and(|stage| {
+                        !overwrite || stage == &path || stage.parent() != path.parent()
+                    }) {
+                        return Err(MediationError::InvalidStagingPath);
+                    }
+                    crate::action::Action::upload_with_staging(
+                        path,
+                        source,
+                        overwrite,
+                        staging_path,
+                    )
+                    .map_err(MediationError::from)
                 })
             })
             .await??;
@@ -1476,6 +1531,10 @@ async fn own_operation<T: Send + 'static>(
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MediationError {
+    #[error(
+        "staged replacement needs overwrite and a distinct temporary path in the destination directory"
+    )]
+    InvalidStagingPath,
     #[error("the requested account access class does not match configuration")]
     AccountMismatch,
     #[error("synchronous state work is at capacity; try again later")]
@@ -2234,6 +2293,102 @@ mod tests {
         bastion.cancel(&alice(), &session.id, id).unwrap();
         assert!(bastion.ledger.entries().iter().any(|entry| matches!(entry.event, crate::audit::Event::CancellationRequested { ref run, .. } if run == id)));
         bastion.close_session(&alice(), &session.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_upload_review_binds_both_paths_and_replacement_choice() {
+        let bastion = bastion().await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let path = crate::files::RemotePath::parse("/tmp/destination").unwrap();
+        let intent = CommandIntent::parse("replace the report using a temporary file").unwrap();
+        let input = || {
+            crate::transfer::PreparedUpload::new("file://fixture".to_owned(), b"content".to_vec())
+                .unwrap()
+        };
+        let mut ids = Vec::new();
+        for stage in [
+            Some("/tmp/stage-a"),
+            Some("/tmp/stage-a"),
+            Some("/tmp/stage-b"),
+            None,
+        ] {
+            let Executed::AwaitingApproval { asked, .. } = bastion
+                .upload_with_staging_intended(
+                    &alice(),
+                    &session.id,
+                    intent.clone(),
+                    path.clone(),
+                    input(),
+                    true,
+                    stage.map(|stage| crate::files::RemotePath::parse(stage).unwrap()),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("review required");
+            };
+            ids.push(asked.asked().id.clone());
+        }
+        assert_eq!(ids.first(), ids.get(1));
+        assert_ne!(ids.first(), ids.get(2));
+        assert_ne!(ids.first(), ids.get(3));
+        for (stage, overwrite) in [
+            ("/another/stage", true),
+            ("/tmp/destination", true),
+            ("/tmp/stage-c", false),
+        ] {
+            assert!(matches!(
+                bastion
+                    .upload_with_staging_intended(
+                        &alice(),
+                        &session.id,
+                        intent.clone(),
+                        path.clone(),
+                        input(),
+                        overwrite,
+                        Some(crate::files::RemotePath::parse(stage).unwrap())
+                    )
+                    .await,
+                Err(MediationError::InvalidStagingPath)
+            ));
+        }
+        assert_eq!(bastion.waiting_for_approval().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn metadata_operations_have_distinct_review_identity_and_reject_foreign_owners() {
+        let bastion = bastion().await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let foreign = PrincipalId::parse("someone-else").unwrap();
+        for operation in [
+            crate::files::InfoOperation::Stat,
+            crate::files::InfoOperation::List,
+            crate::files::InfoOperation::Checksum,
+        ] {
+            let intent = CommandIntent::parse("inspect remote metadata").unwrap();
+            let path = crate::files::RemotePath::parse("/report").unwrap();
+            assert!(
+                bastion
+                    .file_info_intended(
+                        &foreign,
+                        &session.id,
+                        intent.clone(),
+                        path.clone(),
+                        operation
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                bastion
+                    .file_info_intended(&alice(), &session.id, intent, path, operation)
+                    .await
+                    .unwrap(),
+                Executed::AwaitingApproval { .. }
+            ));
+        }
+        assert_eq!(bastion.waiting_for_approval().len(), 3);
+        assert!(bastion.outstanding_runs().is_empty());
     }
 
     #[tokio::test]

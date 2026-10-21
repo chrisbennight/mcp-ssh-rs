@@ -569,7 +569,15 @@ fn validate_event(event: &Value) -> Result<(), ()> {
         "completed" => {
             exact_keys(
                 object,
-                if object.contains_key("file") {
+                if object.contains_key("info") && object.contains_key("file") {
+                    &[
+                        "event", "run", "decided", "state", "stdout", "stderr", "file", "info",
+                    ]
+                } else if object.contains_key("info") {
+                    &[
+                        "event", "run", "decided", "state", "stdout", "stderr", "info",
+                    ]
+                } else if object.contains_key("file") {
                     &[
                         "event", "run", "decided", "state", "stdout", "stderr", "file",
                     ]
@@ -577,6 +585,13 @@ fn validate_event(event: &Value) -> Result<(), ()> {
                     &["event", "run", "decided", "state", "stdout", "stderr"]
                 },
             )?;
+            if let Some(info) = object.get("info") {
+                let info: ssh_core::files::FileInfo =
+                    serde_json::from_value(info.clone()).map_err(|_| ())?;
+                if !info.is_bounded() {
+                    return Err(());
+                }
+            }
             if let Some(file) = object.get("file") {
                 let file = file.as_object().ok_or(())?;
                 exact_keys(file, &["uri", "bytes", "sha256"])?;
@@ -692,7 +707,7 @@ fn operation_keys(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Res
     if let Some(operation) = object.get("operation") {
         one_of(
             operation.as_str().ok_or(())?,
-            &["execute", "download", "upload"],
+            &["execute", "download", "upload", "stat", "list", "checksum"],
         )?;
         exact_keys(object, keys)
     } else {

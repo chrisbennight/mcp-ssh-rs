@@ -49,6 +49,7 @@ pub struct EvaluatorSettings {
 pub struct Settings {
     pub sessions_per_principal: usize,
     pub download_window: ssh_core::files::DownloadWindow,
+    pub checksum_bytes: u64,
     pub operator_header: axum::http::HeaderName,
     pub file_origin: Option<Url>,
     pub file_root: Option<PathBuf>,
@@ -112,6 +113,7 @@ impl std::fmt::Debug for Settings {
         f.debug_struct("Settings")
             .field("sessions_per_principal", &self.sessions_per_principal)
             .field("download_window", &self.download_window)
+            .field("checksum_bytes", &self.checksum_bytes)
             .field("registry", &self.registry)
             .field("bearers", &self.bearers)
             .field("proxy_bearers", &self.proxy_bearers)
@@ -129,6 +131,7 @@ impl std::fmt::Debug for Settings {
 impl Settings {
     pub const SESSIONS_PER_PRINCIPAL_VAR: &'static str = "MCP_SSH_SESSIONS_PER_PRINCIPAL";
     pub const DEFAULT_SESSIONS_PER_PRINCIPAL: usize = 32;
+    pub const CHECKSUM_BYTES_VAR: &'static str = "MCP_SSH_CHECKSUM_MAX_BYTES";
     pub const SFTP_READ_AHEAD_VAR: &'static str = "MCP_SSH_SFTP_READ_AHEAD";
     pub const AUTH_MODE_VAR: &'static str = "MCP_SSH_AUTH_MODE";
     pub const STANDALONE_BEARER_VAR: &'static str = "MCP_SSH_BEARER";
@@ -469,7 +472,14 @@ impl Settings {
             .ok_or(SettingsError::Unusable {
                 var: Self::SFTP_READ_AHEAD_VAR,
             })?;
+        let checksum_bytes = positive(&lookup, Self::CHECKSUM_BYTES_VAR, 64 << 20)?;
+        if checksum_bytes > i64::MAX as u64 {
+            return Err(SettingsError::Unusable {
+                var: Self::CHECKSUM_BYTES_VAR,
+            });
+        }
         Ok(Self {
+            checksum_bytes,
             download_window,
             sessions_per_principal: usize::try_from(positive(
                 &lookup,
@@ -505,6 +515,7 @@ impl Settings {
         bounds.sessions_per_principal = self.sessions_per_principal;
         bounds.run.transfer_timeout = self.transfers.timeout;
         bounds.run.download_window = self.download_window;
+        bounds.run.checksum_bytes = self.checksum_bytes;
         bounds
     }
 }
@@ -721,6 +732,29 @@ mod tests {
             (Settings::STANDALONE_BEARER_VAR, BEARER.to_owned()),
             (Settings::OPERATOR_PASSWORD_VAR, PROXY_BEARER.to_owned()),
         ])
+    }
+
+    #[test]
+    fn checksum_limit_defaults_and_reaches_the_run_budget() {
+        for (configured, expected) in [(None, 64 << 20), (Some("16"), 16)] {
+            let mut vars = standalone();
+            if let Some(value) = configured {
+                vars.insert(Settings::CHECKSUM_BYTES_VAR, value.to_owned());
+            }
+            assert_eq!(
+                Settings::from_lookup(read(&vars))
+                    .unwrap()
+                    .bounds()
+                    .run
+                    .checksum_bytes,
+                expected
+            );
+        }
+        for invalid in ["0", "-1", "18446744073709551615"] {
+            let mut vars = standalone();
+            vars.insert(Settings::CHECKSUM_BYTES_VAR, invalid.to_owned());
+            assert!(Settings::from_lookup(read(&vars)).is_err());
+        }
     }
 
     #[test]

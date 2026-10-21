@@ -9,6 +9,9 @@ pub enum ActionKind {
     Execute,
     Download,
     Upload,
+    Stat,
+    List,
+    Checksum,
 }
 
 impl ActionKind {
@@ -17,6 +20,9 @@ impl ActionKind {
             Self::Execute => "execute",
             Self::Download => "download",
             Self::Upload => "upload",
+            Self::Stat => "stat",
+            Self::List => "list",
+            Self::Checksum => "checksum",
         }
     }
 }
@@ -35,10 +41,15 @@ pub enum Operation {
     Download {
         path: RemotePath,
     },
+    FileInfo {
+        path: RemotePath,
+        operation: crate::files::InfoOperation,
+    },
     Upload {
         path: RemotePath,
         source: FileIdentity,
         overwrite: bool,
+        staging_path: Option<RemotePath>,
     },
 }
 
@@ -65,23 +76,53 @@ impl Action {
         })
     }
 
+    pub fn file_info(
+        path: RemotePath,
+        operation: crate::files::InfoOperation,
+    ) -> Result<Self, CommandError> {
+        let program = match operation {
+            crate::files::InfoOperation::Stat => "file.stat",
+            crate::files::InfoOperation::List => "file.list",
+            crate::files::InfoOperation::Checksum => "file.checksum",
+        };
+        let command = Command::new(vec![program.to_owned(), path.as_str().to_owned()])?;
+        Ok(Self {
+            operation: Operation::FileInfo { path, operation },
+            command,
+        })
+    }
+
     pub fn upload(
         path: RemotePath,
         source: FileIdentity,
         overwrite: bool,
     ) -> Result<Self, CommandError> {
-        let command = Command::new(vec![
+        Self::upload_with_staging(path, source, overwrite, None)
+    }
+
+    pub fn upload_with_staging(
+        path: RemotePath,
+        source: FileIdentity,
+        overwrite: bool,
+        staging_path: Option<RemotePath>,
+    ) -> Result<Self, CommandError> {
+        let mut argv = vec![
             "file.upload".to_owned(),
             path.as_str().to_owned(),
             source.bytes.to_string(),
             source.sha256.clone(),
             if overwrite { "replace" } else { "create_new" }.to_owned(),
-        ])?;
+        ];
+        if let Some(stage) = &staging_path {
+            argv.extend(["staged".to_owned(), stage.as_str().to_owned()]);
+        }
+        let command = Command::new(argv)?;
         Ok(Self {
             operation: Operation::Upload {
                 path,
                 source,
                 overwrite,
+                staging_path,
             },
             command,
         })
@@ -92,6 +133,11 @@ impl Action {
             Operation::Execute => ActionKind::Execute,
             Operation::Download { .. } => ActionKind::Download,
             Operation::Upload { .. } => ActionKind::Upload,
+            Operation::FileInfo { operation, .. } => match operation {
+                crate::files::InfoOperation::Stat => ActionKind::Stat,
+                crate::files::InfoOperation::List => ActionKind::List,
+                crate::files::InfoOperation::Checksum => ActionKind::Checksum,
+            },
         }
     }
 

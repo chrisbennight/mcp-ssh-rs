@@ -137,6 +137,7 @@ impl DownloadSink for CountingSink {
 
 pub(crate) enum Payload {
     Download(Arc<dyn DownloadSink>),
+    FileInfo,
     Upload(PreparedUpload),
 }
 
@@ -154,6 +155,9 @@ pub enum Failure {
     TimedOut,
     WorkerStopped,
     Cancelled,
+    UnsupportedOperation,
+    ReplacementUnknown,
+    StagingCleanupFailed,
 }
 
 impl Failure {
@@ -169,6 +173,9 @@ impl Failure {
             Self::TimedOut => "timed_out",
             Self::WorkerStopped => "worker_stopped",
             Self::Cancelled => "cancelled",
+            Self::UnsupportedOperation => "unsupported_operation",
+            Self::ReplacementUnknown => "replacement_unknown",
+            Self::StagingCleanupFailed => "staging_cleanup_failed",
         }
     }
 
@@ -186,6 +193,13 @@ impl Failure {
             Self::TimedOut => "The transfer exceeded its time limit.",
             Self::WorkerStopped => "The transfer worker ended unexpectedly.",
             Self::Cancelled => "The transfer was cancelled locally; remote work may be incomplete.",
+            Self::UnsupportedOperation => "The SFTP peer does not support the requested operation.",
+            Self::ReplacementUnknown => {
+                "The replacement acknowledgement was lost; the destination may have been replaced. Investigate before retrying."
+            }
+            Self::StagingCleanupFailed => {
+                "The staged operation failed and temporary file removal was not confirmed; inspect both named paths before retrying."
+            }
         }
     }
 }

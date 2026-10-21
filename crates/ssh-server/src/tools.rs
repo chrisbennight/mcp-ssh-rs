@@ -44,6 +44,7 @@ pub const EXEC: &str = "ssh_exec";
 pub const POLL: &str = "ssh_poll";
 pub const PROGRESS: &str = "ssh_progress";
 pub const CANCEL: &str = "ssh_cancel";
+pub const FILE_INFO: &str = "ssh_file_info";
 pub const CLOSE_SESSION: &str = "ssh_close_session";
 
 /// How long `poll` waits before answering "still running" again.
@@ -302,6 +303,8 @@ pub enum ExecResult {
     Ran {
         #[serde(skip_serializing_if = "Option::is_none")]
         file: Option<crate::transfer::Reference>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        info: Option<ssh_core::files::FileInfo>,
         run: String,
         /// Absent when the command ended without the target reporting one.
         exit: Option<u32>,
@@ -519,6 +522,15 @@ pub fn catalog() -> ListToolsResult {
                     // handed over, but they are not this service's news.
                     .open_world(true),
             ),
+            tool::<FileInfoArgs, ExecResult>(
+                FILE_INFO,
+                "Inspect remote metadata, list a bounded directory, or compute a size-limited SHA-256 checksum without returning file contents. Uses session review and run tracking; poll still-running operations.",
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(false)
+                    .idempotent(false)
+                    .open_world(true),
+            ),
             tool::<PollArgs, ProgressResult>(
                 PROGRESS,
                 "Inspect an owned run immediately without collecting output. Counters do not expose stream contents. Collect the final result with ssh_poll.",
@@ -615,6 +627,18 @@ pub struct DownloadArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct FileInfoArgs {
+    pub host: String,
+    pub role: String,
+    pub access_class: AccessClassArg,
+    pub session: String,
+    pub intent: String,
+    pub path: String,
+    pub operation: ssh_core::files::InfoOperation,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UploadArgs {
     pub host: String,
     pub role: String,
@@ -628,6 +652,9 @@ pub struct UploadArgs {
     pub source: String,
     /// Explicitly permit replacement of an existing file. Interrupted writes may be partial.
     pub overwrite: bool,
+    /// Optional distinct temporary path in the destination directory. Requires overwrite and POSIX rename support. Cancellation may leave this temporary file behind.
+    #[serde(default)]
+    pub staging_path: Option<String>,
 }
 
 pub fn catalog_with_files(files: Option<&crate::transfer::Transfers>) -> ListToolsResult {
@@ -695,6 +722,31 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
     let principal = acting_for.get();
     let arguments = params.arguments.unwrap_or_default();
     match params.name.as_ref() {
+        FILE_INFO => {
+            let args: FileInfoArgs = parse(arguments)?;
+            let session = session_named(&args.session)?;
+            check_session_account(
+                bastion,
+                principal,
+                &session,
+                &args.host,
+                &args.role,
+                args.access_class,
+            )
+            .await?;
+            let path = ssh_core::files::RemotePath::parse(&args.path).map_err(bad_request)?;
+            let intent = CommandIntent::parse(&args.intent).map_err(bad_request)?;
+            match bastion
+                .file_info_intended(principal, &session, intent, path, args.operation)
+                .await
+            {
+                Ok(executed) => {
+                    announce(notifier, dashboard, &executed);
+                    ok(&exec_result_with_files(executed, dashboard, files, principal).await)
+                }
+                Err(error) => without_an_outcome(&error),
+            }
+        }
         "ssh_download" => {
             let args: DownloadArgs = parse(arguments)?;
             let session = session_named(&args.session)?;
@@ -744,12 +796,26 @@ pub async fn dispatch_with_files<C: Clock + 'static, S: CredentialSource>(
             let store = files.ok_or_else(|| {
                 McpError::invalid_request("file transfer is not configured", None)
             })?;
+            let staging_path = args
+                .staging_path
+                .as_deref()
+                .map(ssh_core::files::RemotePath::parse)
+                .transpose()
+                .map_err(bad_request)?;
             let input = store
                 .input(principal, &args.source)
                 .await
                 .map_err(bad_request)?;
             match bastion
-                .upload_intended(principal, &session, intent, path, input, args.overwrite)
+                .upload_with_staging_intended(
+                    principal,
+                    &session,
+                    intent,
+                    path,
+                    input,
+                    args.overwrite,
+                    staging_path,
+                )
                 .await
             {
                 Ok(executed) => {
@@ -1161,7 +1227,8 @@ fn ran(outcome: &ssh_core::run::Outcome, why: String) -> ExecResult {
         outcome.stderr(),
         why,
     );
-    if let ExecResult::Ran { file, .. } = &mut result {
+    if let ExecResult::Ran { file, info, .. } = &mut result {
+        *info = outcome.info().cloned();
         *file = outcome.file().map(|identity| crate::transfer::Reference {
             uri: identity.uri.clone(),
             size: Some(identity.bytes),
@@ -1242,6 +1309,7 @@ fn reported(
     }
     ExecResult::Ran {
         file: None,
+        info: None,
         run: run.as_str().to_owned(),
         exit: match state {
             RunState::Exited { code } => Some(code),
@@ -1985,7 +2053,7 @@ mod tests {
             serde_json::to_vec(&catalog_with_files(Some(&files)))
                 .unwrap()
                 .len()
-                < 40_000
+                < 64_000
         );
         let result = ok(&ExecResult::Unknown {
             run: "retained-run".to_owned(),
@@ -2049,6 +2117,7 @@ mod tests {
                 OPEN_SESSION,
                 EXEC,
                 POLL,
+                FILE_INFO,
                 PROGRESS,
                 CANCEL,
                 CLOSE_SESSION

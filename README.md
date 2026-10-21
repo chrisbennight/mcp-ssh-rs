@@ -48,6 +48,10 @@ result, or explicitly request cancellation of a command or transfer.
 references, streaming through disk storage with a configurable 2 GB default file
 limit. [Set up file transfers](docs/file-transfers.md).
 
+**Inspect remote files.** Read metadata, list a bounded directory, or calculate a
+checksum without returning file contents. Uploads can request staged replacement
+when the SFTP peer supports it. [File operations](docs/file-transfers.md#metadata-listings-and-checksums).
+
 **Collect large command results as files.** Keep bulk output outside the model's
 context and retrieve it through the configured byte channel.
 [Choose a file channel](docs/file-transfers.md).

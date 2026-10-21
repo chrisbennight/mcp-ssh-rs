@@ -78,6 +78,46 @@ can leave the private staging directory for operator cleanup.
 Local mode has no HTTP file descriptors or upload annotation. A gateway needing
 the network file protocol should use `MCP_SSH_FILE_ORIGIN` with its upstream.
 
+## Metadata, listings, and checksums
+
+`ssh_file_info` accepts `stat`, `list`, or `checksum` with the session account,
+intent, and absolute remote path. It uses the same review and run workflow as
+other file work and does not require a file byte channel. Results appear under
+`info` when the run completes; poll a still-running operation.
+
+A listing returns at most 128 entries within a 64 KiB result allowance and marks
+an incomplete listing as `truncated`. It has no continuation cursor; inspect a
+narrower directory when truncated. Recognized sensitive filenames are withheld.
+Metadata includes the file type, optional byte size, permission bits, and
+modification timestamp reported by the peer.
+
+Checksums stream SHA-256 without publishing or returning file content. The
+`MCP_SSH_CHECKSUM_MAX_BYTES` setting defaults to 64 MiB and the existing file
+operation deadline also applies. A growing file is refused when the byte limit
+is exceeded. The digest describes the bytes observed during the read; concurrent
+remote modification is not a filesystem snapshot.
+
+## Staged replacement
+
+For `ssh_upload`, supply `staging_path` and `overwrite: true` to request staged
+replacement. The temporary path must differ from the destination and share its
+directory. Both paths and the content identity are included in review. The
+service checks for version 1 of
+[OpenSSH POSIX rename](https://github.com/openssh/openssh-portable/blob/HEAD/PROTOCOL)
+before creating the temporary file; an existing temporary path is refused.
+
+A complete upload is closed before the rename request replaces the destination.
+The new file requests mode 0600 and does not preserve the previous file's mode
+or ownership. This provides the peer's POSIX rename visibility semantics, not
+an fsync or crash-durability guarantee. Uploads without `staging_path` keep the
+ordinary direct-write behavior.
+
+Cancellation, a deadline, or connection loss can leave the named temporary
+file. A lost rename acknowledgement reports `replacement_unknown`: inspect
+both paths before retrying. Failed cleanup reports `staging_cleanup_failed`;
+the service does not claim that removal succeeded. No mutation is replayed
+automatically.
+
 ## Limits and outcomes
 
 File contents stream through private disk snapshots with bounded application
@@ -135,8 +175,8 @@ be polled with `ssh_poll`. Use `ssh_progress` for counters without collecting
 the result, or `ssh_cancel` to request cancellation. Cancelled uploads may have
 partial remote writes; inspect the outcome before retrying. File operations
 have a bounded runtime. Failure or
-interruption can leave a remote upload partial; replacement is not an atomic
-remote transaction. An unknown result must be investigated before repeating an
+interruption can leave a direct remote upload partial. Staged replacement
+has the explicit behavior described above. An unknown result must be investigated before repeating an
 upload. The service never automatically replays a mutation.
 
 Downloads default to eight read chunks of up to 64 KiB in flight or awaiting
@@ -148,7 +188,8 @@ guarantee higher throughput. Invalid values prevent startup. Negotiated peer
 limits can reduce chunk size. Responses are validated and delivered in offset
 order, including short reads; a slow consumer stops further requests once that
 window is occupied. Protocol framing and SSH have separate bounded buffers.
-Upload acknowledgement pipelining is unchanged.
+Direct uploads retain the dependency writer's acknowledgement pipelining.
+Staged replacement uses bounded acknowledged writes before rename.
 See [local performance measurements](performance.md) for repeatable scheduling,
 backpressure, and polling fixtures.
 

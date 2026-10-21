@@ -2807,6 +2807,7 @@ dependencies = [
  "rsa",
  "russh",
  "russh-sftp",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

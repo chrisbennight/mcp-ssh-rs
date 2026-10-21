@@ -358,7 +358,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(65536);
         let observer = handler.clone();
         let commands_only = handler.clone().with_transfers(None);
-        assert_eq!(commands_only.catalog().tools.len(), 7);
+        assert_eq!(commands_only.catalog().tools.len(), 8);
         let task = tokio::spawn(async move {
             handler
                 .serve(server)
@@ -418,7 +418,7 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .len(),
-                    9
+                    10
                 );
                 let cached = observer
                     .catalog
@@ -476,6 +476,6 @@ mod tests {
             maximum(&original),
             crate::transfer::TransferSettings::default().max_bytes
         );
-        assert_eq!(observer.with_transfers(None).catalog().tools.len(), 7);
+        assert_eq!(observer.with_transfers(None).catalog().tools.len(), 8);
     }
 }
