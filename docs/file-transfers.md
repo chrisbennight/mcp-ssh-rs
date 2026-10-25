@@ -158,7 +158,14 @@ whose upload fails, times out, waits for approval, or is refused stays usable
 until its window ends, so an investigated retry does not need the bytes sent
 again. A released reference cannot be used again or downloaded; supply the file
 again to place it on another target. Download and retained-output references
-are not released by serving as an upload source. The trusted
+are not released by serving as an upload source. Instead, each is released once
+an HTTP fetch has sent all of its bytes, so a gateway that copies a result's
+file frees the slot for the next download. A fetch that fails or disconnects
+early keeps the reference, so a new descriptor can retry it. Bytes a client
+loses after all of them were sent cannot be fetched again. Fetch a reference
+last if you also want to place it on another target. Local stdio outputs are
+read from the shared directory rather than fetched, so they last until their
+window ends. The trusted
 stdio launcher controls the shared filesystem; files or descriptors it retains
 independently are outside the service’s storage accounting. Operators
 must also bound HTTP connection lifetime at their TLS proxy, including slow GET
