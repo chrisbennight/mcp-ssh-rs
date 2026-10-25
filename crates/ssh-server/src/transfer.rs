@@ -102,6 +102,9 @@ pub struct DownloadResult {
 struct Ticketed {
     id: String,
     bytes: Option<Arc<Snapshot>>,
+    /// Sending every byte withdraws the reference: it was made for its caller
+    /// to collect, not to be placed on a target.
+    release_on_delivery: bool,
 }
 
 struct Ticket {
@@ -123,8 +126,9 @@ struct Item {
     active: Option<Arc<DiskFile>>,
     ticket: Option<Ticket>,
     cleaning: bool,
-    /// No new use may start: its transfer was abandoned, or its upload reached
-    /// the target. It stays charged only while work in progress holds storage.
+    /// No new use may start: its transfer was abandoned, its upload reached
+    /// the target, or its caller received every byte. It stays charged only
+    /// while work in progress holds storage.
     withdrawn: bool,
 }
 
@@ -167,7 +171,7 @@ pub enum TransferError {
     #[error("file reference is unavailable")]
     Unknown,
     #[error(
-        "file transfer capacity is exhausted; slots free when an upload using an earlier reference succeeds or when earlier references expire, normally within five minutes"
+        "file transfer capacity is exhausted; slots free when an earlier download or output reference has been fetched in full, when an upload using an earlier reference succeeds, or when earlier references expire, normally within five minutes"
     )]
     Capacity,
     #[error("file size or metadata exceeds its configured limit")]
@@ -426,8 +430,9 @@ impl Transfers {
             bytes.identity(uri.to_owned()),
             bytes.reader(),
         );
-        // Only references made to upload are released. Downloads and retained
-        // output also serve as sources, but they are still owed to the caller.
+        // Only references made to upload are released here. Downloads and
+        // retained output also serve as sources, but they are still owed to
+        // the caller until it fetches them.
         if !item.upload {
             return Ok(input);
         }
@@ -436,7 +441,7 @@ impl Transfers {
             .strip_prefix(URI_PREFIX)
             .ok_or(TransferError::Unknown)?
             .to_owned();
-        Ok(input.released_on_success(move || withdraw_placed(&shared, &id)))
+        Ok(input.released_on_success(move || withdraw_delivered(&shared, &id)))
     }
 
     pub async fn destination(
@@ -550,6 +555,7 @@ impl Transfers {
         Ok(Ticketed {
             id: key.clone(),
             bytes,
+            release_on_delivery: !upload && !item.upload,
         })
     }
 
@@ -637,12 +643,13 @@ impl Transfers {
     }
 }
 
-/// Withdraws an uploaded reference whose content has reached a target.
+/// Withdraws a reference whose content has reached where it was going: an
+/// upload placed on its target, or a download or output fetched in full.
 ///
 /// The store is a transfer buffer, so the slot goes back to its owner at the
-/// next admission. Another upload still reading the same bytes keeps them
-/// charged until it finishes.
-fn withdraw_placed(items: &Mutex<HashMap<String, Item>>, id: &str) {
+/// next admission. Other work still reading the same bytes keeps them charged
+/// until it finishes.
+fn withdraw_delivered(items: &Mutex<HashMap<String, Item>>, id: &str) {
     let mut items = items.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(item) = items.get_mut(id)
         && matches!(item.content, Content::Ready(_))
@@ -733,19 +740,58 @@ async fn download(
     };
     match store.take_ticket(&id, credential, false) {
         Ok(Ticketed {
-            bytes: Some(bytes), ..
+            id,
+            bytes: Some(bytes),
+            release_on_delivery,
         }) => (
             [
                 ("content-type", "application/octet-stream"),
                 ("cache-control", "no-store"),
             ],
-            Body::from_stream(ReaderStream::with_capacity(
-                bytes.reader(),
-                crate::disk::CHUNK,
-            )),
+            Body::from_stream(Delivery {
+                bytes: ReaderStream::with_capacity(bytes.reader(), crate::disk::CHUNK),
+                size: bytes.size,
+                sent: 0,
+                release: release_on_delivery.then(|| {
+                    let items = Arc::clone(&store.items);
+                    Box::new(move || withdraw_delivered(&items, &id)) as Box<_>
+                }),
+            }),
         )
             .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A download body that withdraws its reference once every byte has been sent.
+///
+/// A body that fails, or that a disconnecting client drops before its end,
+/// leaves the reference able to issue another ticket for a retry.
+struct Delivery {
+    bytes: ReaderStream<ssh_core::transfer::Reader>,
+    size: u64,
+    sent: u64,
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl futures_util::Stream for Delivery {
+    type Item = std::io::Result<axum::body::Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let next = std::task::ready!(std::pin::Pin::new(&mut self.bytes).poll_next(context));
+        match &next {
+            Some(Ok(chunk)) => self.sent = self.sent.saturating_add(chunk.len() as u64),
+            None if self.sent == self.size => {
+                if let Some(release) = self.release.take() {
+                    release();
+                }
+            }
+            Some(Err(_)) | None => {}
+        }
+        std::task::Poll::Ready(next)
     }
 }
 
@@ -1025,8 +1071,9 @@ mod tests {
         );
         assert!(
             store.authorize_download(&caller, &upload.file.uri).is_ok(),
-            "an interrupted fetch can obtain a new ticket for the same immutable file"
+            "fetching an upload reference does not withdraw it before placement"
         );
+        assert!(store.input(&caller, &upload.file.uri).await.is_ok());
     }
 
     #[tokio::test]
@@ -1176,6 +1223,72 @@ mod tests {
             .unwrap();
         store.input(&caller, &file.uri).await.unwrap().succeeded();
         assert!(store.authorize_download(&caller, &file.uri).is_ok());
+    }
+
+    /// A download or retained output that its caller has fetched in full gives
+    /// its slot back at once instead of holding it for the rest of its window.
+    /// A fetch that ends early keeps the reference for a retry.
+    #[tokio::test]
+    async fn a_fully_fetched_download_returns_its_slot_before_the_window_ends() {
+        use futures_util::StreamExt as _;
+        let store = plane();
+        let caller = owner("caller");
+        let size = crate::disk::CHUNK + 1;
+        let mut sinks = Vec::new();
+        let mut uris = Vec::new();
+        for _ in 0..OWNER_ITEMS {
+            let sink = store.destination(&caller, None).await.unwrap();
+            let file = sink
+                .receive(&mut std::io::Cursor::new(vec![7; size]))
+                .await
+                .unwrap();
+            sinks.push(sink);
+            uris.push(file.uri);
+        }
+        assert!(matches!(
+            store.destination(&caller, None).await,
+            Err(TransferError::Capacity)
+        ));
+        let first = uris.first().unwrap();
+
+        let interrupted = store.authorize_download(&caller, first).unwrap();
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&interrupted.download, Body::empty()))
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let partial = body.next().await.unwrap().unwrap().len();
+        assert!(partial > 0 && partial < size);
+        drop(body);
+        assert!(
+            matches!(
+                store.destination(&caller, None).await,
+                Err(TransferError::Capacity)
+            ),
+            "a fetch that ended early keeps its slot"
+        );
+
+        let retried = store
+            .authorize_download(&caller, first)
+            .expect("an interrupted fetch can obtain a new ticket for the same immutable file");
+        let response = routes(Arc::clone(&store))
+            .oneshot(request(&retried.download, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), size + 1)
+                .await
+                .unwrap()
+                .len(),
+            size
+        );
+        assert!(store.authorize_download(&caller, first).is_err());
+        assert!(store.input(&caller, first).await.is_err());
+        assert!(
+            store.destination(&caller, None).await.is_ok(),
+            "a complete fetch frees its slot for the next transfer"
+        );
+        drop(sinks);
     }
 
     #[tokio::test]
