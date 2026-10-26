@@ -1068,7 +1068,9 @@ impl<C: Clock> Ledger<C> {
                 state: format!("{:?}", outcome.state()),
                 stdout: record_output(outcome.stdout()),
                 stderr: record_output(outcome.stderr()),
-                file: outcome.file().cloned(),
+                // An upload's source is kept here even though callers are not
+                // offered it: this is the only record of which input was placed.
+                file: outcome.moved_file().cloned(),
                 info: outcome.info().cloned(),
             },
         )?;

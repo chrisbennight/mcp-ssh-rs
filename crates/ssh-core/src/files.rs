@@ -1447,7 +1447,8 @@ mod tests {
     /// An upload source is released only by a write that reached the target,
     /// and by the transfer itself: a caller that stopped waiting does not keep
     /// it held. A failed write keeps the source for an investigated retry.
-    /// A released source is not reported back as a file the run produced.
+    /// A released source is not offered back to the caller as a file the run
+    /// produced, but the record still names it as the input that was placed.
     ///
     /// The release also follows the reported outcome. A release still running
     /// when the deadline passes must not leave a success reported as a
@@ -1500,7 +1501,7 @@ mod tests {
             // The test supplies the bytes, so the transfer cannot finish first.
             let (mut sender, reader) = tokio::io::duplex(64);
             let input = PreparedUpload::from_reader(
-                crate::transfer::identity(String::new(), bytes),
+                crate::transfer::identity("mcp-file://test/source".to_owned(), bytes),
                 Box::new(reader),
             )
             .released_on_success({
@@ -1512,9 +1513,9 @@ mod tests {
                     released.fetch_add(1, Ordering::SeqCst);
                 }
             });
+            let source = input.identity().clone();
             let action =
-                crate::action::Action::upload(path(remote), input.identity().clone(), false)
-                    .unwrap();
+                crate::action::Action::upload(path(remote), source.clone(), false).unwrap();
             let decision = Engine::new(ReviewMode::Disabled).decide_action(&session, action);
             let receipt = ledger
                 .record_intent(
@@ -1535,7 +1536,7 @@ mod tests {
                 sender.write_all(bytes).await.unwrap();
             }
             drop(sender);
-            let outcome = runs
+            let mut outcome = runs
                 .wait(outcome.run(), Duration::from_secs(10))
                 .await
                 .unwrap();
@@ -1544,6 +1545,13 @@ mod tests {
                 // The released source must not come back as the run's file:
                 // a caller offered it would be refused when fetching it.
                 assert!(outcome.file().is_none());
+                // The record still names the input that was placed.
+                let accounted = ledger.record_outcome(outcome).unwrap();
+                let crate::audit::Event::Completed { file, .. } = &accounted.entry.event else {
+                    panic!("recording an outcome appends its completion");
+                };
+                assert_eq!(file.as_ref(), Some(&source));
+                outcome = accounted.outcome;
             } else {
                 assert!(matches!(
                     outcome.state(),

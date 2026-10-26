@@ -247,12 +247,22 @@ pub struct Outcome {
     stdout: Stream,
     stderr: Stream,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<crate::action::FileIdentity>,
+    file: Option<Transferred>,
     info: Option<crate::files::FileInfo>,
     #[serde(skip)]
     stdout_bytes: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
     stderr_bytes: Option<Arc<Vec<u8>>>,
+}
+
+/// A file a transfer moved, and which way it went.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Transferred {
+    /// Produced for the caller to fetch.
+    Output(crate::action::FileIdentity),
+    /// An upload's input, released once the upload succeeds.
+    Source(crate::action::FileIdentity),
 }
 
 impl Outcome {
@@ -272,9 +282,20 @@ impl Outcome {
     }
 
     /// A file this run produced for its caller to fetch. Never an upload's
-    /// source, which the run consumed rather than produced.
+    /// source: the run consumed it, and success has already released it.
     pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
-        self.file.as_ref()
+        match &self.file {
+            Some(Transferred::Output(file)) => Some(file),
+            Some(Transferred::Source(_)) | None => None,
+        }
+    }
+
+    /// The file this run moved in either direction, as the record keeps it.
+    pub const fn moved_file(&self) -> Option<&crate::action::FileIdentity> {
+        match &self.file {
+            Some(Transferred::Output(file) | Transferred::Source(file)) => Some(file),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -433,7 +454,7 @@ struct Live {
 }
 
 struct Record {
-    file: Option<crate::action::FileIdentity>,
+    file: Option<Transferred>,
     info: Option<crate::files::FileInfo>,
     stdout: Collected,
     stderr: Collected,
@@ -712,20 +733,13 @@ impl Runs {
                     }
                 })
                 .map(|moved| match moved {
-                    Moved::Downloaded(file) => {
-                        metrics.transfer_completed(false, file.bytes);
-                        (Some(file), None)
-                    }
-                    // The source was this run's input, and success has just
-                    // released it. Reported as the run's file, it would offer
-                    // callers a reference that can no longer be fetched. The
-                    // decision this run carried out already records it.
-                    Moved::Uploaded(input) => {
-                        metrics.transfer_completed(true, input.succeeded().bytes);
-                        (None, None)
-                    }
+                    Moved::Downloaded(file) => (Some(Transferred::Output(file)), None),
+                    Moved::Uploaded(input) => (Some(Transferred::Source(input.succeeded())), None),
                     Moved::Inspected(info) => (None, Some(info)),
                 });
+            if let Ok((Some(Transferred::Output(file) | Transferred::Source(file)), _)) = &result {
+                metrics.transfer_completed(is_upload, file.bytes);
+            }
             {
                 let mut record = live
                     .record
