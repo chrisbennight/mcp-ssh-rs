@@ -1447,6 +1447,7 @@ mod tests {
     /// An upload source is released only by a write that reached the target,
     /// and by the transfer itself: a caller that stopped waiting does not keep
     /// it held. A failed write keeps the source for an investigated retry.
+    /// A released source is not reported back as a file the run produced.
     ///
     /// The release also follows the reported outcome. A release still running
     /// when the deadline passes must not leave a success reported as a
@@ -1540,6 +1541,9 @@ mod tests {
                 .unwrap();
             if succeeds {
                 assert_eq!(outcome.state(), RunState::Exited { code: 0 });
+                // The released source must not come back as the run's file:
+                // a caller offered it would be refused when fetching it.
+                assert!(outcome.file().is_none());
             } else {
                 assert!(matches!(
                     outcome.state(),

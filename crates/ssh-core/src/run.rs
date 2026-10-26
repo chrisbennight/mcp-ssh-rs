@@ -271,6 +271,8 @@ impl Outcome {
         self.info.as_ref()
     }
 
+    /// A file this run produced for its caller to fetch. Never an upload's
+    /// source, which the run consumed rather than produced.
     pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
         self.file.as_ref()
     }
@@ -710,13 +712,20 @@ impl Runs {
                     }
                 })
                 .map(|moved| match moved {
-                    Moved::Downloaded(file) => (Some(file), None),
-                    Moved::Uploaded(input) => (Some(input.succeeded()), None),
+                    Moved::Downloaded(file) => {
+                        metrics.transfer_completed(false, file.bytes);
+                        (Some(file), None)
+                    }
+                    // The source was this run's input, and success has just
+                    // released it. Reported as the run's file, it would offer
+                    // callers a reference that can no longer be fetched. The
+                    // decision this run carried out already records it.
+                    Moved::Uploaded(input) => {
+                        metrics.transfer_completed(true, input.succeeded().bytes);
+                        (None, None)
+                    }
                     Moved::Inspected(info) => (None, Some(info)),
                 });
-            if let Ok((Some(file), _)) = &result {
-                metrics.transfer_completed(is_upload, file.bytes);
-            }
             {
                 let mut record = live
                     .record
