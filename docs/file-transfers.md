@@ -153,8 +153,9 @@ new input snapshots.
 
 Transfer storage is a buffer for moving bytes, not an archive. A reference from
 `files/authorizeUpload` is released as soon as an `ssh_upload` using it finishes
-writing to the target, so its slot is free for the next upload. A reference
-whose upload fails, times out, waits for approval, or is refused stays usable
+writing to the target, so its slot is free for the next upload. A successful
+upload's result does not return its source. A reference whose upload fails,
+times out, waits for approval, or is refused stays usable
 until its window ends, so an investigated retry does not need the bytes sent
 again. A released reference cannot be used again or downloaded; supply the file
 again to place it on another target. Download and retained-output references

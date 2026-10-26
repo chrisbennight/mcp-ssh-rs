@@ -247,12 +247,22 @@ pub struct Outcome {
     stdout: Stream,
     stderr: Stream,
     #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<crate::action::FileIdentity>,
+    file: Option<Transferred>,
     info: Option<crate::files::FileInfo>,
     #[serde(skip)]
     stdout_bytes: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
     stderr_bytes: Option<Arc<Vec<u8>>>,
+}
+
+/// A file a transfer moved, and which way it went.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Transferred {
+    /// Produced for the caller to fetch.
+    Output(crate::action::FileIdentity),
+    /// An upload's input, released once the upload succeeds.
+    Source(crate::action::FileIdentity),
 }
 
 impl Outcome {
@@ -271,8 +281,21 @@ impl Outcome {
         self.info.as_ref()
     }
 
+    /// A file this run produced for its caller to fetch. Never an upload's
+    /// source: the run consumed it, and success has already released it.
     pub const fn file(&self) -> Option<&crate::action::FileIdentity> {
-        self.file.as_ref()
+        match &self.file {
+            Some(Transferred::Output(file)) => Some(file),
+            Some(Transferred::Source(_)) | None => None,
+        }
+    }
+
+    /// The file this run moved in either direction, as the record keeps it.
+    pub const fn moved_file(&self) -> Option<&crate::action::FileIdentity> {
+        match &self.file {
+            Some(Transferred::Output(file) | Transferred::Source(file)) => Some(file),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -431,7 +454,7 @@ struct Live {
 }
 
 struct Record {
-    file: Option<crate::action::FileIdentity>,
+    file: Option<Transferred>,
     info: Option<crate::files::FileInfo>,
     stdout: Collected,
     stderr: Collected,
@@ -710,11 +733,11 @@ impl Runs {
                     }
                 })
                 .map(|moved| match moved {
-                    Moved::Downloaded(file) => (Some(file), None),
-                    Moved::Uploaded(input) => (Some(input.succeeded()), None),
+                    Moved::Downloaded(file) => (Some(Transferred::Output(file)), None),
+                    Moved::Uploaded(input) => (Some(Transferred::Source(input.succeeded())), None),
                     Moved::Inspected(info) => (None, Some(info)),
                 });
-            if let Ok((Some(file), _)) = &result {
+            if let Ok((Some(Transferred::Output(file) | Transferred::Source(file)), _)) = &result {
                 metrics.transfer_completed(is_upload, file.bytes);
             }
             {
