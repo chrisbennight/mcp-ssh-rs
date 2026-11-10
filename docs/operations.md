@@ -336,9 +336,13 @@ History in this tab is the bounded service view; use saved audit events for olde
 records. These history reads do not depend on the optional log service.
 
 Visible Review, Hosts and Sessions views refresh observations and support pause,
-resume and applying pending updates. Open details and focused controls hold
-changes for explicit application. A failed refresh retains the last observation
-with an unavailable message. Counts describe service work rather than host health.
+resume and applying pending updates. Review requests receive new arrivals while
+expanded; confirmation-message focus does not stop the queue. Chosen session
+approval durations and collapsed requests survive updates. Focused controls and
+other open inspection details hold changes for explicit application. Returning
+to a restored page or visible tab refreshes its observation. Failed or timed-out
+reads retain the last observation with an unavailable message and allow another
+refresh. Counts describe service work rather than host health.
 
 ## Operational metrics
 

@@ -1371,6 +1371,17 @@ pub(crate) async fn home() -> Redirect {
     Redirect::to(&format!("{DASHBOARD_PATH}/approvals"))
 }
 
+fn script_version() -> &'static str {
+    use sha2::{Digest as _, Sha256};
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let mut digest = Sha256::new();
+        digest.update(include_bytes!("../static/activity.js"));
+        digest.update(include_bytes!("../static/investigations.js"));
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
+    });
+    VERSION.as_str()
+}
+
 /// Embedded files share the dashboard's operator authentication boundary.
 async fn brand_asset(Path(name): Path<String>) -> Response {
     let (mime, bytes): (&str, &[u8]) = match name.as_str() {
@@ -1402,7 +1413,14 @@ async fn brand_asset(Path(name): Path<String>) -> Response {
     (
         [
             (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, "private, max-age=3600"),
+            (
+                header::CACHE_CONTROL,
+                if name.ends_with(".js") {
+                    "no-store"
+                } else {
+                    "private, max-age=3600"
+                },
+            ),
         ],
         bytes,
     )
@@ -2347,6 +2365,8 @@ mod tests {
         for (name, mime) in [
             ("brand.svg", "image/svg+xml"),
             ("icons.svg", "image/svg+xml"),
+            ("activity.js", "text/javascript; charset=utf-8"),
+            ("investigations.js", "text/javascript; charset=utf-8"),
             ("Manrope.ttf", "font/ttf"),
             ("IBMPlexMono-Regular.ttf", "font/ttf"),
             ("OFL-Manrope.txt", "text/plain; charset=utf-8"),
@@ -2363,6 +2383,14 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CONTENT_TYPE], mime);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                if name.ends_with(".js") {
+                    "no-store"
+                } else {
+                    "private, max-age=3600"
+                }
+            );
             let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                 .await
                 .unwrap();
