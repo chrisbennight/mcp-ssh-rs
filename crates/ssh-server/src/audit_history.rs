@@ -492,9 +492,10 @@ impl Loki {
         }
         if !exact_page && let Some(sequence) = record_sequence(&query.filters.text) {
             expression.push_str(" |~ ");
-            expression.push_str(&logql_string(&json_number_relation(
-                "sequence",
-                &[sequence],
+            expression.push_str(&logql_string(&format!(
+                "({}|\"event\":\"decided\".*{})",
+                json_number_relation("sequence", &[sequence]),
+                query.filters.text
             )));
         }
         if !exact_page
@@ -1344,22 +1345,32 @@ fn operation_identifier_logql(value: &str) -> Option<String> {
         return Some(format!(
             " |~ {}",
             logql_string(&format!(
-                "({session}.*{decision}|{decision}.*{session}|{answer}.*{request}|{request}.*{answer})"
+                "({session}.*{decision}|{decision}.*{session}|{answer}.*{request}|{request}.*{answer}|{decision}.*{value})"
             ))
         ));
     }
     if RunId::parse(value).is_ok() {
+        let completion = format!(
+            "{}.*{}",
+            json_fragment("event", "completed"),
+            json_fragment("run", value)
+        );
+        let request = format!("{}.*{value}", json_fragment("event", "decided"));
         return Some(format!(
-            " |= {} |= {}",
-            logql_string(&json_fragment("event", "completed")),
-            logql_string(&json_fragment("run", value))
+            " |~ {}",
+            logql_string(&format!("({completion}|{request})"))
         ));
     }
+
     None
 }
 
 fn record_sequence(value: &str) -> Option<u64> {
-    value.strip_prefix('#')?.parse().ok()
+    let digits = value.strip_prefix('#')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 pub(crate) fn is_operation_identifier(value: &str) -> bool {
@@ -1822,10 +1833,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_saved_upload_hash_can_match_the_request_before_execution() {
-        let digest = "a".repeat(64);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let app=Router::new().route("/loki/api/v1/query_range",get({
+    async fn saved_identifiers_keep_literal_request_matches_before_execution() {
+        for digest in [
+            "a".repeat(64),
+            "a".repeat(32),
+            "abcdef0123456789-abcdef0123456789abcdef0123456789".to_owned(),
+            "#999".to_owned(),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app=Router::new().route("/loki/api/v1/query_range",get({
             let calls=Arc::clone(&calls);
             let digest=digest.clone();
             move |AxumQuery(params):AxumQuery<HashMap<String,String>>| {
@@ -1837,32 +1853,33 @@ mod tests {
                         let predicate:String=serde_json::from_str(expression.rsplit(" |~ ").next().unwrap()).unwrap();
                         assert!(predicate.contains("decided"),"the digest search must admit pending request records");
                         assert!(predicate.contains(&digest));
-                        vec![["100".to_owned(),event_line(10,serde_json::json!({"event":"decided","operation":"upload","program":"file.upload","argv":["file.upload","/srv/report","12",digest,"create","direct"],"agent_intent":"place the approved file","purpose":"diagnose","access_class":"privileged","verdict":"needs_approval","policies":["default"]}),'b')]]
+                        vec![["100".to_owned(),event_line(10,serde_json::json!({"event":"decided","operation":"upload","program":"file.upload","argv":["file.upload","/srv/report","12","a".repeat(64),"create","direct"],"agent_intent":format!("place the approved file {digest}"),"purpose":"diagnose","access_class":"privileged","verdict":"needs_approval","policies":["default"]}),'b')]]
                     } else {assert!(phase < 3);Vec::new()};
                     axum::Json(serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{"stream":{},"values":values}]}}))
                 }
             }
         }));
-        let reader = Loki::new(
-            server(app).await,
-            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
-        )
-        .unwrap();
-        let page = reader
-            .operations(&OperationQuery {
-                filters: Query {
-                    text: digest,
-                    start: Some(1),
-                    ..Default::default()
-                },
-                end: Some(200),
-                ..Default::default()
-            })
-            .await
+            let reader = Loki::new(
+                server(app).await,
+                Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+            )
             .unwrap();
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries.first().map(|entry| entry.sequence), Some(10));
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+            let page = reader
+                .operations(&OperationQuery {
+                    filters: Query {
+                        text: digest,
+                        start: Some(1),
+                        ..Default::default()
+                    },
+                    end: Some(200),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(page.entries.len(), 1);
+            assert_eq!(page.entries.first().map(|entry| entry.sequence), Some(10));
+            assert_eq!(calls.load(Ordering::Relaxed), 3);
+        }
     }
 
     #[tokio::test]
