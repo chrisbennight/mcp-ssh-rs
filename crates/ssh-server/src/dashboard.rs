@@ -2287,6 +2287,10 @@ where
 /// it. Reporting that as "no longer waiting" would hide the one failure an
 /// operator must hear about under a fail-closed audit boundary.
 fn decision_failure(id: &ssh_core::approval::RequestId, why: &MediationError) -> Response {
+    if let MediationError::SessionApprovalNotActivated(error) = why {
+        tracing::error!(%error, request=id.as_str(), "one-time approval recorded but session approval not activated");
+        return (StatusCode::INTERNAL_SERVER_ERROR, message_html("This request was approved and its answer was recorded. The session approval was not activated. Any previous session approval was not changed by this attempt. Inspect the request and current session activity before trying another action.")).into_response();
+    }
     if let MediationError::Audit(why) = why {
         tracing::error!(%why, request = id.as_str(), "a decision was applied but not recorded");
         return (
