@@ -3,6 +3,7 @@ use super::*;
 use ssh_core::audit::{Entry, EvaluationVerdict, Event};
 use std::collections::HashMap;
 
+#[cfg_attr(test, derive(Default))]
 struct Observation {
     execution: state::Execution,
     approval: state::Approval,
@@ -337,7 +338,15 @@ impl Current {
                 && (scope.host.is_empty() || scope.host == entry.host.as_str())
                 && (scope.principal.is_empty() || scope.principal == entry.principal.as_str())
                 && (scope.role.is_empty() || scope.role == entry.role.as_str())
-                && scope.kind.is_empty()
+                && match &entry.event {
+                    Event::Completed { info, file, .. } => {
+                        let kind = files::retained_operation(info.as_ref(), file.is_some());
+                        scope.kind.is_empty()
+                            || scope.kind == kind
+                            || (scope.kind == "files" && kind != "unknown")
+                    }
+                    _ => scope.kind.is_empty(),
+                }
         } else {
             scope.matches(entry)
         };
@@ -428,5 +437,99 @@ impl Current {
             }
         }
         row.classify();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ssh_core::audit::{Ledger, Recorded};
+    use ssh_core::clock::TestClock;
+    use ssh_core::session::{Lifetime, Purpose, SessionStore};
+
+    #[test]
+    fn typed_retained_results_survive_operation_filters_without_request_evidence() {
+        let session = SessionStore::new(
+            TestClock::at(1000),
+            Lifetime {
+                idle: 1000,
+                max: 1000,
+                grace: 0,
+            },
+            8,
+        )
+        .open(
+            ssh_core::PrincipalId::parse("agent").unwrap(),
+            ssh_core::HostId::parse("server").unwrap(),
+            ssh_core::RoleId::parse("ops").unwrap(),
+            Purpose::parse("inspect metadata").unwrap(),
+            AccessClass::ReadOnly,
+        )
+        .unwrap();
+        let ledger = Ledger::new(TestClock::at(1000));
+        let original = ledger.record_session_opened(&session).unwrap();
+        let kept = Recorded::Kept {
+            text: String::new(),
+            truncated: false,
+            bytes: 0,
+        };
+        for (kind, info) in [
+            (
+                "stat",
+                serde_json::json!({"operation":"stat","metadata":{"kind":"file","bytes":12,"permissions":384,"modified":0}}),
+            ),
+            (
+                "list",
+                serde_json::json!({"operation":"list","entries":[],"truncated":false}),
+            ),
+            (
+                "checksum",
+                serde_json::json!({"operation":"checksum","bytes":12,"sha256":"a".repeat(64)}),
+            ),
+        ] {
+            let mut entry = original.clone();
+            entry.event = Event::Completed {
+                run: RunId::parse("abcdef0123456789-abcdef0123456789abcdef0123456789").unwrap(),
+                decided: 999,
+                state: "Exited { code: 0 }".into(),
+                outcome: RunState::Exited { code: 0 },
+                stdout: kept.clone(),
+                stderr: kept.clone(),
+                file: None,
+                info: Some(serde_json::from_value(info).unwrap()),
+            };
+            let current = Current {
+                observations: HashMap::from([(
+                    entry.sequence,
+                    Observation {
+                        missing_request: true,
+                        execution: state::Execution::Observed(RunState::Exited { code: 0 }),
+                        completed_at: Some(1000),
+                        ..Default::default()
+                    },
+                )]),
+                now: 1000,
+                matches: 0,
+                instance: ledger.instance_id().to_owned(),
+            };
+            for filter in [kind, "files"] {
+                assert!(current.includes(
+                    &ActivityQuery {
+                        kind: filter.to_owned(),
+                        view: "evidence".into(),
+                        ..Default::default()
+                    },
+                    &entry
+                ));
+            }
+            assert!(!current.includes(
+                &ActivityQuery {
+                    kind: "execute".into(),
+                    ..Default::default()
+                },
+                &entry
+            ));
+        }
     }
 }

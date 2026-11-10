@@ -49,6 +49,16 @@ fn metadata_fields(fields: &mut Vec<(String, String)>, value: &Metadata) {
     ));
 }
 
+pub(super) fn retained_operation(info: Option<&FileInfo>, artifact: bool) -> &'static str {
+    match info {
+        Some(FileInfo::Stat { .. }) => "stat",
+        Some(FileInfo::List { .. }) => "list",
+        Some(FileInfo::Checksum { .. }) => "checksum",
+        None if artifact => "files",
+        None => "unknown",
+    }
+}
+
 pub(super) fn describe(
     kind: &str,
     arguments: &[String],
@@ -69,7 +79,7 @@ pub(super) fn describe(
         "stat" => "file.stat",
         "list" => "file.list",
         "checksum" => "file.checksum",
-        "unknown" => "",
+        "unknown" | "files" => "",
         _ => return None,
     };
     let mut shown = FileShown {

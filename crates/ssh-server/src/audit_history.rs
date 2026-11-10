@@ -1331,7 +1331,9 @@ fn operation_identifier_logql(value: &str) -> Option<String> {
         );
         return Some(format!(
             " |~ {}",
-            logql_string(&format!("({digest}|{checksum})"))
+            logql_string(&format!(
+                "({digest}|{checksum}|\"event\":\"decided\".*{value})"
+            ))
         ));
     }
     if lower_hex_id(value).is_ok() {
@@ -1817,6 +1819,50 @@ mod tests {
             vec![15, 14, 13, 12, 11, 10]
         );
         assert_eq!(page.window_end, 200);
+    }
+
+    #[tokio::test]
+    async fn a_saved_upload_hash_can_match_the_request_before_execution() {
+        let digest = "a".repeat(64);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app=Router::new().route("/loki/api/v1/query_range",get({
+            let calls=Arc::clone(&calls);
+            let digest=digest.clone();
+            move |AxumQuery(params):AxumQuery<HashMap<String,String>>| {
+                let calls=Arc::clone(&calls);let digest=digest.clone();
+                async move {
+                    let phase=calls.fetch_add(1,Ordering::Relaxed);
+                    let values=if phase == 0 {
+                        let expression=params.get("query").unwrap();
+                        let predicate:String=serde_json::from_str(expression.rsplit(" |~ ").next().unwrap()).unwrap();
+                        assert!(predicate.contains("decided"),"the digest search must admit pending request records");
+                        assert!(predicate.contains(&digest));
+                        vec![["100".to_owned(),event_line(10,serde_json::json!({"event":"decided","operation":"upload","program":"file.upload","argv":["file.upload","/srv/report","12",digest,"create","direct"],"agent_intent":"place the approved file","purpose":"diagnose","access_class":"privileged","verdict":"needs_approval","policies":["default"]}),'b')]]
+                    } else {assert!(phase < 3);Vec::new()};
+                    axum::Json(serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{"stream":{},"values":values}]}}))
+                }
+            }
+        }));
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
+        let page = reader
+            .operations(&OperationQuery {
+                filters: Query {
+                    text: digest,
+                    start: Some(1),
+                    ..Default::default()
+                },
+                end: Some(200),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries.first().map(|entry| entry.sequence), Some(10));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

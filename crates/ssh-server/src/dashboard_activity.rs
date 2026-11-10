@@ -879,12 +879,14 @@ fn shown(
         if original.is_some() || operations.iter().any(|row| row.id == entry.digest) {
             continue;
         }
-        let kind = entry
-            .event
-            .get("info")
-            .and_then(|info| wire_string(info, "operation"))
-            .unwrap_or("unknown")
-            .to_owned();
+        let file_info = entry.event.get("info").and_then(|value| {
+            serde_json::from_value::<ssh_core::files::FileInfo>(value.clone()).ok()
+        });
+        let kind = files::retained_operation(
+            file_info.as_ref(),
+            entry.event.get("file").is_some_and(|file| !file.is_null()),
+        )
+        .to_owned();
         let approval_state =
             if authority.is_some_and(|authority| wire_event_name(&authority.event) == "approved") {
                 if authority.is_some_and(|authority| {
@@ -942,10 +944,7 @@ fn shown(
                 .to_owned(),
             kind: kind.clone(),
             file: files::describe(&kind, &[], Some(&entry.event)),
-            file_info: entry
-                .event
-                .get("info")
-                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            file_info,
             file_identity: entry.event.get("file").and_then(|file| {
                 Some(ArtifactMetadata {
                     bytes: file.get("bytes")?.as_u64()?,
