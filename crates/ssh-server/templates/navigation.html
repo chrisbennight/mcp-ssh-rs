@@ -1,0 +1,7 @@
+{% macro sidebar(current) %}
+<nav aria-label="Dashboard">
+{% for item in [("review", "Review", "/dashboard/approvals", "review"), ("sessions", "Sessions", "/dashboard/sessions", "sessions"), ("hosts", "Hosts", "/dashboard/inventory", "hosts"), ("activity", "Activity", "/dashboard/activity", "history")] %}
+<a class="nav-item{% if current == item.0 %} active{% endif %}" href="{{ item.2 }}"{% if current == item.0 %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#{{ item.3 }}"/></svg>{{ item.1 }}</a>
+{% endfor %}
+</nav>
+{% endmacro %}

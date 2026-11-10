@@ -975,6 +975,23 @@ impl<C: Clock> Approvals<C> {
             .collect()
     }
 
+    /// Recorded positive answers that have not been collected. The boolean
+    /// reports whether their collection window is still open.
+    #[must_use]
+    pub fn uncollected(&self, redeemable: impl Fn(&SessionId) -> bool) -> Vec<(Asked, bool)> {
+        let now = self.clock.now();
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|held| {
+                matches!(held.state, State::Approved { recorded: true, .. })
+                    && redeemable(&held.asked.session)
+            })
+            .map(|held| (held.asked.clone(), now < held.redeem_by))
+            .collect()
+    }
+
     /// Drops requests nobody can act on any more.
     ///
     /// What stops one being worth keeping depends on what became of it: an

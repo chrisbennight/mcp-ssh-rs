@@ -1,0 +1,114 @@
+{% import "navigation.html" as navigation %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Activity · mcp-ssh-rs</title>
+{% include "styles.html" %}
+<script src="/dashboard/assets/activity.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<div class="shell">
+<aside class="sidebar">
+{% include "brand.html" %}
+{% call navigation::sidebar("activity") %}{% endcall %}
+</aside>
+<main id="main-content" tabindex="-1">
+<header class="topbar"><h1>Activity</h1><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header>
+<div class="content">
+{% match current %}{% when Some with (session) %}
+<section class="context-strip" aria-label="Session context">
+<div><h2>{{ session.host }} / {{ session.role }}</h2><p>{{ session.principal }} · {{ session.status }} · {{ session.running }} running · {{ session.waiting }} awaiting decision</p></div>
+<details><summary>Session context and controls</summary>
+<p><strong>Agent-supplied purpose:</strong> {{ session.purpose }}</p>
+<p>Opened {{ session.opened_at }} · session last used {{ session.last_used }} · expires in {{ session.ends_by }}</p>
+<p>Configured class: <span class="mono">{{ session.access_class }}</span> · {{ session.slots }} / {{ session.limit }} session slots used by this principal</p>
+{% for agreement in standing %}
+<p>Session approval by <strong>{{ agreement.who }}</strong> · {{ agreement.remaining }} remaining</p>
+<form method="post" action="/dashboard/approvals/standing/{{ agreement.id }}"><button class="refuse" name="decision" value="revoke">Revoke session approval</button></form>
+<p class="muted">Revoking approval affects future requests; it does not end the session or stop running work.</p>
+{% endfor %}
+<details class="end-session"><summary>End session…</summary>
+<p>Release this session's slot and disconnect its SSH connection. Commands may be interrupted; detached remote processes may continue.</p>
+<form method="post" action="/dashboard/sessions/{{ session.id }}/terminate"><button class="refuse" name="decision" value="terminate">Confirm end session</button></form>
+</details>
+</details>
+</section>
+{% when None %}{% if !query.session.is_empty() %}<p class="notice">This session is no longer held by this service. Retained or saved evidence may still be available.</p>{% endif %}{% endmatch %}
+<form class="activity-filters" method="get" action="/dashboard/activity">
+<input type="hidden" name="source" value="{{ source }}">
+{% if !query.session.is_empty() %}<input type="hidden" name="session" value="{{ query.session }}">{% endif %}
+<label class="search-field">Search operations<input type="search" name="q" value="{{ query.q }}" placeholder="Commands, intent, paths or IDs"></label>
+<label>Requested in<select name="window">
+<option value="1h"{% if query.window == "1h" %} selected{% endif %}>Last hour</option>
+<option value="24h"{% if query.window == "24h" %} selected{% endif %}>Last 24 hours</option>
+<option value="7d"{% if query.window == "7d" %} selected{% endif %}>Last 7 days</option>
+<option value="30d"{% if query.window == "30d" %} selected{% endif %}>Last 30 days</option>
+</select></label>
+<label>View<select name="view">
+<option value="">All operations</option>
+<option value="waiting"{% if query.view == "waiting" %} selected{% endif %}>Awaiting decision</option>
+<option value="running"{% if query.view == "running" %} selected{% endif %}>Running</option>
+<option value="attention"{% if query.view == "attention" %} selected{% endif %}>Needs attention</option>
+<option value="assessments"{% if query.view == "assessments" %} selected{% endif %}>With assessments</option>
+</select></label>
+<button type="submit">Search</button>
+<details class="additional-filters"><summary>More filters</summary><div class="filters">
+<label>Host<input name="host" value="{{ query.host }}"></label>
+<label>Principal<input name="principal" value="{{ query.principal }}"></label>
+<label>Operation type<select name="kind">
+<option value="">All types</option>
+<option value="execute"{% if query.kind == "execute" %} selected{% endif %}>Commands</option>
+<option value="files"{% if query.kind == "files" %} selected{% endif %}>All file operations</option>
+<option value="upload"{% if query.kind == "upload" %} selected{% endif %}>Uploads</option>
+<option value="download"{% if query.kind == "download" %} selected{% endif %}>Downloads</option>
+<option value="stat"{% if query.kind == "stat" %} selected{% endif %}>File metadata</option>
+<option value="list"{% if query.kind == "list" %} selected{% endif %}>Directory listings</option>
+<option value="checksum"{% if query.kind == "checksum" %} selected{% endif %}>Checksums</option>
+</select></label>
+</div><p class="muted">Search includes commands and recorded context, not output contents.</p></details>
+</form>
+<div class="scope-chips">
+{% if !query.session.is_empty() %}<span class="badge">Session: {{ query.session }}</span>{% endif %}
+{% if !query.host.is_empty() %}<span class="badge">Host: {{ query.host }}</span>{% endif %}
+{% if !query.principal.is_empty() %}<span class="badge">Principal: {{ query.principal }}</span>{% endif %}
+<a href="/dashboard/activity">Clear scope and filters</a>
+</div>
+<div class="activity-toolbar">
+<div class="activity-tabs"><a href="{{ current_url }}"{% if source == "current" %} aria-current="page"{% endif %}>Current service</a><a href="{{ history_url }}"{% if source == "history" %} aria-current="page"{% endif %}>Saved history</a><a href="/dashboard/audit">Audit events</a></div>
+{% if live %}<div class="live-controls"><span id="freshness" role="status">Observed on page load</span><button type="button" id="pause-updates" hidden>Pause updates</button><button type="button" id="apply-updates" hidden>Apply updates</button></div>{% endif %}
+</div>
+<p class="muted" id="activity-notice">{{ notice }}</p>
+<p class="muted">Up to {{ page_size }} requested operations per page. Views narrow this page; continue to older operations for more results.</p>
+<div id="activity-results" data-source="{{ source }}">
+{% if operations.is_empty() %}<div class="empty">No operations are shown on this page. Adjust the filters, inspect another source, or continue to older operations if available.</div>{% else %}
+<div class="operation-columns" aria-hidden="true"><span>Requested</span><span>Operation and target</span><span>Execution</span></div>
+{% for row in operations %}
+<details class="operation-row" id="operation-{{ row.id }}" data-operation="{{ row.id }}" data-state="{{ row.status }} {{ row.progress }} {{ row.cancellation }}"{% if row.open %} open{% endif %}>
+<summary><span class="operation-time">{{ row.when }}</span><span class="operation-label"><code>{{ row.preview }}</code><span class="muted">{{ row.host }} / {{ row.role }} · {{ row.principal }}</span></span><span class="operation-state"><strong>{{ row.status }}</strong><span class="muted">{{ row.approval }}</span></span></summary>
+<div class="command-detail">
+<p><strong>Agent-supplied intent:</strong> {{ row.intent }}</p>
+{% if !row.progress.is_empty() %}<p>{{ row.progress }}</p>{% endif %}
+{% if !row.cancellation.is_empty() %}<p class="notice">{{ row.cancellation }}</p>{% endif %}
+{% if row.kind == "execute" %}<h2>Exact arguments</h2>{% else %}<h2>File operation</h2><dl>{% for field in row.result %}<dt>{{ field.0 }}</dt><dd class="mono preserve">{{ field.1 }}</dd>{% endfor %}</dl><details><summary>Exact operation representation</summary>{% endif %}
+<ol class="argv" start="0">{% for argument in row.arguments %}<li>{% if argument.is_empty() %}<em>(empty argument)</em>{% else %}{{ argument }}{% endif %}</li>{% endfor %}</ol>
+{% if row.kind != "execute" %}</details>{% endif %}
+{% for output in row.outputs %}
+{% if !output.preview.is_empty() %}<h3>{{ output.label }}</h3><pre class="output">{{ output.preview }}</pre>{% endif %}
+<p class="muted">{{ output.label }} · {{ output.note }}</p>
+{% if !output.url.is_empty() %}<a href="{{ output.url }}">Inspect retained {{ output.label }}</a>{% endif %}
+{% endfor %}
+{% match row.assessment %}{% when Some with (assessment) %}<details><summary>Advisory assessment · {{ assessment.verdict }}</summary><p>{{ assessment.evaluator }} · confidence {{ assessment.confidence }}%</p><p>{{ assessment.rationale }}</p>{% if !assessment.side_effects.is_empty() %}<p>Reported potential side effects</p><ul>{% for effect in assessment.side_effects %}<li>{{ effect }}</li>{% endfor %}</ul>{% endif %}</details>{% when None %}{% endmatch %}
+<details><summary>Approval and evidence</summary><dl>
+<dt>Evidence source</dt><dd>{{ row.evidence }}</dd><dt>Human answer</dt><dd>{{ row.human_answer }}</dd><dt>Execution authorization</dt><dd>{{ row.authorization }}</dd><dt>Observed result</dt><dd>{{ row.outcome }}</dd><dt>Session purpose</dt><dd>{{ row.purpose }}</dd><dt>Record identity</dt><dd class="digest">{{ row.id }}</dd>
+</dl></details>
+<a href="/dashboard/activity?session={{ row.session }}">View this session's activity</a>
+<a href="/dashboard/audit?session={{ row.session }}">View related audit events</a>
+</div>
+</details>
+{% endfor %}{% endif %}
+{% if !next_url.is_empty() %}<div class="pager"><a href="{{ next_url }}">Older operations →</a></div>{% endif %}
+</div>
+</div></main></div>
+</body></html>

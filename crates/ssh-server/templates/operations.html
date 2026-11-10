@@ -1,3 +1,4 @@
+{% import "navigation.html" as navigation %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -5,7 +6,7 @@
 <title>{{ title }} · mcp-ssh-rs</title>
 {% include "styles.html" %}
 </head>
-<body><a class="skip-link" href="#main-content">Skip to content</a><div class="shell"><aside class="sidebar">{% include "brand.html" %}<nav aria-label="Dashboard"><a class="nav-item" href="/dashboard/approvals"><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#review"/></svg>Review queue</a><a class="nav-item{% if inventory_active %} active{% endif %}" href="/dashboard/inventory"{% if inventory_active %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#hosts"/></svg>Inventory</a><a class="nav-item{% if sessions_active %} active{% endif %}{% if transcript_active %} active{% endif %}{% if output_active %} active{% endif %}" href="/dashboard/sessions"{% if sessions_active || transcript_active || output_active %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#sessions"/></svg>Sessions</a><a class="nav-item{% if audit_active %} active{% endif %}" href="/dashboard/audit"{% if audit_active %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#history"/></svg>Audit log</a><a class="nav-item{% if evaluations_active %} active{% endif %}" href="/dashboard/evaluations"{% if evaluations_active %} aria-current="page"{% endif %}><svg class="icon" aria-hidden="true"><use href="/dashboard/assets/icons.svg#review"/></svg>Evaluations</a></nav><div class="sidebar-foot">Review requests and manage sessions.</div></aside>
+<body><a class="skip-link" href="#main-content">Skip to content</a><div class="shell"><aside class="sidebar">{% include "brand.html" %}{% if inventory_active %}{% call navigation::sidebar("hosts") %}{% endcall %}{% elif sessions_active %}{% call navigation::sidebar("sessions") %}{% endcall %}{% else %}{% call navigation::sidebar("activity") %}{% endcall %}{% endif %}<div class="sidebar-foot">Review requests and manage sessions.</div></aside>
 <main id="main-content" tabindex="-1"><header class="topbar"><div><p class="eyebrow">Operations</p><h1>{{ title }}</h1></div><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header><div class="content">
 {% if !transcript_active %}<div class="notice">{{ source_notice }}</div>{% endif %}
 {% if inventory_active %}

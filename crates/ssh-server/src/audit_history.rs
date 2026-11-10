@@ -97,6 +97,13 @@ pub struct TranscriptQuery {
     pub session: SessionId,
 }
 
+#[derive(Clone, Debug)]
+pub struct OperationQuery {
+    pub filters: Query,
+    pub kind: String,
+    pub end: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputQuery {
     pub start: u64,
@@ -123,6 +130,26 @@ pub struct Entry {
 }
 
 pub trait ReadsAudit: Send + Sync {
+    fn operations<'a>(
+        &'a self,
+        query: &'a OperationQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptPage, ReadError>> + Send + 'a>> {
+        Box::pin(async move {
+            let session =
+                SessionId::parse(&query.filters.session).map_err(|_| ReadError::NotConfigured)?;
+            if !query.filters.text.is_empty() || !query.kind.is_empty() {
+                return Err(ReadError::NotConfigured);
+            }
+            self.transcript(&TranscriptQuery {
+                session,
+                before: query.filters.before,
+                start: query.filters.start,
+                end: query.end,
+            })
+            .await
+        })
+    }
+
     fn page<'a>(
         &'a self,
         query: &'a Query,
@@ -323,6 +350,83 @@ impl Loki {
         decisions.append(&mut related);
         let mut seen = HashSet::new();
         decisions.retain(|entry| seen.insert((entry.source_nanos, entry.digest.clone())));
+        decisions
+            .sort_unstable_by_key(|entry| std::cmp::Reverse((entry.source_nanos, entry.sequence)));
+        Ok(TranscriptPage {
+            entries: decisions,
+            next_before,
+            window_start: start,
+            window_end,
+        })
+    }
+
+    async fn read_operations(&self, query: &OperationQuery) -> Result<TranscriptPage, ReadError> {
+        let _permit =
+            tokio::time::timeout(QUERY_WITHIN, Arc::clone(&self.one_query).acquire_owned())
+                .await
+                .map_err(|_| ReadError::Unavailable)?
+                .map_err(|_| ReadError::Unavailable)?;
+        let (start, window_end) =
+            read_window(None, query.filters.start, query.end, query.filters.window)?;
+        let decision_end = query.filters.before.unwrap_or(window_end);
+        if decision_end < start || decision_end > window_end {
+            return Err(ReadError::InvalidWindow);
+        }
+        let mut filters = query.filters.clone();
+        filters.event = "decided".to_owned();
+        let mut expression = logql(&filters);
+        if !query.kind.is_empty() {
+            if query.kind == "files" {
+                expression.push_str(" |~ ");
+                expression.push_str(&logql_string(
+                    "\"operation\":\"(upload|download|stat|list|checksum)\"",
+                ));
+            } else {
+                expression.push_str(" |= ");
+                expression.push_str(&logql_string(&json_fragment("operation", &query.kind)));
+            }
+        }
+        let mut decisions = self
+            .fetch(expression, start, decision_end, FETCH_LIMIT)
+            .await?;
+        let next_before = collision_safe_page(&mut decisions)?;
+        if !decisions.is_empty() {
+            let maximum = decisions.len().saturating_mul(6);
+            let mut related = self
+                .fetch(
+                    operation_relations_logql(&decisions, false),
+                    start,
+                    window_end,
+                    maximum.saturating_add(1),
+                )
+                .await?;
+            if related.len() > maximum {
+                return Err(ReadError::MalformedResponse);
+            }
+            let approvals: Vec<_> = related
+                .iter()
+                .filter(|entry| event_name(entry) == Some("approved"))
+                .cloned()
+                .collect();
+            if !approvals.is_empty() {
+                let maximum = approvals.len().saturating_mul(2);
+                let mut completions = self
+                    .fetch(
+                        operation_relations_logql(&approvals, true),
+                        start,
+                        window_end,
+                        maximum.saturating_add(1),
+                    )
+                    .await?;
+                if completions.len() > maximum {
+                    return Err(ReadError::MalformedResponse);
+                }
+                related.append(&mut completions);
+            }
+            decisions.append(&mut related);
+        }
+        let mut seen = HashSet::new();
+        decisions.retain(|entry| seen.insert((entry.session.clone(), entry.digest.clone())));
         decisions
             .sort_unstable_by_key(|entry| std::cmp::Reverse((entry.source_nanos, entry.sequence)));
         Ok(TranscriptPage {
@@ -815,6 +919,17 @@ struct Artifact {
 }
 
 impl ReadsAudit for Loki {
+    fn operations<'a>(
+        &'a self,
+        query: &'a OperationQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptPage, ReadError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::timeout(QUERY_WITHIN, self.read_operations(query))
+                .await
+                .map_err(|_| ReadError::Unavailable)?
+        })
+    }
+
     fn page<'a>(
         &'a self,
         query: &'a Query,
@@ -941,6 +1056,28 @@ fn transcript_relation_logql(session: &SessionId, pattern: &str) -> String {
     expression.push_str(" |~ ");
     expression.push_str(&logql_string(pattern));
     expression
+}
+
+fn operation_relations_logql(entries: &[Entry], completions: bool) -> String {
+    // Session IDs and digests have already passed the reader's strict
+    // validation. Bind each sequence to its session across service lifetimes.
+    let patterns: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let relation = if completions {
+                json_number_relation("decided", &[entry.sequence])
+            } else {
+                format!(
+                    "({}|\\\"decision_digest\\\":\\\"{}\\\")",
+                    json_number_relation("decided", &[entry.sequence]),
+                    entry.digest
+                )
+            };
+            let session = json_fragment("session", &entry.session);
+            format!("({session}.*{relation}|{relation}.*{session})")
+        })
+        .collect();
+    format!("{} |~ {}", audit_logql(), logql_string(&patterns.join("|")))
 }
 
 fn joined_numbers(values: &[u64]) -> String {
@@ -1237,6 +1374,86 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![12, 11, 10]
         );
+    }
+
+    #[tokio::test]
+    async fn global_operation_search_hydrates_evidence_without_searching_the_result_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/loki/api/v1/query_range", get({
+            let calls = Arc::clone(&calls);
+            move |AxumQuery(params): AxumQuery<HashMap<String, String>>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let phase = calls.fetch_add(1, Ordering::Relaxed);
+                    let expression = params.get("query").unwrap();
+                    assert_eq!(params.get("start").map(String::as_str), Some("1"));
+                    let (at, sequence, event, digest) = match phase {
+                        0 => {
+                            assert!(expression.contains("needle"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("100"));
+                            (90, 10, serde_json::json!({
+                                "event":"decided", "operation":"execute", "agent_intent":"inspect",
+                                "argv":["printf","needle"], "program":"printf", "access_class":"read_only",
+                                "purpose":"diagnose", "verdict":"needs_approval", "policies":["default"]
+                            }), 'd')
+                        }
+                        1 => {
+                            assert!(!expression.contains("needle"));
+                            assert!(expression.contains("0123456789abcdef0123456789abcdef"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("200"));
+                            (150, 11, serde_json::json!({
+                                "event":"approved", "decided":10, "request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "approver":"operator", "override_of":null, "standing":false,
+                                "mode":"direct", "agreement":null
+                            }), 'b')
+                        }
+                        2 => {
+                            assert!(!expression.contains("needle"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("200"));
+                            (160, 12, serde_json::json!({
+                                "event":"completed", "run":"abcdef0123456789-abcdef0123456789abcdef0123456789",
+                                "decided":11, "state":"Exited { code: 0 }",
+                                "stdout":{"kind":"kept","text":"ok","truncated":false,"bytes":2},
+                                "stderr":{"kind":"kept","text":"","truncated":false,"bytes":0}
+                            }), 'c')
+                        }
+                        _ => panic!("unbounded operation query"),
+                    };
+                    axum::Json(serde_json::json!({
+                        "status":"success", "data":{"resultType":"streams", "result":[{
+                            "stream":{}, "values":[[at.to_string(), event_line(sequence, event, digest)]]
+                        }]}
+                    }))
+                }
+            }
+        }));
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
+        let page = reader
+            .operations(&OperationQuery {
+                filters: Query {
+                    text: "needle".to_owned(),
+                    before: Some(100),
+                    start: Some(1),
+                    ..Default::default()
+                },
+                kind: String::new(),
+                end: Some(200),
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![12, 11, 10]
+        );
+        assert_eq!(page.window_end, 200);
     }
 
     #[tokio::test]

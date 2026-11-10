@@ -850,6 +850,12 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         self.approvals
             .waiting(|session| self.sessions.holds(session))
     }
+
+    #[must_use]
+    pub fn uncollected_approvals(&self) -> Vec<(Asked, bool)> {
+        self.approvals
+            .uncollected(|session| self.sessions.holds(session))
+    }
     /// A bounded newest-first session view for the authenticated workspace.
     #[must_use]
     pub fn recent_session_snapshots(&self, limit: usize) -> Vec<SessionSnapshot> {
@@ -1098,6 +1104,14 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
             .into());
         }
         Ok(self.runs.progress(run)?)
+    }
+
+    /// Observes retained progress for the authenticated operator surface.
+    /// Unlike an agent operation, observation does not touch session idleness
+    /// or collect its result. The HTTP adapter authenticates the operator.
+    #[must_use]
+    pub fn observe_progress(&self, run: &RunId) -> Option<crate::run::Progress> {
+        self.runs.progress(run).ok()
     }
 
     /// Records an explicit owner cancellation request before notifying the worker.

@@ -249,12 +249,24 @@ In the dashboard, open **Sessions** and filter by host or principal. Each row
 shows current work and the principal's slot usage across all hosts. Open a row
 to inspect its command requests, outputs, approval, and expiry.
 
-**Recent activity** reads the records still held by this service, including
-commands executed after a session-wide approval. **Saved history** reads the
-configured log service. Both views page through command requests; an initial
-approval request and the client's later execution request can appear separately.
-Recent activity is limited by retention and restart. Missing saved history does
-not disable the current session's controls.
+**Activity** uses the same operation list globally and within a session.
+Expand a short preview to inspect exact arguments, file-operation fields,
+retained output, approval evidence, and advisory assessments. The session context
+contains approval and expiry information and the existing session controls.
+
+**Current service** reads retained process-local evidence and observes running
+work without collecting its result or extending session idleness. Visible
+current pages update automatically; pause updates to read, or apply pending
+changes after inspecting an expanded operation. **Saved history** reads the
+configured log service. **Audit events** retains the individual-record view.
+Sources and missing evidence are labeled explicitly.
+
+Search commands, recorded context and paths, or filter by host, principal and
+operation type. Output contents are not searched. An initial approval request and
+the client's collection decision may still appear separately. State views narrow
+the displayed page; follow Older operations to inspect earlier requests.
+Current activity remains limited by retention and restart. Missing saved history
+does not disable current session controls.
 
 To recover a slot, open **End session…**, check the target and owner, and confirm.
 The session is removed and its SSH connection is disconnected. Running commands

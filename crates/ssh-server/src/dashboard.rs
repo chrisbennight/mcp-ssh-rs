@@ -40,6 +40,9 @@ use ssh_core::{AccessClass, HostId, PrincipalId};
 use crate::audit_history::{self, ReadsAudit};
 use crate::ingress::SharedBearer;
 
+#[path = "dashboard_activity.rs"]
+mod activity;
+
 /// Where the dashboard is mounted.
 pub const DASHBOARD_PATH: &str = "/dashboard";
 
@@ -801,7 +804,6 @@ fn wire_argv(event: &serde_json::Value) -> Vec<String> {
 
 fn wire_journeys(
     entries: &[audit_history::Entry],
-    session: &SessionId,
     before: u64,
     start: u64,
     end: u64,
@@ -811,11 +813,13 @@ fn wire_journeys(
         .filter(|entry| wire_event_name(&entry.event) == "decided")
         .map(|decision| {
             let answer = entries.iter().find(|entry| {
-                wire_event_name(&entry.event) == "answered"
+                entry.session == decision.session
+                    && wire_event_name(&entry.event) == "answered"
                     && wire_u64(&entry.event, "decided") == Some(decision.sequence)
             });
             let approval = entries.iter().find(|entry| {
-                wire_event_name(&entry.event) == "approved"
+                entry.session == decision.session
+                    && wire_event_name(&entry.event) == "approved"
                     && wire_u64(&entry.event, "decided") == Some(decision.sequence)
             });
             let verdict = wire_string(&decision.event, "verdict").unwrap_or("unavailable");
@@ -827,12 +831,14 @@ fn wire_journeys(
                 authorizations.push(approval.sequence);
             }
             let completion = entries.iter().find(|entry| {
-                wire_event_name(&entry.event) == "completed"
+                entry.session == decision.session
+                    && wire_event_name(&entry.event) == "completed"
                     && wire_u64(&entry.event, "decided")
                         .is_some_and(|sequence| authorizations.contains(&sequence))
             });
             let evaluation = entries.iter().find_map(|entry| {
-                if wire_event_name(&entry.event) != "evaluated" {
+                if entry.session != decision.session || wire_event_name(&entry.event) != "evaluated"
+                {
                     return None;
                 }
                 let artifact = entry.event.get("artifact")?;
@@ -907,7 +913,7 @@ fn wire_journeys(
                             == Some("kept")
                         {
                             output.inspect_url = retained_output_url(
-                                session.as_str(),
+                                decision.session.as_str(),
                                 run,
                                 output.label,
                                 before,
@@ -1050,7 +1056,7 @@ fn audit_shown(entry: audit_history::Entry) -> AuditShown {
 }
 
 fn session_history_url(session: &str) -> String {
-    format!("/dashboard/sessions/{}", visible(session))
+    format!("/dashboard/activity?session={}", visible(session))
 }
 
 fn retained_output_url(
@@ -1104,14 +1110,6 @@ fn next_audit_url(filters: &Filters, before: Option<u64>, start: u64) -> String 
     encoded.append_pair("before", &before.to_string());
     encoded.append_pair("start", &start.to_string());
     format!("/dashboard/audit?{}", encoded.finish())
-}
-
-fn next_session_url(session: &str, before: Option<u64>, start: u64, end: u64) -> String {
-    before.map_or_else(String::new, |before| {
-        format!(
-            "/dashboard/sessions/{session}?source=history&before={before}&start={start}&end={end}"
-        )
-    })
 }
 
 fn next_evaluations_url(filters: &Filters, before: Option<u64>, start: u64) -> String {
@@ -1281,6 +1279,7 @@ where
 {
     Router::new()
         .route("/assets/{name}", get(brand_asset))
+        .route("/activity", get(activity::activity::<C, S>))
         .route("/approvals", get(queue::<C, S>))
         .route("/inventory", get(inventory::<C, S>))
         .route("/sessions", get(sessions::<C, S>))
@@ -1313,6 +1312,10 @@ async fn brand_asset(Path(name): Path<String>) -> Response {
     let (mime, bytes): (&str, &[u8]) = match name.as_str() {
         "brand.svg" => ("image/svg+xml", include_bytes!("../static/brand.svg")),
         "icons.svg" => ("image/svg+xml", include_bytes!("../static/icons.svg")),
+        "activity.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../static/activity.js"),
+        ),
         "Manrope.ttf" => ("font/ttf", include_bytes!("../static/fonts/Manrope.ttf")),
         "IBMPlexMono-Regular.ttf" => (
             "font/ttf",
@@ -1390,7 +1393,7 @@ where
         Ok(inventory) => inventory,
         Err(_) => return state_unavailable(),
     };
-    let mut page = OperationsPage::new(operator.0, "Host and role inventory");
+    let mut page = OperationsPage::new(operator.0, "Hosts");
     page.inventory_active = true;
     page.inventory = inventory;
     page.source_notice =
@@ -1561,171 +1564,38 @@ async fn session_transcript<C, S>(
 ) -> Response
 where
     C: Clock + 'static,
-    S: CredentialSource,
+    S: CredentialSource + 'static,
 {
-    let Ok(session) = SessionId::parse(&raw_session) else {
-        return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
+    let (Ok(before), Ok(start), Ok(end)) = (
+        cursor_value(query.before),
+        cursor_value(query.start),
+        cursor_value(query.end),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            message_html("Invalid activity window."),
+        )
+            .into_response();
     };
-    let viewed = session.clone();
-    let (current, standing, running, waiting) = match bastion
-        .blocking(move |bastion| {
-            let current = bastion
-                .session_snapshot(&viewed)
-                .map(|snapshot| session_shown(&bastion, snapshot));
-            let standing = bastion
-                .standing_approvals()
-                .into_iter()
-                .filter(|(agreement, _)| agreement.session == viewed)
-                .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
-                .collect();
-            (
-                current,
-                standing,
-                bastion.runs_in_flight_with_authorization(),
-                bastion.waiting_for_approval(),
-            )
-        })
-        .await
-    {
-        Ok(state) => state,
-        Err(_) => return state_unavailable(),
-    };
-    let mut page = OperationsPage::new(
-        operator.0,
-        current.as_ref().map_or_else(
-            || "Session history".to_owned(),
-            |session| format!("{} · {}", session.host, session.role),
-        ),
-    );
-    page.transcript_active = true;
-    page.transcript_session = session.as_str().to_owned();
-    page.current = current;
-    page.standing = standing;
-    if query.source == ActivitySource::Current
-        || (query.source == ActivitySource::Auto
-            && page.current.is_some()
-            && query.before.is_none()
-            && query.start.is_none()
-            && query.end.is_none())
-    {
-        let before = query.before.as_deref().map(str::parse::<u64>).transpose();
-        let Ok(before) = before else {
-            return (
-                StatusCode::BAD_REQUEST,
-                message_html("Invalid activity page."),
-            )
-                .into_response();
-        };
-        let viewed = session.clone();
-        let (entries, next) = match bastion
-            .blocking(move |bastion| {
-                bastion
-                    .ledger()
-                    .session_activity(&viewed, before, audit_history::PAGE_SIZE)
-            })
-            .await
-        {
-            Ok(entries) => entries,
-            Err(_) => return state_unavailable(),
-        };
-        let entries: Result<Vec<_>, _> = entries.iter().map(|entry| current_entry(entry)).collect();
-        let Ok(entries) = entries else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                message_html("Could not read this session's activity."),
-            )
-                .into_response();
-        };
-        page.journeys = wire_journeys(&entries, &session, 0, 0, 0);
-        let observed_at = bastion.now();
-        for journey in &mut page.journeys {
-            if running.iter().any(|(_, authorization)| {
-                authorization.session() == &session
-                    && (authorization.sequence() == journey.decision
-                        || entries.iter().any(|entry| {
-                            entry.sequence == authorization.sequence()
-                                && wire_u64(&entry.event, "decided") == Some(journey.decision)
-                        }))
-            }) {
-                journey.status = "Running".to_owned();
-            } else if waiting
-                .iter()
-                .any(|request| request.session == session && request.decided == journey.decision)
-            {
-                journey.status = "Awaiting approval".to_owned();
+    activity::activity(
+        State(bastion),
+        axum::Extension(operator),
+        axum::Extension(audit_reader),
+        Query(activity::ActivityQuery {
+            session: raw_session,
+            before,
+            start,
+            end,
+            source: match query.source {
+                ActivitySource::Auto => "",
+                ActivitySource::Current => "current",
+                ActivitySource::History => "history",
             }
-            if let Some(entry) = entries
-                .iter()
-                .find(|entry| entry.sequence == journey.decision)
-            {
-                journey.when =
-                    format!("{} ago", elapsed_time(observed_at.saturating_sub(entry.at)));
-            }
-            for output in &mut journey.outputs {
-                if !output.inspect_url.is_empty() {
-                    output.inspect_url = output
-                        .inspect_url
-                        .split('?')
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned()
-                        + "?source=current";
-                }
-            }
-        }
-        page.current_activity = true;
-        page.source_notice = "Recent activity held by this service. Earlier activity may have expired; use Saved history to search the log service.".to_owned();
-        page.verification = "Current service".to_owned();
-        page.next_url = next.map_or_else(String::new, |before| {
-            format!(
-                "/dashboard/sessions/{}?source=current&before={before}",
-                session.as_str()
-            )
-        });
-        return render_operations(page);
-    }
-    let Ok(bounds) = transcript_bounds(query.before, query.start, query.end) else {
-        return (StatusCode::BAD_REQUEST, message_html("The filters or time range are invalid. Open a current view and choose supported values.")).into_response();
-    };
-    let read = audit_reader
-        .transcript(&audit_history::TranscriptQuery {
-            before: bounds.before,
-            start: bounds.start,
-            end: bounds.end,
-            session: session.clone(),
-        })
-        .await;
-    match read {
-        Ok(history) => {
-            let page_before = bounds.before.unwrap_or(history.window_end);
-            page.journeys = wire_journeys(
-                &history.entries,
-                &session,
-                page_before,
-                history.window_start,
-                history.window_end,
-            );
-            page.audit = history.entries.into_iter().map(audit_shown).collect();
-            page.next_url = next_session_url(
-                session.as_str(),
-                history.next_before,
-                history.window_start,
-                history.window_end,
-            );
-            page.source_notice =
-                "Saved command history, newest first. Refresh to include newly collected logs."
-                    .to_owned();
-            page.verification = "Saved history".to_owned();
-        }
-        Err(why) => {
-            tracing::warn!(%why, session = %session.as_str(), "the durable session transcript is unavailable");
-            page.source_available = false;
-            page.verification_ok = false;
-            page.verification = "History unavailable".to_owned();
-            page.source_notice = "The log service is not configured or could not be reached. Current session controls are still available.".to_owned();
-        }
-    }
-    render_operations(page)
+            .to_owned(),
+            ..Default::default()
+        }),
+    )
+    .await
 }
 
 fn current_entry(
@@ -1841,7 +1711,7 @@ where
             page.source_available = false;
             page.verification_ok = false;
             page.verification = "History unavailable".to_owned();
-            page.source_notice = "The log service could not provide this output. Try Recent activity for a copy still held by this service.".to_owned();
+            page.source_notice = "The log service could not provide this output. Try Current service for a copy still held by this service.".to_owned();
         }
     }
     render_operations(page)
@@ -3157,7 +3027,7 @@ mod tests {
         assert!(body.contains(r#"value="read_only" selected"#));
         assert!(body.contains(r#"value="permit" selected"#));
         assert!(
-            body.contains("/dashboard/sessions/session-1"),
+            body.contains("/dashboard/activity?session=session-1"),
             "session link missing: {body}"
         );
         assert!(
@@ -3497,8 +3367,8 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         for expected in [
-            "id=\"command-10\"",
-            "id=\"command-20\"",
+            "data-operation=",
+            "Exact arguments",
             "Policy decision entry #20",
             "automatic",
             "chris accepted via session standing agreement",
@@ -3507,14 +3377,54 @@ mod tests {
             "The read-only command supports the stated diagnosis.",
             "May reveal service metadata",
             "active",
-            "Older commands",
-            "Open full stdout",
-            "Succeeded",
+            "Older operations",
+            "Inspect retained stdout",
+            "Completed · exit 0",
         ] {
             assert!(
                 body.contains(expected),
                 "transcript omitted {expected}: {body}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn global_activity_uses_operation_details_and_rejects_invalid_filters() {
+        let response = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
+            .layer(axum::Extension(Operator("chris".to_owned())))
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/activity?source=history&session=0123456789abcdef0123456789abcdef")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("operation-row"));
+        assert!(body.contains("systemctl"));
+        assert!(body.contains("Completed · exit 0"));
+        assert!(body.contains("Approval entry #12"));
+        assert!(body.contains("View related audit events"));
+        for uri in [
+            "/activity?source=unrecognized",
+            "/activity?kind=delete",
+            "/activity?session=not-a-session",
+        ] {
+            let response = routes(operations_bastion())
+                .layer(axum::Extension(Operator("chris".to_owned())))
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 
@@ -3603,7 +3513,7 @@ mod tests {
             ("/sessions", "No sessions match."),
             (
                 "/sessions/0123456789abcdef0123456789abcdef",
-                "Command history could not be loaded.",
+                "Saved history unavailable.",
             ),
             ("/audit", "Historical audit data is currently unavailable."),
             (
@@ -3630,6 +3540,11 @@ mod tests {
             if path == "/sessions" {
                 assert!(body.contains("Sessions held by this service"));
                 assert!(body.contains("100"), "sessions omitted its result bound");
+            } else if path.starts_with("/sessions/") {
+                assert!(body.contains("data-source=\"history\""));
+                assert!(
+                    body.contains("Current service activity and session controls remain available")
+                );
             } else {
                 assert!(body.contains("The log service is not configured or could not be reached"));
                 assert!(body.contains("20"), "{path} omitted its durable page bound");
