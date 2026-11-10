@@ -258,7 +258,6 @@ pub struct Pending {
     pub age: String,
     pub deadline: String,
     pub session_remaining: String,
-    pub selected: bool,
     pub file: Option<files::FileShown>,
 }
 
@@ -280,7 +279,6 @@ impl From<Asked> for Pending {
             age: String::new(),
             deadline: String::new(),
             session_remaining: String::new(),
-            selected: false,
         }
     }
 }
@@ -2469,7 +2467,10 @@ mod tests {
         let long_argument = "a".repeat(1024);
         std::fs::write(
             directory.join("long-command.html"),
-            page(vec![asked(&["printf", &long_argument])]),
+            page(vec![
+                asked(&["printf", &long_argument]),
+                asked(&["journalctl", "--rotate"]),
+            ]),
         )
         .unwrap();
         std::fs::write(
@@ -2712,12 +2713,40 @@ mod tests {
         let rendered = page(vec![asked(&["systemctl", "restart", "unbound"])]);
         assert!(rendered.contains(r#"value="approve-session""#));
         assert!(!rendered.contains(r#"value="approve-matching""#));
-        assert!(rendered.contains(r#"value="15" selected"#));
+        assert!(rendered.contains(r#"value="session" selected"#));
         for minutes in ["15", "30", "60"] {
             assert!(
                 rendered.contains(&format!(r#"value="{minutes}""#)),
                 "the {minutes}-minute choice is missing"
             );
+        }
+    }
+
+    #[test]
+    fn every_pending_request_exposes_its_decision_controls_without_disclosure() {
+        let rendered = page(vec![
+            asked(&["systemctl", "status", "unbound"]),
+            asked(&["journalctl", "--rotate"]),
+        ]);
+        let requests = rendered
+            .split(r#"<details class="review-request""#)
+            .skip(1)
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let (attributes, _) = request.split_once('>').unwrap();
+            assert!(
+                attributes
+                    .split_ascii_whitespace()
+                    .any(|attribute| attribute == "open")
+            );
+            let (_, form) = request.split_once(r#"<form class="actions""#).unwrap();
+            let (controls, _) = form.split_once("</form>").unwrap();
+            for decision in ["approve", "refuse", "approve-session"] {
+                assert!(controls.contains(&format!(r#"value="{decision}""#)));
+            }
+            assert!(controls.contains(r#"value="session" selected"#));
+            assert!(!request.contains(r#"<details class="session-approval""#));
         }
     }
 

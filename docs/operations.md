@@ -315,10 +315,11 @@ approval for future commands; it does not end the session or release its slot.
 **Review** separates Needs approval, Session approvals and History. Requests
 show waiting age and a server-observed decision deadline, with oldest-first or
 expiring-first ordering. Notification fragments still select the exact request.
-Approve once and Refuse remain direct actions. **Approve session…** opens a
-separate duration form with 15 minutes selected; longer durations and remaining
-session lifetime require an explicit choice. The current usable session time is
-shown separately because idle expiry can occur before the approval deadline.
+Pending requests start expanded. **Approve once**, **Refuse** and **Approve
+session** are direct actions in the same row, with the session duration always
+visible and the remaining session lifetime selected by default. Shorter durations
+remain available. The current usable session time is shown separately because
+idle expiry can occur before the approval deadline.
 
 After a decision, the page reads the recorded answer and offers an explicit Next
 request link. Session approvals show current work, effective remaining time,
