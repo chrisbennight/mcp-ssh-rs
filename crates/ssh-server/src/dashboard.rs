@@ -522,6 +522,7 @@ struct AuditQuery {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PageQuery {
+    return_to: Option<String>,
     before: Option<String>,
     start: Option<String>,
     end: Option<String>,
@@ -1717,6 +1718,15 @@ where
     C: Clock + 'static,
     S: CredentialSource,
 {
+    let return_to = match query
+        .return_to
+        .as_deref()
+        .map(activity::investigation_return)
+    {
+        Some(Some(url)) => Some(url),
+        Some(None) => return StatusCode::BAD_REQUEST.into_response(),
+        None => None,
+    };
     let Ok(session) = SessionId::parse(&raw_session) else {
         return (StatusCode::NOT_FOUND, message_html("That session, run, or output stream could not be identified. Open a current view to continue.")).into_response();
     };
@@ -1732,7 +1742,8 @@ where
         let mut page = OperationsPage::new(operator.0, format!("Command output · {stream}"));
         page.output_active = true;
         page.output_run = run.as_str().to_owned();
-        page.output_back_url = format!("/dashboard/sessions/{}?source=current", session.as_str());
+        page.output_back_url = return_to
+            .unwrap_or_else(|| format!("/dashboard/sessions/{}?source=current", session.as_str()));
         page.source_notice = "Output held by this service. The capture limit is shown below if any output was discarded.".to_owned();
         page.verification = "Current service".to_owned();
         let output = match bastion
@@ -1783,7 +1794,8 @@ where
     );
     page.output_active = true;
     page.output_run = visible(run.as_str());
-    page.output_back_url = transcript_page_url(session.as_str(), before, start, end);
+    page.output_back_url =
+        return_to.unwrap_or_else(|| transcript_page_url(session.as_str(), before, start, end));
     match read {
         Ok(Some(entry)) => {
             page.output = entry

@@ -82,6 +82,7 @@ impl ActivityQuery {
             ("window", &self.window),
             ("kind", &self.kind),
             ("view", &self.view),
+            ("selected", &self.selected),
         ] {
             if !value.is_empty() {
                 pairs.append_pair(key, value);
@@ -105,6 +106,20 @@ impl ActivityQuery {
         }
         format!("/dashboard/activity?{}", pairs.finish())
     }
+}
+
+pub(super) fn investigation_return(value: &str) -> Option<String> {
+    if value.len() > 4096 {
+        return None;
+    }
+    let uri: axum::http::Uri = value.parse().ok()?;
+    if uri.scheme().is_some() || uri.authority().is_some() || uri.path() != "/dashboard/activity" {
+        return None;
+    }
+    let Query(query) = Query::<ActivityQuery>::try_from_uri(&uri).ok()?;
+    query
+        .valid()
+        .then(|| query.url(&query.source, query.before))
 }
 
 #[derive(Serialize)]
@@ -345,7 +360,17 @@ fn shown(
                     label: output.label.to_owned(),
                     preview: output.preview,
                     note: output.note,
-                    url,
+                    url: if url.is_empty() {
+                        url
+                    } else {
+                        let mut scope = query.clone();
+                        scope.selected = decision.digest.clone();
+                        let back = scope.url(source, query.before);
+                        let encoded = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("return_to", &back)
+                            .finish();
+                        format!("{url}&{encoded}")
+                    },
                 }
             })
             .collect();
@@ -709,5 +734,23 @@ mod tests {
         assert!(!url.contains("start="));
         assert!(!url.contains("end="));
         assert!(query.url("history", Some(150)).contains("end=200"));
+    }
+
+    #[test]
+    fn output_returns_only_to_a_valid_local_investigation() {
+        let url = "/dashboard/activity?host=server&q=quoted%20%22text%22&kind=execute&source=current&before=10&selected=abcdef";
+        let back = investigation_return(url).unwrap();
+        assert!(back.contains("q=quoted+%22text%22"));
+        assert!(back.contains("before=10"));
+        assert!(back.contains("selected=abcdef"));
+        for invalid in [
+            "https://elsewhere.test/dashboard/activity",
+            "//elsewhere.test/dashboard/activity",
+            "/dashboard/approvals",
+            "/dashboard/activity?source=unsupported",
+            "/dashboard/activity?unknown=filter",
+        ] {
+            assert!(investigation_return(invalid).is_none());
+        }
     }
 }
