@@ -108,44 +108,54 @@ impl Observation {
             "Active work"
         }
         .to_owned();
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| matches(entry) && matches!(entry.event, Event::Decided { .. }))
-        {
-            if let Event::Decided {
-                argv, operation, ..
-            } = &entry.event
+        if let Some(latest) = self.entries.iter().find(|entry| {
+            matches(entry) && matches!(entry.event, Event::Decided { .. } | Event::Completed { .. })
+        }) {
+            let (origin, completed) = match &latest.event {
+                Event::Completed { decided, state, .. } => {
+                    let authority = self.entries.iter().find(|entry| {
+                        entry.session == latest.session && entry.sequence == *decided
+                    });
+                    let origin = authority.and_then(|authority| match &authority.event {
+                        Event::Approved { decided, .. } => self.entries.iter().find(|entry| {
+                            entry.session == latest.session && entry.sequence == *decided
+                        }),
+                        Event::Decided { .. } => Some(authority),
+                        _ => None,
+                    });
+                    (origin, Some(state))
+                }
+                _ => (Some(latest), None),
+            };
+            if let Some(origin) = origin
+                && let Event::Decided {
+                    argv, operation, ..
+                } = &origin.event
             {
                 work.latest = activity::preview(
                     &argv.iter().map(|arg| visible(arg)).collect::<Vec<_>>(),
                     operation.as_str(),
                 );
-                work.latest_when = format!(
-                    "Requested {} ago · retained service evidence",
-                    elapsed_time(self.now.saturating_sub(entry.at))
-                );
                 work.latest_url = format!(
                     "{}&selected={}",
-                    session_history_url(entry.session.as_str()),
-                    entry.digest.as_str()
+                    session_history_url(origin.session.as_str()),
+                    origin.digest.as_str()
                 );
-                let authorization = self.entries.iter().find(|candidate| candidate.session == entry.session && matches!(&candidate.event, Event::Approved { decided, .. } if *decided == entry.sequence)).map_or(entry.sequence, |approval| approval.sequence);
-                work.latest_outcome = self
-                    .entries
-                    .iter()
-                    .find_map(|candidate| {
-                        if candidate.session == entry.session
-                            && let Event::Completed { decided, state, .. } = &candidate.event
-                            && *decided == authorization
-                        {
-                            Some(format!("Observed result: {}", visible(state)))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "Completion not retained for this request".to_owned());
+            } else {
+                work.latest = "Result retained; original request context unavailable".to_owned();
             }
+            work.latest_when = format!(
+                "{} {} ago · retained service evidence",
+                if completed.is_some() {
+                    "Completed"
+                } else {
+                    "Requested"
+                },
+                elapsed_time(self.now.saturating_sub(latest.at))
+            );
+            work.latest_outcome = completed
+                .map(|state| format!("Observed result: {}", visible(state)))
+                .unwrap_or_else(|| "Completion not retained for this request".to_owned());
         } else {
             work.latest = "No operation in retained evidence".to_owned();
         }
