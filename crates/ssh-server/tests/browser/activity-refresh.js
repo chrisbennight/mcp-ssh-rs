@@ -89,6 +89,17 @@
       await state.poll();
       assert(state.doc.getElementById("recovered"), "Polling did not recover");
     }],
+    ["Nested inspection panels survive Apply", request("first").replace("</details>", '<details id="representation-first"><summary>Exact operation representation</summary>Arguments</details></details>') + '<details id="revoke-agreement"><summary>Revoke session approval</summary>Withdrawal controls</details>', async state => {
+      for (const id of ["representation-first", "revoke-agreement"]) state.doc.getElementById(id).open = true;
+      state.html = state.html.replace("</div>", request("second") + "</div>");
+      await state.poll();
+      assert(!state.doc.getElementById("apply-updates").hidden, "Inspection did not hold changes for Apply");
+      state.doc.getElementById("apply-updates").click();
+      assert(state.doc.getElementById("second"), "Apply did not install the next request");
+      for (const id of ["representation-first", "revoke-agreement"]) {
+        assert(state.doc.getElementById(id).open, "Apply closed an inspection panel: " + id);
+      }
+    }],
     ["A stalled read times out and permits a later refresh", request("first"), async state => {
       state.fetch = (_url, options) => new Promise((_resolve, reject) => {
         options.signal.addEventListener("abort", () => reject(new state.win.DOMException("Aborted", "AbortError")));

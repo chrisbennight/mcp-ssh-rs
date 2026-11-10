@@ -2786,6 +2786,15 @@ mod tests {
         assert!(rendered.contains(r#"value="approve-session""#));
     }
 
+    #[test]
+    fn file_inspection_details_keep_the_request_identity() {
+        let mut request = asked(&["file.stat", "/srv/report"]);
+        request.operation = ssh_core::action::ActionKind::Stat;
+        let id = request.id.as_str().to_owned();
+        let rendered = page(vec![request]);
+        assert!(rendered.contains(&format!(r#"<details id="representation-{id}">"#)));
+    }
+
     /// A standing agreement is visible and withdrawable where decisions are
     /// made, and the grantor's name passes the same visibility rules as any
     /// other text shown to an operator.
@@ -2820,6 +2829,7 @@ mod tests {
         assert!(rendered.contains("0123456789abcdef0123456789abcdef"));
         assert!(rendered.contains("3 h 59 min"));
         assert!(rendered.contains(r#"value="revoke""#));
+        assert!(rendered.contains(r#"<details id="revoke-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">"#));
         assert!(
             rendered.contains("/approvals/standing/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "the withdrawal form does not name the agreement"
