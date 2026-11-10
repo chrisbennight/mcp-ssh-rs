@@ -5,13 +5,20 @@
   const pause = document.getElementById("pause-updates");
   const apply = document.getElementById("apply-updates");
   if (!results || !freshness || !pause || !apply) return;
+  const target = location.hash && document.getElementById(location.hash.slice(1));
+  if (target && target.tagName === "DETAILS") { target.open = true; target.scrollIntoView(); }
+  const outcome = document.getElementById("decision-outcome");
+  if (outcome) outcome.focus();
   let paused = false, pending = null, inFlight = false;
-  const fingerprint = node => Array.from(node.querySelectorAll("[data-operation]"))
-    .map(row => row.dataset.operation + ":" + row.textContent).join("|");
+  const context = document.getElementById("session-context");
+  const regions = [results, context].filter(Boolean);
+  const fingerprint = nodes => nodes.map(node => node.textContent + "|" + Array.from(node.querySelectorAll("[data-operation]")).map(row => row.dataset.operation).join("|")).join("|");
   const install = next => {
-    const open = new Set(Array.from(results.querySelectorAll("details[open]")).map(row => row.id));
-    results.replaceChildren(...Array.from(next.childNodes).map(node => document.importNode(node, true)));
-    for (const row of results.querySelectorAll("details")) if (open.has(row.id)) row.open = true;
+    regions.forEach((region, index) => {
+      const open = new Set(Array.from(region.querySelectorAll("details[open][id]")).map(row => row.id));
+      region.replaceChildren(...Array.from(next[index].childNodes).map(node => document.importNode(node, true)));
+      for (const row of region.querySelectorAll("details[id]")) if (open.has(row.id)) row.open = true;
+    });
     pending = null;
     apply.hidden = true;
     freshness.textContent = "Updated just now";
@@ -35,13 +42,15 @@
       const page = new DOMParser().parseFromString(await response.text(), "text/html");
       const next = page.getElementById("activity-results");
       if (!next || next.dataset.source !== results.dataset.source) throw new Error("Activity unavailable");
-      const changed = fingerprint(next) !== fingerprint(results);
-      if (changed && (results.contains(document.activeElement) || results.querySelector("details[open]"))) {
-        pending = next;
+      const nextRegions = regions.map(region => page.getElementById(region.id));
+      if (nextRegions.some(region => !region)) throw new Error("Activity unavailable");
+      const changed = fingerprint(nextRegions) !== fingerprint(regions);
+      if (changed && regions.some(region => region.contains(document.activeElement) || region.querySelector("details[open]"))) {
+        pending = nextRegions;
         apply.hidden = false;
         freshness.textContent = "Activity updates available";
       } else if (changed) {
-        install(next);
+        install(nextRegions);
       } else {
         freshness.textContent = "Checked just now";
       }

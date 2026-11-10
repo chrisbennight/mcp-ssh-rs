@@ -43,6 +43,9 @@ use crate::ingress::SharedBearer;
 #[path = "dashboard_activity.rs"]
 mod activity;
 
+#[path = "dashboard_supervision.rs"]
+mod supervision;
+
 /// Where the dashboard is mounted.
 pub const DASHBOARD_PATH: &str = "/dashboard";
 
@@ -246,6 +249,10 @@ pub struct Pending {
     /// program name the agent chose.
     pub why: String,
     pub command: Vec<String>,
+    pub age: String,
+    pub deadline: String,
+    pub session_remaining: String,
+    pub selected: bool,
 }
 
 impl From<Asked> for Pending {
@@ -262,6 +269,10 @@ impl From<Asked> for Pending {
             agent_intent: visible(asked.agent_intent.as_str()),
             why: visible(&asked.why),
             command: asked.command.iter().map(|arg| visible(arg)).collect(),
+            age: String::new(),
+            deadline: String::new(),
+            session_remaining: String::new(),
+            selected: false,
         }
     }
 }
@@ -316,6 +327,11 @@ struct ApprovalsPage {
     action: String,
     waiting: Vec<Pending>,
     standing: Vec<StandingShown>,
+    tab: String,
+    sort: String,
+    history: Vec<AuditShown>,
+    outcome: String,
+    reviewed_url: String,
 }
 
 /// One standing agreement, as the page shows it.
@@ -326,6 +342,11 @@ pub struct StandingShown {
     pub remaining: String,
     pub coverage: String,
     pub detail: String,
+    pub context: String,
+    pub work: supervision::WorkShown,
+    pub uses: usize,
+    pub last_use: String,
+    pub expiring: bool,
 }
 
 impl StandingShown {
@@ -334,7 +355,7 @@ impl StandingShown {
         let (coverage, detail) = match &agreement.coverage {
             StandingCoverage::Session => (
                 "Session-wide".to_owned(),
-                "Every held command in this session".to_owned(),
+                "Operations requiring review in this session".to_owned(),
             ),
         };
         Self {
@@ -348,6 +369,11 @@ impl StandingShown {
             } else {
                 format!("{minutes} min")
             },
+            context: String::new(),
+            work: supervision::WorkShown::default(),
+            uses: 0,
+            last_use: "No retained use".to_owned(),
+            expiring: remaining_ms <= 600_000,
         }
     }
 }
@@ -379,14 +405,15 @@ pub struct SessionShown {
     pub waiting: usize,
     pub slots: usize,
     pub limit: usize,
+    pub work: supervision::WorkShown,
 }
 
 pub struct InventoryShown {
     pub host: String,
-    pub roles: Vec<String>,
     pub live_sessions: usize,
     pub history_url: String,
     pub sessions_url: String,
+    pub accounts: Vec<supervision::AccountShown>,
 }
 
 pub struct AuditShown {
@@ -461,6 +488,9 @@ pub struct JourneyShown {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionsQuery {
+    #[serde(default)]
+    view: String,
+    role: Option<String>,
     host: Option<String>,
     principal: Option<String>,
 }
@@ -518,6 +548,8 @@ struct Filters {
     verdict: String,
     window: String,
     q: String,
+    view: String,
+    role: String,
 }
 
 #[derive(Template)]
@@ -631,6 +663,19 @@ fn wire_event_name(event: &serde_json::Value) -> &str {
 
 fn wire_summary(event: &serde_json::Value) -> String {
     match wire_event_name(event) {
+        "session_approval_granted" => format!(
+            "{} granted session approval {}{}",
+            visible(wire_string(event, "operator").unwrap_or("unavailable")),
+            visible(wire_string(event, "agreement").unwrap_or("unavailable")),
+            wire_string(event, "supersedes")
+                .map(|previous| format!("; superseded {}", visible(previous)))
+                .unwrap_or_default()
+        ),
+        "session_approval_revoked" => format!(
+            "{} revoked session approval {}",
+            visible(wire_string(event, "operator").unwrap_or("unavailable")),
+            visible(wire_string(event, "agreement").unwrap_or("unavailable"))
+        ),
         "session_opened" => format!(
             "Opened for {} with account class {}",
             visible(wire_string(event, "purpose").unwrap_or("unavailable")),
@@ -1082,10 +1127,10 @@ fn transcript_page_url(session: &str, before: u64, start: u64, end: u64) -> Stri
     )
 }
 
-fn host_audit_url(host: &str) -> String {
+fn host_activity_url(host: &str) -> String {
     let mut encoded = url::form_urlencoded::Serializer::new(String::new());
     encoded.append_pair("host", host);
-    format!("/dashboard/audit?{}", encoded.finish())
+    format!("/dashboard/activity?{}", encoded.finish())
 }
 
 fn next_audit_url(filters: &Filters, before: Option<u64>, start: u64) -> String {
@@ -1220,6 +1265,8 @@ fn blank_filters() -> Filters {
         verdict: String::new(),
         window: "30d".to_owned(),
         q: String::new(),
+        view: String::new(),
+        role: String::new(),
     }
 }
 
@@ -1280,7 +1327,7 @@ where
     Router::new()
         .route("/assets/{name}", get(brand_asset))
         .route("/activity", get(activity::activity::<C, S>))
-        .route("/approvals", get(queue::<C, S>))
+        .route("/approvals", get(supervision::queue::<C, S>))
         .route("/inventory", get(inventory::<C, S>))
         .route("/sessions", get(sessions::<C, S>))
         .route(
@@ -1359,26 +1406,45 @@ where
 {
     let inventory = match bastion
         .blocking(|bastion| {
-            let mut live_by_host = HashMap::<String, usize>::new();
-            for snapshot in bastion.recent_session_snapshots(OPERATIONS_RESULT_LIMIT) {
-                if snapshot.status == SessionStatus::Live {
-                    let count = live_by_host
-                        .entry(snapshot.session.host.as_str().to_owned())
-                        .or_default();
-                    *count = count.saturating_add(1);
-                }
-            }
+            let observation = supervision::Observation::read(&bastion);
             bastion
-                .inventory()
+                .account_inventory()
                 .into_iter()
                 .map(|(host, roles)| InventoryShown {
                     host: visible(host.as_str()),
-                    roles: roles
-                        .into_iter()
-                        .map(|role| visible(role.as_str()))
+                    live_sessions: observation
+                        .counts
+                        .iter()
+                        .filter(|((target, _), _)| target == host)
+                        .map(|(_, count)| count)
+                        .sum(),
+                    accounts: roles
+                        .iter()
+                        .map(|(role, access_class)| supervision::AccountShown {
+                            access_class: access_class_name(*access_class).to_owned(),
+                            role: visible(role.as_str()),
+                            sessions_url: format!(
+                                "/dashboard/sessions?{}",
+                                url::form_urlencoded::Serializer::new(String::new())
+                                    .append_pair("host", host.as_str())
+                                    .append_pair("role", role.as_str())
+                                    .finish()
+                            ),
+                            sessions: observation
+                                .counts
+                                .get(&(host.clone(), (*role).clone()))
+                                .copied()
+                                .unwrap_or_default(),
+                            work: observation.account(host.as_str(), role.as_str()),
+                            activity_url: format!(
+                                "/dashboard/activity?{}",
+                                url::form_urlencoded::Serializer::new(String::new())
+                                    .append_pair("host", host.as_str())
+                                    .finish()
+                            ),
+                        })
                         .collect(),
-                    live_sessions: live_by_host.get(host.as_str()).copied().unwrap_or_default(),
-                    history_url: host_audit_url(host.as_str()),
+                    history_url: host_activity_url(host.as_str()),
                     sessions_url: format!(
                         "/dashboard/sessions?{}",
                         url::form_urlencoded::Serializer::new(String::new())
@@ -1411,6 +1477,23 @@ where
     C: Clock + 'static,
     S: CredentialSource,
 {
+    if !matches!(
+        query.view.as_str(),
+        "" | "running" | "waiting" | "waiting_agent" | "quiet"
+    ) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let role = query
+        .role
+        .as_deref()
+        .filter(|role| !role.is_empty())
+        .map(ssh_core::RoleId::parse)
+        .transpose();
+    let Ok(role) = role else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let role_label = query.role.clone().unwrap_or_default();
+    let view = query.view.clone();
     let host = query
         .host
         .as_deref()
@@ -1432,10 +1515,19 @@ where
     };
     let sessions = match bastion
         .blocking(move |bastion| {
+            let observation = supervision::Observation::read(&bastion);
             bastion
-                .session_snapshots(OPERATIONS_RESULT_LIMIT, host.as_ref(), principal.as_ref())
+                .session_snapshots_matching(
+                    OPERATIONS_RESULT_LIMIT,
+                    host.as_ref(),
+                    principal.as_ref(),
+                    |session| {
+                        observation.matches(session.id.as_str(), &query.view)
+                            && role.as_ref().is_none_or(|role| role == &session.role)
+                    },
+                )
                 .into_iter()
-                .map(|snapshot| session_shown(&bastion, snapshot))
+                .map(|snapshot| session_shown_observed(&bastion, snapshot, &observation))
                 .collect()
         })
         .await
@@ -1446,6 +1538,8 @@ where
     let mut page = OperationsPage::new(operator.0, "Sessions");
     page.sessions_active = true;
     page.sessions = sessions;
+    page.filters.view = view;
+    page.filters.role = role_label;
     page.filters.host = query.host.unwrap_or_default();
     page.filters.principal = query.principal.unwrap_or_default();
     page.source_notice = "Sessions held by this service. Limits apply per principal across all hosts. Open a session to inspect its work or end it.".to_owned();
@@ -1456,8 +1550,18 @@ fn session_shown<C: Clock + 'static, S: CredentialSource>(
     bastion: &Bastion<C, S>,
     snapshot: SessionSnapshot,
 ) -> SessionShown {
+    let observation = supervision::Observation::read(bastion);
+    session_shown_observed(bastion, snapshot, &observation)
+}
+
+fn session_shown_observed<C: Clock + 'static, S: CredentialSource>(
+    bastion: &Bastion<C, S>,
+    snapshot: SessionSnapshot,
+    observation: &supervision::Observation,
+) -> SessionShown {
     let session = &snapshot.session;
     let (slots, limit) = bastion.session_usage(&session.principal);
+    let work = observation.session(session.id.as_str());
     SessionShown {
         id: session.id.as_str().to_owned(),
         principal: visible(session.principal.as_str()),
@@ -1486,19 +1590,12 @@ fn session_shown<C: Clock + 'static, S: CredentialSource>(
                 .min(snapshot.idle_by)
                 .saturating_sub(snapshot.observed_at),
         ),
-        running: bastion
-            .runs_in_flight_with_authorization()
-            .iter()
-            .filter(|(_, auth)| auth.session() == &session.id)
-            .count(),
-        waiting: bastion
-            .waiting_for_approval()
-            .iter()
-            .filter(|request| request.session == session.id)
-            .count(),
+        running: work.running,
+        waiting: work.waiting,
         slots,
         limit,
         history_url: session_history_url(session.id.as_str()),
+        work,
     }
 }
 
@@ -1778,6 +1875,8 @@ where
         verdict,
         window: window_label,
         q,
+        view: String::new(),
+        role: String::new(),
     };
     let read_query = audit_history::Query {
         before,
@@ -1981,47 +2080,6 @@ where
     render_operations(page)
 }
 
-async fn queue<C, S>(
-    State(bastion): State<Arc<Bastion<C, S>>>,
-    axum::Extension(operator): axum::Extension<Operator>,
-) -> Response
-where
-    C: Clock + 'static,
-    S: CredentialSource,
-{
-    let page = match bastion
-        .blocking(move |bastion| ApprovalsPage {
-            operator: operator.0,
-            action: format!("{DASHBOARD_PATH}/approvals"),
-            waiting: bastion
-                .waiting_for_approval()
-                .into_iter()
-                .map(Pending::from)
-                .collect(),
-            standing: bastion
-                .standing_approvals()
-                .into_iter()
-                .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
-                .collect(),
-        })
-        .await
-    {
-        Ok(page) => page,
-        Err(_) => return state_unavailable(),
-    };
-    match page.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(why) => {
-            tracing::error!(%why, "the approvals page could not be rendered");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                message_html("The approvals page could not be rendered."),
-            )
-                .into_response()
-        }
-    }
-}
-
 async fn answer<C, S>(
     State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
@@ -2078,7 +2136,11 @@ where
                         agreement = agreement.as_str(),
                         "a request was approved with a standing agreement for its session"
                     );
-                    Redirect::to(&format!("{DASHBOARD_PATH}/approvals")).into_response()
+                    Redirect::to(&format!(
+                        "{DASHBOARD_PATH}/approvals?request={}",
+                        id.as_str()
+                    ))
+                    .into_response()
                 }
                 Err(why) => decision_failure(&id, &why),
             };
@@ -2110,7 +2172,11 @@ where
             // Answered with a redirect rather than a rendered page, so a
             // reloaded browser re-reads the queue instead of re-submitting the
             // decision.
-            Redirect::to(&format!("{DASHBOARD_PATH}/approvals")).into_response()
+            Redirect::to(&format!(
+                "{DASHBOARD_PATH}/approvals?request={}",
+                id.as_str()
+            ))
+            .into_response()
         }
         Err(why) => decision_failure(&id, &why),
     }
@@ -2118,8 +2184,8 @@ where
 
 /// How long a standing agreement should answer for, from the form's words.
 ///
-/// The page's vocabulary, exactly: the session default and three shorter
-/// choices. A value the page never offers did not come from an operator
+/// The page's vocabulary, exactly: three short choices and an explicit
+/// remaining-session choice. A value the page never offers did not come from an operator
 /// reading it, so it is refused rather than interpreted.
 fn standing_duration(duration: Option<&str>) -> Result<Option<u64>, NotADuration> {
     match duration {
@@ -2168,11 +2234,19 @@ where
             .into_response();
     };
     let requested = agreement.clone();
+    let who = operator.0.clone();
     let revoked = match bastion
-        .blocking(move |bastion| bastion.revoke_standing(&requested))
+        .blocking(move |bastion| bastion.revoke_standing(&requested, who))
         .await
     {
-        Ok(revoked) => revoked,
+        Ok(Ok(revoked)) => revoked,
+        Ok(Err(MediationError::Approval(ssh_core::approval::ApprovalError::Unattributed))) => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "session approval revoked but its outcome could not be recorded");
+            return (StatusCode::INTERNAL_SERVER_ERROR, message_html("Session approval revoked. Its history could not be recorded; it remains revoked.")).into_response();
+        }
         Err(_) => return state_unavailable(),
     };
     if revoked {
@@ -2428,6 +2502,11 @@ mod tests {
             action: format!("{DASHBOARD_PATH}/approvals"),
             waiting: waiting.into_iter().map(Pending::from).collect(),
             standing: Vec::new(),
+            tab: String::new(),
+            sort: String::new(),
+            history: Vec::new(),
+            outcome: String::new(),
+            reviewed_url: String::new(),
         }
         .render()
         .unwrap()
@@ -2457,7 +2536,7 @@ mod tests {
         let access_class = access_class_name(waiting.access_class).to_owned();
         // The card carries the request's identifier, so the fragment link in
         // notes and in the agent's held answer lands the reader on it.
-        let anchor = format!(r#"<article id="{}""#, waiting.id.as_str());
+        let anchor = format!(r#"id="{}""#, waiting.id.as_str());
         let session = waiting.session.as_str().to_owned();
         let rendered = page(vec![waiting]);
         assert!(
@@ -2475,7 +2554,7 @@ mod tests {
             "restart",
             "unbound",
             "Session purpose",
-            "Agent-supplied:",
+            "Agent-supplied intent:",
             "exercise the dashboard",
         ] {
             assert!(rendered.contains(needed), "the page omits {needed}");
@@ -2521,7 +2600,7 @@ mod tests {
     #[test]
     fn an_empty_queue_says_so_rather_than_rendering_nothing() {
         let rendered = page(Vec::new());
-        assert!(rendered.contains("Nothing is waiting."));
+        assert!(rendered.contains("Nothing is waiting for a decision."));
     }
 
     /// HTML escaping stops markup, not deception: a bidirectional control
@@ -2587,7 +2666,7 @@ mod tests {
         let rendered = page(vec![asked(&["systemctl", "restart", "unbound"])]);
         assert!(rendered.contains(r#"value="approve-session""#));
         assert!(!rendered.contains(r#"value="approve-matching""#));
-        assert!(rendered.contains(r#"value="session" selected"#));
+        assert!(rendered.contains(r#"value="15" selected"#));
         for minutes in ["15", "30", "60"] {
             assert!(
                 rendered.contains(&format!(r#"value="{minutes}""#)),
@@ -2619,12 +2698,22 @@ mod tests {
                 who: visible("chris\u{202e}"),
                 remaining: "3 h 59 min".to_owned(),
                 coverage: "Session-wide".to_owned(),
-                detail: "Every held command in this session".to_owned(),
+                detail: "Operations requiring review in this session".to_owned(),
+                context: String::new(),
+                work: supervision::WorkShown::default(),
+                uses: 0,
+                last_use: String::new(),
+                expiring: false,
             }],
+            tab: "standing".to_owned(),
+            sort: String::new(),
+            history: Vec::new(),
+            outcome: String::new(),
+            reviewed_url: String::new(),
         }
         .render()
         .unwrap();
-        assert!(rendered.contains("Standing agreements"));
+        assert!(rendered.contains("Session approvals"));
         assert!(rendered.contains("0123456789abcdef0123456789abcdef"));
         assert!(rendered.contains("3 h 59 min"));
         assert!(rendered.contains(r#"value="revoke""#));
@@ -2939,7 +3028,7 @@ mod tests {
         assert!(body.contains("operator"));
         assert!(body.contains("Account permissions are configured on the target"));
         assert!(body.contains("/dashboard/sessions?host=dns1"));
-        assert!(body.contains("/dashboard/audit?host=dns1"));
+        assert!(body.contains("/dashboard/activity?host=dns1"));
         assert!(!body.contains("mcp-ssh/dns1/readonly"));
     }
 

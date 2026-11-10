@@ -734,6 +734,36 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             validate_recorded(object.get("stdout").ok_or(())?)?;
             validate_recorded(object.get("stderr").ok_or(())?)
         }
+        "session_approval_granted" => {
+            exact_keys(
+                object,
+                &[
+                    "event",
+                    "agreement",
+                    "operator",
+                    "request",
+                    "until",
+                    "supersedes",
+                ],
+            )?;
+            ssh_core::approval::AgreementId::parse(required_string(object, "agreement")?)
+                .map_err(|_| ())?;
+            ssh_core::approval::RequestId::parse(required_string(object, "request")?)
+                .map_err(|_| ())?;
+            non_blank_string(required_string(object, "operator")?)?;
+            required_u64(object, "until")?;
+            if let Some(value) = object.get("supersedes").filter(|value| !value.is_null()) {
+                ssh_core::approval::AgreementId::parse(value.as_str().ok_or(())?)
+                    .map_err(|_| ())?;
+            }
+            Ok(())
+        }
+        "session_approval_revoked" => {
+            exact_keys(object, &["event", "agreement", "operator"])?;
+            ssh_core::approval::AgreementId::parse(required_string(object, "agreement")?)
+                .map_err(|_| ())?;
+            non_blank_string(required_string(object, "operator")?)
+        }
         "cancellation_requested" => {
             exact_keys(object, &["event", "run", "decided"])?;
             RunId::parse(required_string(object, "run")?).map_err(|_| ())?;
@@ -1220,6 +1250,30 @@ mod tests {
             "digest": digest.to_string().repeat(64),
         })
         .to_string()
+    }
+
+    #[test]
+    fn structured_session_approval_events_are_readable_history() {
+        for event in [
+            ssh_core::audit::Event::SessionApprovalGranted {
+                agreement: "a".repeat(32),
+                operator: "chris".to_owned(),
+                request: "b".repeat(32),
+                until: 60_000,
+                supersedes: Some("c".repeat(32)),
+            },
+            ssh_core::audit::Event::SessionApprovalRevoked {
+                agreement: "a".repeat(32),
+                operator: "chris".to_owned(),
+            },
+        ] {
+            let mut entry: Entry =
+                serde_json::from_str(&event_line(1, serde_json::to_value(event).unwrap(), 'a'))
+                    .unwrap();
+            assert!(validate_entry(&entry).is_ok());
+            *entry.event.get_mut("operator").unwrap() = serde_json::json!("");
+            assert!(validate_entry(&entry).is_err());
+        }
     }
 
     #[test]

@@ -169,7 +169,7 @@ struct ActivityPage {
     page_size: usize,
 }
 
-fn preview(arguments: &[String], kind: &str) -> String {
+pub(super) fn preview(arguments: &[String], kind: &str) -> String {
     let first = arguments.first().map(String::as_str).unwrap_or("Operation");
     let title = match kind {
         "upload" => "Upload",

@@ -529,6 +529,24 @@ impl<C: Clock> SessionStore<C> {
         self.filtered_snapshots(limit, None, None)
     }
 
+    /// Live counts across all held sessions, independent of list pagination.
+    #[must_use]
+    pub fn account_counts(&self) -> HashMap<(HostId, RoleId), usize> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.now();
+        let mut counts = HashMap::<(HostId, RoleId), usize>::new();
+        for session in sessions
+            .values()
+            .filter(|session| session.expiry(now).is_none())
+        {
+            let count = counts
+                .entry((session.host.clone(), session.role.clone()))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        counts
+    }
+
     /// Filter before bounding the result so a selected host cannot disappear
     /// behind newer sessions belonging to other hosts.
     #[must_use]
@@ -538,12 +556,23 @@ impl<C: Clock> SessionStore<C> {
         host: Option<&HostId>,
         principal: Option<&PrincipalId>,
     ) -> Vec<SessionSnapshot> {
+        self.filtered_snapshots_matching(limit, host, principal, |_| true)
+    }
+
+    pub fn filtered_snapshots_matching(
+        &self,
+        limit: usize,
+        host: Option<&HostId>,
+        principal: Option<&PrincipalId>,
+        matches: impl Fn(&Session) -> bool,
+    ) -> Vec<SessionSnapshot> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.clock.now();
         let mut newest = Vec::with_capacity(limit.min(sessions.len()));
         for held in sessions.values() {
             if host.is_some_and(|host| host != &held.host)
                 || principal.is_some_and(|principal| principal != &held.principal)
+                || !matches(held)
             {
                 continue;
             }
@@ -760,6 +789,22 @@ mod tests {
 
     fn store() -> SessionStore<TestClock> {
         SessionStore::new(TestClock::at(1_000), LIFETIME, PER_PRINCIPAL)
+    }
+
+    #[test]
+    fn aggregate_counts_and_activity_selection_precede_the_row_limit() {
+        let sessions = store();
+        let older = open(&sessions, "alice");
+        open(&sessions, "bob");
+        open(&sessions, "charlie");
+        let key = (older.host.clone(), older.role.clone());
+        assert_eq!(sessions.recent_snapshots(1).len(), 1);
+        assert_eq!(sessions.account_counts().get(&key), Some(&3));
+        let selected =
+            sessions.filtered_snapshots_matching(1, None, None, |session| session.id == older.id);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.first().unwrap().session.id, older.id);
+        assert_eq!(selected.first().unwrap().last_used, older.last_used);
     }
 
     fn principal(name: &str) -> PrincipalId {

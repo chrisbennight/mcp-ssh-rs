@@ -862,6 +862,10 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         self.sessions.recent_snapshots(limit)
     }
 
+    pub fn account_session_counts(&self) -> HashMap<(HostId, RoleId), usize> {
+        self.sessions.account_counts()
+    }
+
     pub fn session_snapshots(
         &self,
         limit: usize,
@@ -873,6 +877,17 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
 
     pub fn session_snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
         self.sessions.snapshot(id)
+    }
+
+    pub fn session_snapshots_matching(
+        &self,
+        limit: usize,
+        host: Option<&HostId>,
+        principal: Option<&PrincipalId>,
+        matches: impl Fn(&Session) -> bool,
+    ) -> Vec<SessionSnapshot> {
+        self.sessions
+            .filtered_snapshots_matching(limit, host, principal, matches)
     }
 
     pub fn session_usage(&self, principal: &PrincipalId) -> (usize, usize) {
@@ -1033,9 +1048,20 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         let answer = self.apply_answer(request, Approver::Human { who: who.clone() }, true)?;
         let session = answer.asked().session.clone();
         let until = self.standing_until(&session, for_millis);
-        let agreement =
-            self.approvals
-                .grant_standing(&session, who, until, StandingCoverage::Session);
+        let agreement = self.approvals.grant_standing_recorded(
+            &session,
+            who,
+            until,
+            StandingCoverage::Session,
+            |agreement, previous| {
+                if !self.sessions.holds(&session) {
+                    return Err(MediationError::Approval(ApprovalError::Lapsed));
+                }
+                self.ledger
+                    .record_session_approval_granted(answer.asked(), agreement, previous)?;
+                Ok(())
+            },
+        )?;
         tracing::info!(
             session = session.as_str(),
             request = request.as_str(),
@@ -1078,15 +1104,25 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
 
     /// Withdraws one agreement. Not a refusal: the next matching held command
     /// waits for a person again unless another agreement covers it.
-    pub fn revoke_standing(&self, agreement: &AgreementId) -> bool {
-        let revoked = self.approvals.revoke_standing(agreement);
-        if revoked {
-            tracing::info!(
-                agreement = agreement.as_str(),
-                "a standing agreement was withdrawn"
-            );
+    pub fn revoke_standing(
+        &self,
+        agreement: &AgreementId,
+        operator: String,
+    ) -> Result<bool, MediationError> {
+        if operator.trim().is_empty() {
+            return Err(ApprovalError::Unattributed.into());
         }
-        revoked
+        let Some(withdrawn) = self.approvals.withdraw_standing(agreement) else {
+            return Ok(false);
+        };
+        // Withdrawal stays effective even when its outcome cannot be recorded.
+        let snapshot = self
+            .sessions
+            .snapshot(&withdrawn.session)
+            .ok_or(MediationError::NoConnection)?;
+        self.ledger
+            .record_session_approval_revoked(&snapshot.session, agreement, operator)?;
+        Ok(true)
     }
 
     /// Inspects an owned run without collecting its output.
@@ -3625,7 +3661,11 @@ mod tests {
         );
 
         // Withdrawn, the next held command waits for a person again.
-        assert!(bastion.revoke_standing(&agreement));
+        assert!(
+            bastion
+                .revoke_standing(&agreement, "chris".to_owned())
+                .unwrap()
+        );
         let after = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "echo three"]))
             .await
@@ -3670,7 +3710,9 @@ mod tests {
             LIFETIME.max - 200_000,
             "the agreement claims more time than the session has"
         );
-        bastion.revoke_standing(&agreement);
+        bastion
+            .revoke_standing(&agreement, "chris".to_owned())
+            .unwrap();
 
         // A chosen time shorter than the session bounds it instead.
         let held = bastion
@@ -3883,6 +3925,43 @@ mod tests {
     /// A recording boundary the test can fail on demand, standing in for the
     /// flushed stdout write production selects.
     struct FlakyBoundary(std::sync::atomic::AtomicBool);
+
+    #[tokio::test]
+    async fn a_withdrawal_stays_effective_when_its_history_record_fails() {
+        let boundary = FlakyBoundary::healthy();
+        let bastion = bastion_recording(
+            Arc::new(TestClock::at(1_000)),
+            Limits::default(),
+            Some(boundary.clone()),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let Executed::AwaitingApproval { asked, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["true"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected review");
+        };
+        let agreement = bastion
+            .approve_session(&asked.asked().id, "chris".to_owned(), Some(60_000))
+            .unwrap();
+        assert!(bastion.ledger().entries().iter().any(|entry| matches!(&entry.event, Event::SessionApprovalGranted { agreement: id, operator, .. } if id == agreement.as_str() && operator == "chris")));
+        boundary.fail_now();
+        assert!(matches!(
+            bastion.revoke_standing(&agreement, "chris".to_owned()),
+            Err(MediationError::Audit(_))
+        ));
+        assert!(bastion.standing_approvals().is_empty());
+        boundary.recover();
+        assert!(matches!(
+            bastion
+                .exec(&alice(), &session.id, argv(&["printf", "after withdrawal"]))
+                .await
+                .unwrap(),
+            Executed::AwaitingApproval { .. }
+        ));
+    }
 
     impl FlakyBoundary {
         fn healthy() -> Arc<Self> {

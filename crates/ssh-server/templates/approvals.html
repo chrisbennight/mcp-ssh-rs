@@ -1,40 +1,24 @@
 {% import "navigation.html" as navigation %}
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Review queue · mcp-ssh-rs</title>
-    {% include "styles.html" %}
-  </head>
-  <body><a class="skip-link" href="#main-content">Skip to content</a>
-    <div class="shell">
-      <aside class="sidebar">
-        {% include "brand.html" %}
-        {% call navigation::sidebar("review") %}{% endcall %}
-        <div class="sidebar-foot">Review requests and manage sessions.</div>
-      </aside>
-      <main id="main-content" tabindex="-1">
-        <header class="topbar"><div><p class="eyebrow">Operations</p><h1>Review queue</h1></div><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header>
-        <div class="content">
-          <section class="summary" aria-label="Queue summary"><div class="metric"><span>Waiting</span><strong>{{ waiting.len() }}</strong></div><div class="metric"><span>Standing agreements</span><strong>{{ standing.len() }}</strong></div><div class="metric"><span>Decision mode</span><strong>Human</strong></div></section>
-          <div class="section-head"><h2>Requests requiring a decision</h2><p>Review the operation and its context before deciding.</p></div>
-          {% if waiting.is_empty() %}<div class="empty"><strong>Nothing is waiting.</strong><br>The queue will update on the next page load.</div>{% else %}
-            {% for request in waiting %}
-              <!-- The article id is service-minted hex. Notification fragment links land on this card. -->
-              <article id="{{ request.id }}">
-                <div class="request-head"><div><h3>{{ request.principal }} on {{ request.host }}</h3><div class="identifier">request {{ request.id }}</div></div><span class="risk">{{ request.access_class }}</span></div>
-                <div class="request-grid"><div class="request-main"><div class="argv-label">{{ request.operation }} · Exact arguments</div>
-                  <!-- One list item per argument preserves the boundary even when an argument contains whitespace. -->
-                  <ol class="argv">{% for argument in request.command %}<li>{{ argument }}</li>{% endfor %}</ol><p class="reason"><strong>Why it waits:</strong> {{ request.why }}</p></div>
-                  <div class="request-context"><dl><dt>Session purpose</dt><dd>{{ request.purpose }}</dd><dt>Agent intent</dt><dd><strong>Agent-supplied:</strong> {{ request.agent_intent }}</dd><dt>Host</dt><dd>{{ request.host }}</dd><dt>Role</dt><dd>{{ request.role }}</dd><dt>Operation</dt><dd>{{ request.operation }}</dd><dt>Account class</dt><dd>{{ request.access_class }}</dd><dt>Session</dt><dd class="identifier"><a href="/dashboard/activity?session={{ request.session }}">View session activity →</a></dd></dl></div></div>
-                <form class="actions" method="post" action="{{ action }}/{{ request.id }}"><button class="approve" name="decision" value="approve">Approve once</button><button class="refuse" name="decision" value="refuse">Refuse</button><button class="session" name="decision" value="approve-session">Approve session</button><label class="duration">for <select name="duration"><option value="session" selected>the rest of the session</option><option value="60">1 hour</option><option value="30">30 minutes</option><option value="15">15 minutes</option></select></label></form>
-              </article>
-            {% endfor %}
-          {% endif %}
-          {% if !standing.is_empty() %}<div class="section-head"><h2>Standing agreements</h2><p>Future commands in these sessions can run without another approval. Inspect a session to see its activity.</p></div><div class="agreements">{% for agreement in standing %}<article class="agreement"><p><strong>{{ agreement.coverage }}</strong> · {{ agreement.remaining }} left<br><strong>{{ agreement.who }}</strong> for session <a href="/dashboard/activity?session={{ agreement.session }}">View session activity →</a><br>{{ agreement.detail }}<br><span class="identifier">agreement {{ agreement.id }}</span></p><form method="post" action="{{ action }}/standing/{{ agreement.id }}"><button class="refuse" name="decision" value="revoke">Revoke session approval</button></form></article>{% endfor %}</div>{% endif %}
-        </div>
-      </main>
-    </div>
-  </body>
-</html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review · mcp-ssh-rs</title>{% include "styles.html" %}<script src="/dashboard/assets/activity.js" defer></script></head>
+<body><a class="skip-link" href="#main-content">Skip to content</a><div class="shell"><aside class="sidebar">{% include "brand.html" %}{% call navigation::sidebar("review") %}{% endcall %}</aside>
+<main id="main-content" tabindex="-1"><header class="topbar"><h1>Review</h1><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header><div class="content">
+<div class="activity-toolbar"><nav class="activity-tabs" aria-label="Review views"><a href="/dashboard/approvals"{% if tab.is_empty() || tab == "needs" %} aria-current="page"{% endif %}>Needs approval</a><a href="/dashboard/approvals?tab=standing"{% if tab == "standing" || tab == "quiet" || tab == "expiring" %} aria-current="page"{% endif %}>Session approvals</a><a href="/dashboard/approvals?tab=history"{% if tab == "history" %} aria-current="page"{% endif %}>History</a></nav><div class="live-controls"><span id="freshness" role="status">Observed on page load</span><button id="pause-updates" type="button" hidden>Pause updates</button><button id="apply-updates" type="button" hidden>Apply updates</button></div></div>
+<div id="activity-results" data-source="current">
+{% if !outcome.is_empty() %}<section class="notice" role="status" tabindex="-1" id="decision-outcome"><h2>Recorded decision</h2><p>{{ outcome }}</p>{% if !reviewed_url.is_empty() %}<a href="{{ reviewed_url }}">Inspect the reviewed operation</a> · {% endif %}<a href="/dashboard/approvals">Next request</a></section>{% endif %}
+{% if tab.is_empty() || tab == "needs" %}
+<div class="section-head"><h2>Requests requiring a decision <span class="badge">{{ waiting.len() }}</span></h2><form method="get" action="/dashboard/approvals"><label>Order <select name="sort"><option value="oldest"{% if sort != "expiry" %} selected{% endif %}>Oldest first</option><option value="expiry"{% if sort == "expiry" %} selected{% endif %}>Expiring first</option></select></label><button>Apply</button></form></div>
+{% if waiting.is_empty() %}<div class="empty">Nothing is waiting for a decision.</div>{% endif %}
+{% for request in waiting %}<details class="review-request" id="{{ request.id }}" data-operation="{{ request.id }}" data-state="waiting {{ request.deadline }}"{% if request.selected %} open{% endif %}>
+<summary><span><strong>{{ request.host }} / {{ request.role }}</strong> · {{ request.principal }}<span class="muted">{{ request.operation }} · waiting {{ request.age }} · decide within {{ request.deadline }}</span></span><span class="badge">{{ request.access_class }}</span></summary>
+<div class="request-grid"><div class="request-main"><p><strong>Agent-supplied intent:</strong> {{ request.agent_intent }}</p><p class="reason"><strong>Why it waits:</strong> {{ request.why }}</p><h2>Exact arguments</h2><ol class="argv" start="0">{% for argument in request.command %}<li>{% if argument.is_empty() %}<em>(empty argument)</em>{% else %}{{ argument }}{% endif %}</li>{% endfor %}</ol></div>
+<div class="request-context"><dl><dt>Session purpose</dt><dd>{{ request.purpose }}</dd><dt>Host</dt><dd>{{ request.host }}</dd><dt>Role</dt><dd>{{ request.role }}</dd><dt>Operation</dt><dd>{{ request.operation }}</dd><dt>Account class</dt><dd>{{ request.access_class }}</dd><dt>Session usable for</dt><dd>{{ request.session_remaining }}</dd><dt>Request ID</dt><dd class="identifier">{{ request.id }}</dd></dl><a href="/dashboard/activity?session={{ request.session }}">View session activity →</a></div></div>
+<form class="actions" method="post" action="{{ action }}/{{ request.id }}"><button class="approve" name="decision" value="approve">Approve once</button><button class="refuse" name="decision" value="refuse">Refuse</button></form>
+<details class="session-approval"><summary>Approve session…</summary><p>Approve this exact request and allow operations requiring review in this session until the chosen deadline. The session can expire earlier. Running work continues when approval ends.</p><form class="actions" method="post" action="{{ action }}/{{ request.id }}"><label class="duration">Approval duration <select name="duration"><option value="15" selected>15 minutes</option><option value="30">30 minutes</option><option value="60">1 hour</option><option value="session">Remaining session lifetime</option></select></label><p class="muted">Effective duration is at most {{ request.session_remaining }}, the current usable session time. Agent use can renew idle time within the session's maximum lifetime.</p><button name="decision" value="approve-session">Approve this request and session</button></form></details>
+</details>{% endfor %}{% endif %}
+{% if tab == "standing" || tab == "quiet" || tab == "expiring" %}
+<div class="section-head"><h2>Session approvals <span class="badge">{{ standing.len() }}</span></h2><div><a href="/dashboard/approvals?tab=standing">All active</a> · <a href="/dashboard/approvals?tab=quiet">Quiet approvals</a> · <a href="/dashboard/approvals?tab=expiring">Expiring within 10 minutes</a></div></div>
+<p class="muted">Current service observation. Quiet approvals have no running operation, actionable pending request, or usable approval waiting for agent collection. Use counts cover retained service evidence.</p>
+{% if standing.is_empty() %}<div class="empty">No active session approvals match this view.</div>{% endif %}
+{% for agreement in standing %}<article class="card" data-operation="{{ agreement.id }}" data-state="{{ agreement.remaining }} {{ agreement.work.running }} {{ agreement.work.waiting }} {{ agreement.work.waiting_agent }} {{ agreement.uses }}"><div class="head"><div><h3>{{ agreement.context }}</h3><p>Approved by <strong>{{ agreement.who }}</strong> · {{ agreement.remaining }} effective time remaining</p></div><span class="badge">{{ agreement.work.activity }}</span></div><p>{{ agreement.coverage }} · {{ agreement.detail }}</p><p>{{ agreement.work.running }} running · {{ agreement.work.waiting }} awaiting decision · {{ agreement.work.waiting_agent }} waiting for agent</p><p><code>{{ agreement.work.latest }}</code><br><span class="muted">{{ agreement.work.latest_when }} · {{ agreement.work.latest_outcome }}</span></p><p class="muted">{{ agreement.uses }} observed uses in retained evidence · {{ agreement.last_use }}</p><a href="/dashboard/activity?session={{ agreement.session }}">View session activity →</a><details><summary>Revoke session approval…</summary><p>Future requests requiring review will need approval. This does not end the session or stop running work.</p><form method="post" action="{{ action }}/standing/{{ agreement.id }}"><button class="refuse" name="decision" value="revoke">Revoke session approval</button></form></details><span class="identifier">agreement {{ agreement.id }}</span></article>{% endfor %}{% endif %}
+{% if tab == "history" %}<h2>Decision and session approval history</h2><p class="muted">Newest retained service records, up to 100. Older records may have expired or been lost on restart. Recorded deadlines describe expiry; they are not claims of a human withdrawal.</p>{% if history.is_empty() %}<div class="empty">No decision history is retained by this service.</div>{% endif %}{% for item in history %}<article class="card" data-operation="{{ item.digest }}" data-state="{{ item.event }}"><h3>{{ item.summary }}</h3><p class="muted">Recorded {{ item.at }}</p><p>{{ item.host }} / {{ item.role }} · {{ item.principal }}</p><a href="{{ item.session_url }}">Inspect session evidence</a></article>{% endfor %}<a href="/dashboard/audit">Search saved audit events</a>{% endif %}
+</div></div></main></div></body></html>
