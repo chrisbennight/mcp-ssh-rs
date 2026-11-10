@@ -609,6 +609,24 @@ fn shown(
                             })
                 })
                 .collect::<Vec<_>>();
+        // Related evidence is read through the fixed observation boundary.
+        // Keep identifier matches on their newest matching evidence page.
+        if source == "history"
+            && query.run.is_empty()
+            && query.request.is_empty()
+            && query.agreement.is_empty()
+            && audit_history::is_operation_identifier(&query.q)
+            && query.before.is_some_and(|cursor| {
+                related.iter().any(|entry| {
+                    entry.source_nanos > cursor
+                        && (query.time_basis != "completed"
+                            || wire_event_name(&entry.event) == "completed")
+                        && audit_history::operation_identifier_matches(entry, &query.q)
+                })
+            })
+        {
+            continue;
+        }
         let completion = related.iter().find(|entry| {
             entry.session == decision.session
                 && wire_event_name(&entry.event) == "completed"
@@ -1084,6 +1102,7 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
     let filtered_history = !query.view.is_empty()
         || !query.approval.is_empty()
         || !query.assessment.is_empty()
+        || audit_history::is_operation_identifier(&query.q)
         || query.time_basis == "completed";
     let unsupported = source == "history"
         && (matches!(query.view.as_str(), "waiting" | "waiting_agent" | "running")
@@ -1194,7 +1213,7 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
             notice.push_str(" Some original request times are unavailable. Select Completed in range to inspect retained result records.");
         }
         if filtered_history && next.is_some() {
-            notice.push_str(" Matching examines at most 100 request records per page. Continue to older operations for remaining evidence.");
+            notice.push_str(" Matching examines at most 100 source records per page. Continue to older operations for remaining evidence.");
         }
         (rows, next, notice)
     } else {
@@ -1417,6 +1436,84 @@ mod tests {
         );
         let second = rows.iter().find(|row| row.session == other).unwrap();
         assert!(second.status.contains("7"));
+    }
+
+    #[test]
+    fn an_identifier_operation_stays_on_its_newest_matching_saved_page() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let run = "abcdef0123456789-abcdef0123456789abcdef0123456789";
+        let request = "e".repeat(32);
+        let digest = "e".repeat(64);
+        for needle in [digest.clone(), request.clone(), run.to_owned(), "#4".into()] {
+            let mut original = entry(
+                session,
+                1,
+                'a',
+                json!({
+                    "event":"decided", "operation":"upload", "program":"file.upload",
+                    "argv":["file.upload","/srv/report","12",digest,"create","direct"],
+                    "agent_intent":format!("place the approved file {needle}"),
+                    "purpose":"diagnose", "access_class":"privileged",
+                    "verdict":"needs_approval", "policies":["default"]
+                }),
+            );
+            original.source_nanos = 10;
+            let mut answer = entry(
+                session,
+                2,
+                'b',
+                json!({
+                    "event":"answered", "decided":1, "request":request,
+                    "operator":"chris", "agreed":true
+                }),
+            );
+            answer.source_nanos = 20;
+            let mut authorization = entry(
+                session,
+                3,
+                'c',
+                json!({
+                    "event":"approved", "decided":1, "request":request,
+                    "approver":"chris", "override_of":null, "standing":false,
+                    "mode":"direct", "agreement":null
+                }),
+            );
+            authorization.source_nanos = 21;
+            let mut completion = entry(
+                session,
+                4,
+                'd',
+                json!({
+                    "event":"completed", "decided":3, "run":run,
+                    "state":"Exited { code: 0 }", "file":{"bytes":12,"sha256":digest}
+                }),
+            );
+            completion.source_nanos = 30;
+            let mut entries = vec![original, answer, authorization, completion];
+            let mut query = ActivityQuery {
+                q: needle,
+                ..Default::default()
+            };
+            assert_eq!(shown(&entries, &query, "history", 40, 0, 40).len(), 1);
+            query.before = Some(15);
+            assert!(shown(&entries, &query, "history", 40, 0, 40).is_empty());
+            assert_eq!(shown(&entries, &query, "current", 40, 0, 40).len(), 1);
+            if query.q == digest {
+                *entries
+                    .get_mut(3)
+                    .unwrap()
+                    .event
+                    .get_mut("file")
+                    .unwrap()
+                    .get_mut("sha256")
+                    .unwrap() = json!("f".repeat(64));
+                assert_eq!(
+                    shown(&entries, &query, "history", 40, 0, 40).len(),
+                    1,
+                    "later evidence that does not match must not hide the older request"
+                );
+            }
+        }
     }
 
     #[test]

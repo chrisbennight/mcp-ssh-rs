@@ -274,8 +274,9 @@ one filter at a time. **Refresh time range** starts a new observation.
 Retries waiting for a human answer and the agent's later collection stay on one
 operation. A subsequent independent execution remains a distinct operation.
 Live state filters select across retained metadata before limiting the page.
-Saved state searches examine at most 100 request records per page; continue to
-older operations when offered. Current waiting, running and expired states
+Saved state and identifier searches examine at most 100 source records per page;
+continue to older operations when offered. Identifier matches appear on the page
+of their newest matching evidence. Current waiting, running and expired states
 cannot be established from saved records. Missing evidence and unknown outcomes
 have separate labels. Current evidence remains limited by retention and restart;
 missing saved history does not disable current session controls.

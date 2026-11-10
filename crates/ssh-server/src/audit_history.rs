@@ -1381,6 +1381,33 @@ pub(crate) fn is_operation_identifier(value: &str) -> bool {
             || record_sequence(value).is_some())
 }
 
+pub(crate) fn operation_identifier_matches(entry: &Entry, value: &str) -> bool {
+    let event = event_name(entry);
+    if event == Some("decided") && entry.event.to_string().contains(value) {
+        return true;
+    }
+    if lower_hex_digest(value) {
+        return entry.digest == value
+            || event == Some("completed")
+                && entry
+                    .event
+                    .to_string()
+                    .contains(&json_fragment("sha256", value));
+    }
+    if lower_hex_id(value).is_ok() {
+        return event == Some("decided") && entry.session == value
+            || event == Some("answered")
+                && ["request", "agreement"]
+                    .iter()
+                    .any(|field| entry.event.get(field).and_then(Value::as_str) == Some(value));
+    }
+    if RunId::parse(value).is_ok() {
+        return event == Some("completed")
+            && entry.event.get("run").and_then(Value::as_str) == Some(value);
+    }
+    record_sequence(value) == Some(entry.sequence)
+}
+
 fn operation_parents_logql(entries: &[Entry]) -> Option<String> {
     let mut patterns = Vec::new();
     for entry in entries {
