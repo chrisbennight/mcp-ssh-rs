@@ -46,6 +46,12 @@ mod activity;
 #[path = "dashboard_supervision.rs"]
 mod supervision;
 
+#[path = "dashboard_files.rs"]
+mod files;
+
+#[path = "dashboard_state.rs"]
+mod state;
+
 /// Where the dashboard is mounted.
 pub const DASHBOARD_PATH: &str = "/dashboard";
 
@@ -253,11 +259,13 @@ pub struct Pending {
     pub deadline: String,
     pub session_remaining: String,
     pub selected: bool,
+    pub file: Option<files::FileShown>,
 }
 
 impl From<Asked> for Pending {
     fn from(asked: Asked) -> Self {
         Self {
+            file: files::describe(asked.operation.as_str(), &asked.command, None),
             operation: asked.operation.as_str().to_owned(),
             id: asked.id.as_str().to_owned(),
             session: asked.session.as_str().to_owned(),
@@ -1093,8 +1101,16 @@ fn audit_shown(entry: audit_history::Entry) -> AuditShown {
         host: visible(&entry.host),
         role: visible(&entry.role),
         summary: wire_summary(&entry.event),
-        command: wire_command(&entry.event),
-        outputs: wire_outputs(&entry.event),
+        command: if matches!(event.as_str(), "decided" | "evaluated") {
+            wire_command(&entry.event)
+        } else {
+            Vec::new()
+        },
+        outputs: if event == "completed" {
+            wire_outputs(&entry.event)
+        } else {
+            Vec::new()
+        },
         event,
         previous: entry.previous,
         digest: entry.digest,
@@ -1328,6 +1344,8 @@ where
     Router::new()
         .route("/assets/{name}", get(brand_asset))
         .route("/activity", get(activity::activity::<C, S>))
+        .route("/activity/export", get(activity::export_activity::<C, S>))
+        .route("/activity/view", get(activity::export_view))
         .route("/approvals", get(supervision::queue::<C, S>))
         .route("/inventory", get(inventory::<C, S>))
         .route("/sessions", get(sessions::<C, S>))
@@ -1360,6 +1378,10 @@ async fn brand_asset(Path(name): Path<String>) -> Response {
     let (mime, bytes): (&str, &[u8]) = match name.as_str() {
         "brand.svg" => ("image/svg+xml", include_bytes!("../static/brand.svg")),
         "icons.svg" => ("image/svg+xml", include_bytes!("../static/icons.svg")),
+        "investigations.js" => (
+            "text/javascript; charset=utf-8",
+            include_bytes!("../static/investigations.js"),
+        ),
         "activity.js" => (
             "text/javascript; charset=utf-8",
             include_bytes!("../static/activity.js"),
@@ -1441,6 +1463,7 @@ where
                                 "/dashboard/activity?{}",
                                 url::form_urlencoded::Serializer::new(String::new())
                                     .append_pair("host", host.as_str())
+                                    .append_pair("role", role.as_str())
                                     .finish()
                             ),
                         })
@@ -2385,6 +2408,8 @@ mod tests {
             "IBMPlexMono-Regular.ttf",
             "OFL-Manrope.txt",
             "OFL-IBMPlexMono.txt",
+            "activity.js",
+            "investigations.js",
         ] {
             let response = brand_asset(Path(name.to_owned())).await;
             let body = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -3259,6 +3284,28 @@ mod tests {
     struct SessionJourneyPage;
 
     impl ReadsAudit for SessionJourneyPage {
+        fn operations<'a>(
+            &'a self,
+            query: &'a audit_history::OperationQuery,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<audit_history::TranscriptPage, audit_history::ReadError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.transcript(&audit_history::TranscriptQuery {
+                    session: SessionId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                    start: query.filters.start,
+                    before: query.filters.before,
+                    end: query.end,
+                })
+                .await
+            })
+        }
+
         fn page<'a>(
             &'a self,
             _query: &'a audit_history::Query,
@@ -3540,6 +3587,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evidence_exports_freeze_identities_and_make_output_an_explicit_choice() {
+        let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
+            .layer(axum::Extension(Operator("chris".into())));
+        let investigation = "/dashboard/activity?source=history&session=0123456789abcdef0123456789abcdef&view=attention";
+        for (output, ids) in [
+            (false, "d".repeat(64)),
+            (true, "d".repeat(64)),
+            (false, format!("{},{}", "d".repeat(64), "f".repeat(64))),
+        ] {
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("investigation", investigation)
+                .append_pair("page_ids", &ids)
+                .append_pair("scope", "page")
+                .append_pair("format", "json")
+                .append_pair("output", if output { "true" } else { "false" })
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(format!("/activity/export?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            assert!(
+                response.headers()[header::CONTENT_DISPOSITION]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("attachment; filename=")
+            );
+            assert!(response.headers().contains_key("content-digest"));
+            let value: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 3 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let rows = value.get("operations").unwrap().as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "a later state filter must not change page membership"
+            );
+            assert_eq!(*rows.first().unwrap().get("id").unwrap(), "d".repeat(64));
+            assert_eq!(
+                *value.pointer("/manifest/definition/filters/view").unwrap(),
+                "attention"
+            );
+            assert_eq!(
+                rows.first()
+                    .unwrap()
+                    .get("evidence_records")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                5
+            );
+            assert_eq!(
+                rows.first()
+                    .unwrap()
+                    .pointer("/outputs/0/preview")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                if output { "active" } else { "" }
+            );
+            assert_eq!(
+                *value.pointer("/manifest/status").unwrap(),
+                if ids.contains(',') {
+                    "incomplete"
+                } else {
+                    "ready"
+                }
+            );
+        }
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("investigation", "https://elsewhere.test/dashboard/activity")
+            .finish();
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/activity/export?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn retained_output_expands_every_kept_byte_for_a_policy_permitted_command() {
         let session = "0123456789abcdef0123456789abcdef";
         let run = "0123456789abcdef-0123456789abcdef0123456789abcdef";
@@ -3624,7 +3770,7 @@ mod tests {
             ("/sessions", "No sessions match."),
             (
                 "/sessions/0123456789abcdef0123456789abcdef",
-                "Saved history unavailable.",
+                "Saved history unavailable or query budget exhausted.",
             ),
             ("/audit", "Historical audit data is currently unavailable."),
             (
@@ -3653,9 +3799,7 @@ mod tests {
                 assert!(body.contains("100"), "sessions omitted its result bound");
             } else if path.starts_with("/sessions/") {
                 assert!(body.contains("data-source=\"history\""));
-                assert!(
-                    body.contains("Current service activity and session controls remain available")
-                );
+                assert!(body.contains("session controls remain available"));
             } else {
                 assert!(body.contains("The log service is not configured or could not be reached"));
                 assert!(body.contains("20"), "{path} omitted its durable page bound");

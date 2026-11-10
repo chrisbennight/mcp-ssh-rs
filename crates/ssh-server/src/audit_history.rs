@@ -74,10 +74,9 @@ pub struct Page {
 
 /// One command-oriented page of a durable session transcript.
 ///
-/// `entries` contains the decisions selected for this page and the bounded
-/// related evidence needed to render each as one transaction. Pagination is
-/// driven only by decision timestamps, so an answer or completion cannot push
-/// its command onto another page.
+/// `entries` contains the operation records selected for this page and bounded
+/// related evidence. Transcript pagination uses decision timestamps; operation
+/// searches may select completion or identifier records before joining parents.
 #[derive(Debug)]
 pub struct TranscriptPage {
     pub entries: Vec<Entry>,
@@ -98,11 +97,17 @@ pub struct TranscriptQuery {
     pub session: SessionId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OperationQuery {
     pub filters: Query,
     pub kind: String,
     pub end: Option<u64>,
+    pub role: String,
+    pub request: String,
+    pub agreement: String,
+    pub run: String,
+    pub time_basis: String,
+    pub page_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +143,17 @@ pub trait ReadsAudit: Send + Sync {
         Box::pin(async move {
             let session =
                 SessionId::parse(&query.filters.session).map_err(|_| ReadError::NotConfigured)?;
-            if !query.filters.text.is_empty() || !query.kind.is_empty() {
+            if !query.filters.text.is_empty()
+                || !query.kind.is_empty()
+                || !query.role.is_empty()
+                || !query.request.is_empty()
+                || !query.agreement.is_empty()
+                || !query.run.is_empty()
+                || !matches!(query.time_basis.as_str(), "" | "requested")
+                || !query.page_ids.is_empty()
+                || !query.filters.host.is_empty()
+                || !query.filters.principal.is_empty()
+            {
                 return Err(ReadError::NotConfigured);
             }
             self.transcript(&TranscriptQuery {
@@ -364,6 +379,18 @@ impl Loki {
     }
 
     async fn read_operations(&self, query: &OperationQuery) -> Result<TranscriptPage, ReadError> {
+        if query.page_ids.len() > 40
+            || query.page_ids.iter().any(|id| !lower_hex_digest(id))
+            || (!query.role.is_empty() && RoleId::parse(&query.role).is_err())
+            || (!query.run.is_empty() && RunId::parse(&query.run).is_err())
+            || (!query.request.is_empty()
+                && ssh_core::approval::RequestId::parse(&query.request).is_err())
+            || (!query.agreement.is_empty()
+                && ssh_core::approval::AgreementId::parse(&query.agreement).is_err())
+            || !matches!(query.time_basis.as_str(), "" | "requested" | "completed")
+        {
+            return Err(ReadError::InvalidWindow);
+        }
         let _permit =
             tokio::time::timeout(QUERY_WITHIN, Arc::clone(&self.one_query).acquire_owned())
                 .await
@@ -375,18 +402,86 @@ impl Loki {
         if decision_end < start || decision_end > window_end {
             return Err(ReadError::InvalidWindow);
         }
+        let direct_id = is_operation_identifier(&query.filters.text);
+        let related = query.time_basis == "completed"
+            || !query.run.is_empty()
+            || !query.request.is_empty()
+            || !query.agreement.is_empty()
+            || direct_id;
+        let exact_page = !query.page_ids.is_empty();
+        let lookback = window_end.saturating_sub(
+            30_u64
+                .saturating_mul(24)
+                .saturating_mul(60)
+                .saturating_mul(60)
+                .saturating_mul(1_000_000_000),
+        );
         let mut filters = query.filters.clone();
-        filters.event = "decided".to_owned();
         filters.text.clear();
+        filters.event = if related || exact_page {
+            String::new()
+        } else {
+            "decided".to_owned()
+        };
         let mut expression = logql(&filters);
-        if !query.kind.is_empty() {
-            if query.kind == "files" {
-                expression.push_str(" |~ ");
-                expression.push_str(&logql_string(
-                    "\"operation\":\"(upload|download|stat|list|checksum)\"",
-                ));
-            } else if query.kind == "execute" {
-                expression.push_str(" !~ ");
+        if related && !exact_page {
+            expression.push_str(" |~ ");
+            expression.push_str(&logql_string(
+                "\"event\":\"(decided|approved|answered|completed|evaluated|cancellation_requested)\"",
+            ));
+            if query.time_basis == "completed" || !query.run.is_empty() {
+                expression.push_str(" |= ");
+                expression.push_str(&logql_string(&json_fragment("event", "completed")));
+            }
+        }
+        let selector = if query.time_basis == "completed" {
+            if query.run.is_empty() {
+                None
+            } else {
+                Some(("run", query.run.as_str()))
+            }
+        } else if !query.run.is_empty() {
+            Some(("run", query.run.as_str()))
+        } else if !query.request.is_empty() {
+            Some(("request", query.request.as_str()))
+        } else if !query.agreement.is_empty() {
+            Some(("agreement", query.agreement.as_str()))
+        } else {
+            None
+        };
+        if !query.role.is_empty() {
+            expression.push_str(" |= ");
+            expression.push_str(&logql_string(&json_fragment("role", &query.role)));
+        }
+        if let Some((field, value)) = selector {
+            expression.push_str(" |= ");
+            expression.push_str(&logql_string(&json_fragment(field, value)));
+        }
+        if query.time_basis != "completed" && query.run.is_empty() && selector.is_some() {
+            expression.push_str(" |= ");
+            expression.push_str(&logql_string(&json_fragment("event", "answered")));
+        }
+        let identifier_predicate = if !exact_page && selector.is_none() && direct_id {
+            operation_identifier_logql(&query.filters.text)
+        } else {
+            None
+        };
+        if let Some(predicate) = &identifier_predicate {
+            expression.push_str(predicate);
+        }
+        if exact_page {
+            expression.push_str(" |~ ");
+            expression.push_str(&logql_string(&format!(
+                "\"digest\":\"({})\"",
+                query.page_ids.join("|")
+            )));
+        } else if !related && !query.kind.is_empty() {
+            if query.kind == "files" || query.kind == "execute" {
+                expression.push_str(if query.kind == "files" {
+                    " |~ "
+                } else {
+                    " !~ "
+                });
                 expression.push_str(&logql_string(
                     "\"operation\":\"(upload|download|stat|list|checksum)\"",
                 ));
@@ -395,7 +490,19 @@ impl Loki {
                 expression.push_str(&logql_string(&json_fragment("operation", &query.kind)));
             }
         }
-        if !query.filters.text.is_empty() {
+        if !exact_page && let Some(sequence) = record_sequence(&query.filters.text) {
+            expression.push_str(" |~ ");
+            expression.push_str(&logql_string(&json_number_relation(
+                "sequence",
+                &[sequence],
+            )));
+        }
+        if !exact_page
+            && record_sequence(&query.filters.text).is_none()
+            && identifier_predicate.is_none()
+            && !query.filters.text.is_empty()
+            && (!related || direct_id && selector.is_none())
+        {
             let encoded = serde_json::to_string(&query.filters.text)
                 .map_err(|_| ReadError::MalformedResponse)?;
             let content = encoded
@@ -406,16 +513,63 @@ impl Loki {
             expression.push_str(&logql_string(content));
         }
         let mut decisions = self
-            .fetch(expression, start, decision_end, FETCH_LIMIT)
+            .fetch(
+                expression,
+                if exact_page { lookback } else { start },
+                decision_end,
+                if exact_page { 41 } else { FETCH_LIMIT },
+            )
             .await?;
-        let next_before = collision_safe_page(&mut decisions)?;
+        let next_before = if exact_page {
+            None
+        } else {
+            collision_safe_page(&mut decisions)?
+        };
+        if related && !exact_page {
+            for _ in 0..2 {
+                let expression = operation_parents_logql(&decisions);
+                let Some(expression) = expression else {
+                    break;
+                };
+                let mut parents = self
+                    .fetch(
+                        expression,
+                        lookback,
+                        window_end,
+                        decisions.len().saturating_add(1),
+                    )
+                    .await?;
+                let previous = decisions.len();
+                let mut seen = decisions
+                    .iter()
+                    .map(|entry| (entry.session.clone(), entry.digest.clone()))
+                    .collect::<HashSet<_>>();
+                parents.retain(|entry| seen.insert((entry.session.clone(), entry.digest.clone())));
+                decisions.extend(parents);
+                if decisions.len() == previous {
+                    break;
+                }
+            }
+        }
+        let roots = decisions
+            .iter()
+            .filter(|entry| event_name(entry) == Some("decided"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let relation_start = roots
+            .iter()
+            .map(|entry| entry.source_nanos)
+            .min()
+            .unwrap_or(start)
+            .min(start)
+            .max(lookback);
         let mut evidence_limited = false;
-        if !decisions.is_empty() {
-            let maximum = decisions.len().saturating_mul(6);
+        if !roots.is_empty() {
+            let maximum = roots.len().saturating_mul(6);
             let mut related = self
                 .fetch(
-                    operation_relations_logql(&decisions, false),
-                    start,
+                    operation_relations_logql(&roots, false),
+                    relation_start,
                     window_end,
                     maximum.saturating_add(1),
                 )
@@ -433,7 +587,7 @@ impl Loki {
                 let mut completions = self
                     .fetch(
                         operation_relations_logql(&approvals, true),
-                        start,
+                        relation_start,
                         window_end,
                         maximum.saturating_add(1),
                     )
@@ -443,7 +597,7 @@ impl Loki {
                 }
                 related.append(&mut completions);
             }
-            let mut cancellation_keys = decisions.clone();
+            let mut cancellation_keys = roots.clone();
             cancellation_keys.extend(approvals);
             let maximum = PAGE_SIZE.saturating_mul(8);
             let mut cancellations = self
@@ -453,7 +607,7 @@ impl Loki {
                         operation_relation_pattern(&cancellation_keys, true),
                         logql_string(&json_fragment("event", "cancellation_requested"))
                     ),
-                    start,
+                    relation_start,
                     window_end,
                     maximum.saturating_add(1),
                 )
@@ -710,24 +864,22 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             Ok(())
         }
         "completed" => {
-            exact_keys(
-                object,
-                if object.contains_key("info") && object.contains_key("file") {
-                    &[
-                        "event", "run", "decided", "state", "stdout", "stderr", "file", "info",
-                    ]
-                } else if object.contains_key("info") {
-                    &[
-                        "event", "run", "decided", "state", "stdout", "stderr", "info",
-                    ]
-                } else if object.contains_key("file") {
-                    &[
-                        "event", "run", "decided", "state", "stdout", "stderr", "file",
-                    ]
-                } else {
-                    &["event", "run", "decided", "state", "stdout", "stderr"]
-                },
-            )?;
+            let mut fields = vec!["event", "run", "decided", "state", "stdout", "stderr"];
+            for optional in ["file", "info", "outcome"] {
+                if object.contains_key(optional) {
+                    fields.push(optional);
+                }
+            }
+            exact_keys(object, &fields)?;
+            if let Some(value) = object.get("outcome") {
+                let outcome: ssh_core::run::RunState =
+                    serde_json::from_value(value.clone()).map_err(|_| ())?;
+                if matches!(outcome, ssh_core::run::RunState::Running)
+                    || format!("{outcome:?}") != required_string(object, "state")?
+                {
+                    return Err(());
+                }
+            }
             if let Some(info) = object.get("info") {
                 let info: ssh_core::files::FileInfo =
                     serde_json::from_value(info.clone()).map_err(|_| ())?;
@@ -833,7 +985,14 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             EvaluationArtifact::from_draft(draft, artifact.evaluator).map_err(|_| ())?;
             Ok(())
         }
-        _ => Err(()),
+        _ => {
+            let name = required_string(object, "event")?;
+            non_blank_string(name)?;
+            if name.len() > 64 || serde_json::to_vec(event).map_err(|_| ())?.len() > 65_536 {
+                return Err(());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1160,6 +1319,93 @@ fn operation_relation_pattern(entries: &[Entry], completions: bool) -> String {
         })
         .collect();
     format!("{} |~ {}", audit_logql(), logql_string(&patterns.join("|")))
+}
+
+fn operation_identifier_logql(value: &str) -> Option<String> {
+    if lower_hex_digest(value) {
+        let digest = json_fragment("digest", value);
+        let checksum = format!(
+            "{}.*{}",
+            json_fragment("event", "completed"),
+            json_fragment("sha256", value)
+        );
+        return Some(format!(
+            " |~ {}",
+            logql_string(&format!("({digest}|{checksum})"))
+        ));
+    }
+    if lower_hex_id(value).is_ok() {
+        let session = json_fragment("session", value);
+        let decision = json_fragment("event", "decided");
+        let answer = json_fragment("event", "answered");
+        let request = format!("\"(request|agreement)\":\"{value}\"");
+        return Some(format!(
+            " |~ {}",
+            logql_string(&format!(
+                "({session}.*{decision}|{decision}.*{session}|{answer}.*{request}|{request}.*{answer})"
+            ))
+        ));
+    }
+    if RunId::parse(value).is_ok() {
+        return Some(format!(
+            " |= {} |= {}",
+            logql_string(&json_fragment("event", "completed")),
+            logql_string(&json_fragment("run", value))
+        ));
+    }
+    None
+}
+
+fn record_sequence(value: &str) -> Option<u64> {
+    value.strip_prefix('#')?.parse().ok()
+}
+
+pub(crate) fn is_operation_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && (lower_hex_id(value).is_ok()
+            || lower_hex_digest(value)
+            || RunId::parse(value).is_ok()
+            || record_sequence(value).is_some())
+}
+
+fn operation_parents_logql(entries: &[Entry]) -> Option<String> {
+    let mut patterns = Vec::new();
+    for entry in entries {
+        if event_name(entry) == Some("decided") {
+            continue;
+        }
+        let relation = if let Some(sequence) = entry.event.get("decided").and_then(Value::as_u64) {
+            if entries
+                .iter()
+                .any(|parent| parent.session == entry.session && parent.sequence == sequence)
+            {
+                continue;
+            }
+            json_number_relation("sequence", &[sequence])
+        } else if let Some(digest) = entry
+            .event
+            .get("artifact")
+            .and_then(|artifact| artifact.get("decision_digest"))
+            .and_then(Value::as_str)
+        {
+            if !lower_hex_digest(digest) {
+                continue;
+            }
+            if entries
+                .iter()
+                .any(|parent| parent.session == entry.session && parent.digest == digest)
+            {
+                continue;
+            }
+            json_fragment("digest", digest)
+        } else {
+            continue;
+        };
+        let session = json_fragment("session", &entry.session);
+        patterns.push(format!("({session}.*{relation}|{relation}.*{session})"));
+    }
+    (!patterns.is_empty())
+        .then(|| format!("{} |~ {}", audit_logql(), logql_string(&patterns.join("|"))))
 }
 
 fn joined_numbers(values: &[u64]) -> String {
@@ -1558,6 +1804,7 @@ mod tests {
                 },
                 kind: "execute".to_owned(),
                 end: Some(200),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1570,6 +1817,65 @@ mod tests {
             vec![15, 14, 13, 12, 11, 10]
         );
         assert_eq!(page.window_end, 200);
+    }
+
+    #[tokio::test]
+    async fn completion_time_and_run_lookup_hydrate_a_request_before_the_selected_interval() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/loki/api/v1/query_range",get({
+            let calls = Arc::clone(&calls);
+            move |AxumQuery(params): AxumQuery<HashMap<String,String>>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let phase = calls.fetch_add(1,Ordering::Relaxed);
+                    let expression = params.get("query").unwrap();
+                    let completion = serde_json::json!({"event":"completed","run":"abcdef0123456789-abcdef0123456789abcdef0123456789","decided":10,"state":"Exited { code: 0 }","stdout":{"kind":"kept","text":"ok","truncated":false,"bytes":2},"stderr":{"kind":"kept","text":"","truncated":false,"bytes":0}});
+                    let values = match phase {
+                        0 => {
+                            assert_eq!(params.get("start").map(String::as_str),Some("100"));
+                            assert!(expression.contains("completed"));
+                            assert!(expression.contains("abcdef0123456789-abcdef0123456789abcdef0123456789"));
+                            vec![["150".to_owned(),event_line(11,completion,'b')]]
+                        }
+                        1 => {
+                            assert_eq!(params.get("start").map(String::as_str),Some("0"));
+                            assert!(expression.contains("sequence"));
+                            vec![["20".to_owned(),event_line(10,serde_json::json!({"event":"decided","argv":["true"],"agent_intent":"inspect","purpose":"diagnose","program":"true","access_class":"read_only","verdict":"permit","policies":["default"]}),'a')]]
+                        }
+                        2 => vec![["150".to_owned(),event_line(11,completion,'b')]],
+                        3 => {assert!(expression.contains("cancellation_requested")); Vec::new()},
+                        _ => panic!("unbounded related lookup"),
+                    };
+                    axum::Json(serde_json::json!({"status":"success","data":{"resultType":"streams","result":[{"stream":{},"values":values}]}}))
+                }
+            }
+        }));
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
+        let page = reader
+            .operations(&OperationQuery {
+                filters: Query {
+                    start: Some(100),
+                    ..Default::default()
+                },
+                end: Some(200),
+                time_basis: "completed".into(),
+                run: "abcdef0123456789-abcdef0123456789abcdef0123456789".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.window_start, 100);
+        assert!(
+            page.entries
+                .iter()
+                .any(|entry| entry.sequence == 10 && entry.source_nanos == 20)
+        );
+        assert!(page.entries.iter().any(|entry| entry.sequence == 11));
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
     }
 
     #[tokio::test]

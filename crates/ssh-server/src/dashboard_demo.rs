@@ -302,8 +302,8 @@ async fn commands_after_session_approval_are_present_in_history() {
     }
     assert_eq!(
         seen.len(),
-        27,
-        "initial approval request plus 26 executions"
+        26,
+        "the approval request and its collection remain one operation"
     );
     assert_eq!(
         completed, 26,
@@ -432,4 +432,74 @@ async fn serve_browser_review() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn waiting_for_agent_is_selected_before_the_page_limit() {
+    let (bastion, _) = populated().await;
+    let principal = ssh_core::PrincipalId::parse("agent").unwrap();
+    let session = bastion
+        .open_session(
+            principal.clone(),
+            ssh_core::HostId::parse("demo-web").unwrap(),
+            ssh_core::RoleId::parse("operator").unwrap(),
+            ssh_core::session::Purpose::parse("inspect service health").unwrap(),
+            AccessClass::Privileged,
+        )
+        .await
+        .unwrap();
+    let intent = CommandIntent::parse("inspect service health").unwrap();
+    let outcome = bastion
+        .exec_intended(
+            &principal,
+            &session.id,
+            intent.clone(),
+            vec!["check".into()],
+        )
+        .await
+        .unwrap();
+    let Executed::AwaitingApproval { asked, .. } = outcome else {
+        panic!("review required")
+    };
+    bastion
+        .decide(
+            &asked.asked().id,
+            Approver::Human {
+                who: "chris".into(),
+            },
+            true,
+        )
+        .unwrap();
+    // Newer retained requests must not hide an older uncollected approval.
+    for index in 0..24 {
+        let command =
+            ssh_core::command::Command::new(vec!["other".into(), index.to_string()]).unwrap();
+        let decision = ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged)
+            .decide(&session, command);
+        bastion
+            .ledger()
+            .record_intent(decision, intent.clone())
+            .unwrap();
+    }
+    let app = routes(bastion).layer(axum::Extension(Operator("chris".into())));
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/activity?view=waiting_agent")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(body.matches("data-operation=").count(), 1);
+    assert!(body.contains("Waiting for agent"));
+    assert!(body.contains("1 matching operations"));
 }
