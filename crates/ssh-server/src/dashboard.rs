@@ -3627,6 +3627,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fixed_observation_keeps_its_original_service_instance_when_unavailable() {
+        let bastion = operations_bastion();
+        let mut old = bastion.ledger().instance_id().to_owned();
+        old.replace_range(..1, if old.starts_with('0') { "1" } else { "0" });
+        let app = routes(bastion).layer(axum::Extension(Operator("chris".into())));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!(
+                        "/activity?source=current&instance={old}&service_start=1&service_end=2"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("belongs to an earlier service instance"));
+        assert!(body.contains(&format!("instance={old}")));
+    }
+
+    #[tokio::test]
+    async fn saved_live_state_exports_are_explicitly_unsupported() {
+        let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
+            .layer(axum::Extension(Operator("chris".into())));
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair(
+                "investigation",
+                "/dashboard/activity?source=history&view=waiting",
+            )
+            .append_pair("scope", "range")
+            .finish();
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/activity/export?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("cannot be established from saved history"));
+        assert!(!body.contains("ready"));
+    }
+
+    #[tokio::test]
     async fn evidence_exports_freeze_identities_and_make_output_an_explicit_choice() {
         let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
             .layer(axum::Extension(Operator("chris".into())));

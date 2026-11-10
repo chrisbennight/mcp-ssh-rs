@@ -540,6 +540,7 @@ async fn completion_time_page_exports_keep_the_displayed_operation_identity() {
         .append_pair("scope", "page")
         .finish();
     let response = app
+        .clone()
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!("/activity/export?{query}"))
@@ -569,4 +570,56 @@ async fn completion_time_page_exports_keep_the_displayed_operation_identity() {
             .and_then(serde_json::Value::as_str),
         Some(digest.as_str())
     );
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "investigation",
+            &format!("/dashboard/activity?{params}&before=1"),
+        )
+        .append_pair("scope", "range")
+        .finish();
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/activity/export?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 3 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value.pointer("/manifest/exported_operations"),
+        Some(&serde_json::json!(1))
+    );
+    assert!(
+        value
+            .pointer("/manifest/definition/filters/before")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn attention_includes_a_successful_completion_with_retired_request_evidence() {
+    let (bastion, _) = populated().await;
+    let completion = bastion
+        .ledger()
+        .entries()
+        .into_iter()
+        .rev()
+        .find(|entry| matches!(entry.event, ssh_core::audit::Event::Completed { .. }))
+        .unwrap();
+    bastion.ledger().seal_before(completion.sequence);
+    let app = routes(bastion).layer(axum::Extension(Operator("demo-operator".into())));
+    let body = get_html(app, "/activity?source=current&view=attention").await;
+    assert!(body.contains(&format!(
+        "data-operation=\"{}\"",
+        completion.digest.as_str()
+    )));
+    assert!(body.contains("Original request evidence unavailable"));
 }

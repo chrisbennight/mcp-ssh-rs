@@ -37,7 +37,7 @@
       url.search = new URLSearchParams(new FormData(form)).toString();
       const response = await fetch(url, { credentials: "same-origin", cache: "no-store", redirect: "error" });
       if (!response.ok) {
-        status.textContent = response.status === 413 ? "Limit reached. Narrow the range or exclude output previews." : "Preparation failed. Check source availability and sign-in, narrow the range, or retry.";
+        status.textContent = response.status === 422 ? "This live-state filter is unavailable in saved history. Choose Current service or a recorded-outcome filter." : response.status === 413 ? "Limit reached. Narrow the range or exclude output previews." : "Preparation failed. Check source availability and sign-in, narrow the range, or retry.";
         return;
       }
       const outcome = response.headers.get("x-export-status");

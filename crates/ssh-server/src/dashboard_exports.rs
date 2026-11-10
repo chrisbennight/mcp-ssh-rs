@@ -260,10 +260,14 @@ where
                 break;
             }
         };
+        if page.unsupported {
+            return (StatusCode::UNPROCESSABLE_ENTITY,"This live-state filter cannot be established from saved history. Choose Current service or a recorded-outcome filter.").into_response();
+        }
         if page_number == 0 {
             source.clone_from(&page.source);
             if let Some(normalized) = parse_investigation(&page.investigation) {
                 snapshot.source.clone_from(&normalized.source);
+                snapshot.before = normalized.before;
                 snapshot.start = normalized.start;
                 snapshot.end = normalized.end;
                 snapshot.service_start = normalized.service_start;

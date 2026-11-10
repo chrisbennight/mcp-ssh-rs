@@ -364,7 +364,8 @@ impl Current {
             row.assessment,
             Some(EvaluationVerdict::DoesNotSupportIntent | EvaluationVerdict::Uncertain)
         );
-        let attention = row.approval == state::Approval::AwaitingDecision
+        let attention = row.missing_request
+            || row.approval == state::Approval::AwaitingDecision
             || row.execution.failed()
             || row.execution.unknown()
             || row.execution.missing()

@@ -444,6 +444,7 @@ struct ActivityPage {
     page_size: usize,
     matching: Option<usize>,
     available: bool,
+    unsupported: bool,
     limited: bool,
     scanned: usize,
     investigation: String,
@@ -1080,7 +1081,14 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
         || !query.approval.is_empty()
         || !query.assessment.is_empty()
         || query.time_basis == "completed";
-    let (mut operations, next, mut notice) = if source == "history" {
+    let unsupported = source == "history"
+        && (matches!(query.view.as_str(), "waiting" | "waiting_agent" | "running")
+            || matches!(query.approval.as_str(), "waiting" | "expired"));
+    let (mut operations, next, notice) = if unsupported {
+        available = false;
+        limited = true;
+        (Vec::new(),None,"Current waiting, running and expired states cannot be established from saved records. Choose Current service for live state.".to_owned())
+    } else if source == "history" {
         let window = match window_value(Some(query.window.clone())) {
             Ok((_, window)) => window,
             Err(()) => return Err(ActivityError::InvalidFilters),
@@ -1201,12 +1209,6 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
         };
         (operations, current_next, notice.to_owned())
     };
-    if source == "history"
-        && (matches!(query.view.as_str(), "waiting" | "waiting_agent" | "running")
-            || matches!(query.approval.as_str(), "waiting" | "expired"))
-    {
-        notice.push_str(" Current waiting, running and expired states cannot be established from saved records. Choose Current service for live state.");
-    }
     operations.retain(|row| row.matches_view(&query));
     let mut snapshot = query.clone();
     snapshot.source = source.to_owned();
@@ -1223,7 +1225,9 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
                 .unwrap_or(observations.now.saturating_sub(duration)),
         );
         snapshot.service_end = Some(query.service_end.unwrap_or(observations.now));
-        snapshot.instance.clone_from(&observations.instance);
+        if query.instance.is_empty() {
+            snapshot.instance.clone_from(&observations.instance);
+        }
     }
     let investigation = snapshot.url(source, query.before);
     let page_ids = operations
@@ -1310,6 +1314,7 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
         },
         matching: (source == "current").then_some(observations.matches),
         available,
+        unsupported,
         limited,
         scanned,
         investigation,
