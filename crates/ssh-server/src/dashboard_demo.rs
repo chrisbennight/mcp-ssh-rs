@@ -132,6 +132,7 @@ impl ReadsAudit for DemoHistory {
     > {
         Box::pin(async move {
             Ok(audit_history::TranscriptPage {
+                evidence_limited: false,
                 entries: self
                     .entries()
                     .into_iter()

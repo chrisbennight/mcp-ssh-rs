@@ -356,6 +356,22 @@ fn shown(
             confidence: evaluation.confidence,
             side_effects: evaluation.side_effects,
         });
+        let cancellation = if related.iter().any(|entry| {
+            entry.session == decision.session
+                && wire_event_name(&entry.event) == "cancellation_requested"
+                && (wire_u64(&entry.event, "decided") == Some(decision.sequence)
+                    || related.iter().any(|approval| {
+                        approval.session == decision.session
+                            && wire_event_name(&approval.event) == "approved"
+                            && wire_u64(&approval.event, "decided") == Some(decision.sequence)
+                            && wire_u64(&entry.event, "decided") == Some(approval.sequence)
+                    }))
+        }) {
+            "Cancellation requested · see observed result; request does not confirm termination"
+                .to_owned()
+        } else {
+            String::new()
+        };
         let attention = completion.is_some_and(|entry| {
             let state = wire_string(&entry.event, "state").unwrap_or("");
             state != "exit 0" && state != "Exited { code: 0 }"
@@ -380,7 +396,7 @@ fn shown(
             arguments: journey.command,
             kind,
             progress: String::new(),
-            cancellation: String::new(),
+            cancellation,
             evidence: source.to_owned(),
             human_answer: journey.human_answer,
             authorization: journey.authorization,
@@ -500,7 +516,7 @@ where
                 query.start = Some(page.window_start);
                 query.end = Some(page.window_end);
                 (shown(&page.entries, &query, source, query.before.unwrap_or(page.window_end), page.window_start, page.window_end), page.next_before,
-                    "Saved history · requested in the selected window. Related evidence may have later timestamps.".to_owned())
+                    if page.evidence_limited { "Saved history · cancellation evidence reached the retrieval limit; some requests may be missing. Other related evidence is shown.".to_owned() } else { "Saved history · requested in the selected window. Related evidence may have later timestamps.".to_owned() })
             }
             Err(_) => (Vec::new(), None, "Saved history unavailable. Current service activity and session controls remain available.".to_owned()),
         }
@@ -529,7 +545,10 @@ where
                         progress.stderr_bytes,
                         progress.transfer_bytes_read
                     );
-                    row.cancellation = cancellation_status(progress.cancellation).to_owned();
+                    let observed = cancellation_status(progress.cancellation);
+                    if !observed.is_empty() {
+                        row.cancellation = observed.to_owned();
+                    }
                 } else if waiting.iter().any(|request| {
                     request.session.as_str() == row.session && request.decided == decision.sequence
                 }) {
@@ -639,6 +658,21 @@ mod tests {
         let rows = shown(&entries, &ActivityQuery::default(), "history", 1, 0, 1);
         let first = rows.iter().find(|row| row.session == session).unwrap();
         assert_eq!(first.status, "Completed · exit 0");
+        let mut cancelled = entries.clone();
+        cancelled.push(entry(
+            session,
+            3,
+            'e',
+            json!({"event":"cancellation_requested","decided":1}),
+        ));
+        let rows = shown(&cancelled, &ActivityQuery::default(), "history", 1, 0, 1);
+        assert!(
+            rows.iter()
+                .find(|row| row.session == session)
+                .unwrap()
+                .cancellation
+                .contains("Cancellation requested")
+        );
         let second = rows.iter().find(|row| row.session == other).unwrap();
         assert!(second.status.contains("7"));
     }

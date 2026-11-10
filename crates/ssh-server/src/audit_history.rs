@@ -87,6 +87,7 @@ pub struct TranscriptPage {
     /// follow an older decision, so later pages continue to query through this
     /// edge rather than stopping at the decision cursor.
     pub window_end: u64,
+    pub evidence_limited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,6 +299,7 @@ impl Loki {
                 next_before,
                 window_start: start,
                 window_end,
+                evidence_limited: false,
             });
         }
 
@@ -357,6 +359,7 @@ impl Loki {
             next_before,
             window_start: start,
             window_end,
+            evidence_limited: false,
         })
     }
 
@@ -390,6 +393,7 @@ impl Loki {
             .fetch(expression, start, decision_end, FETCH_LIMIT)
             .await?;
         let next_before = collision_safe_page(&mut decisions)?;
+        let mut evidence_limited = false;
         if !decisions.is_empty() {
             let maximum = decisions.len().saturating_mul(6);
             let mut related = self
@@ -423,6 +427,24 @@ impl Loki {
                 }
                 related.append(&mut completions);
             }
+            let mut cancellation_keys = decisions.clone();
+            cancellation_keys.extend(approvals);
+            let maximum = PAGE_SIZE.saturating_mul(8);
+            let mut cancellations = self
+                .fetch(
+                    format!(
+                        "{} |= {}",
+                        operation_relation_pattern(&cancellation_keys, true),
+                        logql_string(&json_fragment("event", "cancellation_requested"))
+                    ),
+                    start,
+                    window_end,
+                    maximum.saturating_add(1),
+                )
+                .await?;
+            evidence_limited = cancellations.len() > maximum;
+            cancellations.truncate(maximum);
+            related.append(&mut cancellations);
             decisions.append(&mut related);
         }
         let mut seen = HashSet::new();
@@ -434,6 +456,7 @@ impl Loki {
             next_before,
             window_start: start,
             window_end,
+            evidence_limited,
         })
     }
 
@@ -1059,6 +1082,19 @@ fn transcript_relation_logql(session: &SessionId, pattern: &str) -> String {
 }
 
 fn operation_relations_logql(entries: &[Entry], completions: bool) -> String {
+    let events = if completions {
+        "\"event\":\"completed\""
+    } else {
+        "\"event\":\"(approved|answered|completed|evaluated)\""
+    };
+    format!(
+        "{} |~ {}",
+        operation_relation_pattern(entries, completions),
+        logql_string(events)
+    )
+}
+
+fn operation_relation_pattern(entries: &[Entry], completions: bool) -> String {
     // Session IDs and digests have already passed the reader's strict
     // validation. Bind each sequence to its session across service lifetimes.
     let patterns: Vec<_> = entries
@@ -1417,6 +1453,11 @@ mod tests {
                                 "stderr":{"kind":"kept","text":"","truncated":false,"bytes":0}
                             }), 'c')
                         }
+                        3 => {
+                            assert!(expression.contains("cancellation_requested"));
+                            let values = (13_u64..=15).map(|sequence| [sequence.saturating_add(160).to_string(), event_line(sequence, serde_json::json!({"event":"cancellation_requested", "run":"abcdef0123456789-abcdef0123456789abcdef0123456789", "decided":11}), char::from(b'1' + u8::try_from(sequence - 13).unwrap()))]).collect::<Vec<_>>();
+                            return axum::Json(serde_json::json!({"status":"success", "data":{"resultType":"streams", "result":[{"stream":{}, "values":values}]}}));
+                        }
                         _ => panic!("unbounded operation query"),
                     };
                     axum::Json(serde_json::json!({
@@ -1445,13 +1486,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
         assert_eq!(
             page.entries
                 .iter()
                 .map(|entry| entry.sequence)
                 .collect::<Vec<_>>(),
-            vec![12, 11, 10]
+            vec![15, 14, 13, 12, 11, 10]
         );
         assert_eq!(page.window_end, 200);
     }

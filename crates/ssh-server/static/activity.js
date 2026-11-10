@@ -7,7 +7,7 @@
   if (!results || !freshness || !pause || !apply) return;
   let paused = false, pending = null, inFlight = false;
   const fingerprint = node => Array.from(node.querySelectorAll("[data-operation]"))
-    .map(row => row.dataset.operation + ":" + row.dataset.state).join("|");
+    .map(row => row.dataset.operation + ":" + row.textContent).join("|");
   const install = next => {
     const open = new Set(Array.from(results.querySelectorAll("details[open]")).map(row => row.id));
     results.replaceChildren(...Array.from(next.childNodes).map(node => document.importNode(node, true)));
