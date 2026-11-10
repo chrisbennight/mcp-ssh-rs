@@ -377,6 +377,7 @@ impl Loki {
         }
         let mut filters = query.filters.clone();
         filters.event = "decided".to_owned();
+        filters.text.clear();
         let mut expression = logql(&filters);
         if !query.kind.is_empty() {
             if query.kind == "files" {
@@ -384,10 +385,25 @@ impl Loki {
                 expression.push_str(&logql_string(
                     "\"operation\":\"(upload|download|stat|list|checksum)\"",
                 ));
+            } else if query.kind == "execute" {
+                expression.push_str(" !~ ");
+                expression.push_str(&logql_string(
+                    "\"operation\":\"(upload|download|stat|list|checksum)\"",
+                ));
             } else {
                 expression.push_str(" |= ");
                 expression.push_str(&logql_string(&json_fragment("operation", &query.kind)));
             }
+        }
+        if !query.filters.text.is_empty() {
+            let encoded = serde_json::to_string(&query.filters.text)
+                .map_err(|_| ReadError::MalformedResponse)?;
+            let content = encoded
+                .strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'))
+                .ok_or(ReadError::MalformedResponse)?;
+            expression.push_str(" |= ");
+            expression.push_str(&logql_string(content));
         }
         let mut decisions = self
             .fetch(expression, start, decision_end, FETCH_LIMIT)
@@ -1414,6 +1430,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_operation_search_hydrates_evidence_without_searching_the_result_text() {
+        const NEEDLE: &str = r#"needle "quoted" \ path"#;
         let calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new().route("/loki/api/v1/query_range", get({
             let calls = Arc::clone(&calls);
@@ -1427,11 +1444,15 @@ mod tests {
                         0 => {
                             assert!(expression.contains("needle"));
                             assert_eq!(params.get("end").map(String::as_str), Some("100"));
-                            (90, 10, serde_json::json!({
-                                "event":"decided", "operation":"execute", "agent_intent":"inspect",
-                                "argv":["printf","needle"], "program":"printf", "access_class":"read_only",
+                            let event = serde_json::json!({
+                                "event":"decided", "agent_intent":"inspect",
+                                "argv":["printf",NEEDLE], "program":"printf", "access_class":"read_only",
                                 "purpose":"diagnose", "verdict":"needs_approval", "policies":["default"]
-                            }), 'd')
+                            });
+                            let term: String = serde_json::from_str(expression.rsplit(" |= ").next().unwrap()).unwrap();
+                            assert!(event_line(10, event.clone(), 'd').contains(&term), "the saved text predicate must match the serialized legacy command");
+                            assert!(expression.contains(" !~ "), "Commands must include legacy decisions without an operation field");
+                            (90, 10, event, 'd')
                         }
                         1 => {
                             assert!(!expression.contains("needle"));
@@ -1476,12 +1497,12 @@ mod tests {
         let page = reader
             .operations(&OperationQuery {
                 filters: Query {
-                    text: "needle".to_owned(),
+                    text: NEEDLE.to_owned(),
                     before: Some(100),
                     start: Some(1),
                     ..Default::default()
                 },
-                kind: String::new(),
+                kind: "execute".to_owned(),
                 end: Some(200),
             })
             .await

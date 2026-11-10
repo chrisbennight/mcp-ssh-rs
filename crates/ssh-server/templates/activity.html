@@ -17,10 +17,11 @@
 <main id="main-content" tabindex="-1">
 <header class="topbar"><h1>Activity</h1><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header>
 <div class="content">
+<div id="session-context">
 {% match current %}{% when Some with (session) %}
 <section class="context-strip" aria-label="Session context">
 <div><h2>{{ session.host }} / {{ session.role }}</h2><p>{{ session.principal }} · {{ session.status }} · {{ session.running }} running · {{ session.waiting }} awaiting decision</p></div>
-<details><summary>Session context and controls</summary>
+<details id="session-controls"><summary>Session context and controls</summary>
 <p><strong>Agent-supplied purpose:</strong> {{ session.purpose }}</p>
 <p>Opened {{ session.opened_at }} · session last used {{ session.last_used }} · expires in {{ session.ends_by }}</p>
 <p>Configured class: <span class="mono">{{ session.access_class }}</span> · {{ session.slots }} / {{ session.limit }} session slots used by this principal</p>
@@ -36,6 +37,7 @@
 </details>
 </section>
 {% when None %}{% if !query.session.is_empty() %}<p class="notice">This session is no longer held by this service. Retained or saved evidence may still be available.</p>{% endif %}{% endmatch %}
+</div>
 <form class="activity-filters" method="get" action="/dashboard/activity">
 <input type="hidden" name="source" value="{{ source }}">
 {% if !query.session.is_empty() %}<input type="hidden" name="session" value="{{ query.session }}">{% endif %}
