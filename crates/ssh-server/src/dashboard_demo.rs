@@ -302,8 +302,8 @@ async fn commands_after_session_approval_are_present_in_history() {
     }
     assert_eq!(
         seen.len(),
-        27,
-        "initial approval request plus 26 executions"
+        26,
+        "the approval request and its collection remain one operation"
     );
     assert_eq!(
         completed, 26,
@@ -432,4 +432,194 @@ async fn serve_browser_review() {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn waiting_for_agent_is_selected_before_the_page_limit() {
+    let (bastion, _) = populated().await;
+    let principal = ssh_core::PrincipalId::parse("agent").unwrap();
+    let session = bastion
+        .open_session(
+            principal.clone(),
+            ssh_core::HostId::parse("demo-web").unwrap(),
+            ssh_core::RoleId::parse("operator").unwrap(),
+            ssh_core::session::Purpose::parse("inspect service health").unwrap(),
+            AccessClass::Privileged,
+        )
+        .await
+        .unwrap();
+    let intent = CommandIntent::parse("inspect service health").unwrap();
+    let outcome = bastion
+        .exec_intended(
+            &principal,
+            &session.id,
+            intent.clone(),
+            vec!["check".into()],
+        )
+        .await
+        .unwrap();
+    let Executed::AwaitingApproval { asked, .. } = outcome else {
+        panic!("review required")
+    };
+    bastion
+        .decide(
+            &asked.asked().id,
+            Approver::Human {
+                who: "chris".into(),
+            },
+            true,
+        )
+        .unwrap();
+    // Newer retained requests must not hide an older uncollected approval.
+    for index in 0..24 {
+        let command =
+            ssh_core::command::Command::new(vec!["other".into(), index.to_string()]).unwrap();
+        let decision = ssh_core::policy::Engine::new(ssh_core::policy::ReviewMode::Privileged)
+            .decide(&session, command);
+        bastion
+            .ledger()
+            .record_intent(decision, intent.clone())
+            .unwrap();
+    }
+    let app = routes(bastion).layer(axum::Extension(Operator("chris".into())));
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/activity?view=waiting_agent")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(body.matches("data-operation=").count(), 1);
+    assert!(body.contains("Waiting for agent"));
+    assert!(body.contains("1 matching operations"));
+}
+
+#[tokio::test]
+async fn completion_time_page_exports_keep_the_displayed_operation_identity() {
+    let (bastion, _) = populated().await;
+    let entries = bastion.ledger().entries();
+    let (root, completion) = entries
+        .iter()
+        .find_map(|completion| {
+            let ssh_core::audit::Event::Completed { decided, .. } = &completion.event else {
+                return None;
+            };
+            let authority = entries.iter().find(|entry| entry.sequence == *decided)?;
+            let root = if let ssh_core::audit::Event::Approved { decided, .. } = &authority.event {
+                entries.iter().find(|entry| entry.sequence == *decided)?
+            } else {
+                authority
+            };
+            (root.at < completion.at).then_some((root, completion))
+        })
+        .expect("loopback fixture contains a request before its completion");
+    let digest = root.digest.as_str().to_owned();
+    let params = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("source", "current")
+        .append_pair("time_basis", "completed")
+        .append_pair("service_start", &completion.at.to_string())
+        .append_pair("service_end", &completion.at.to_string())
+        .append_pair("instance", bastion.ledger().instance_id())
+        .finish();
+    let app = routes(bastion).layer(axum::Extension(Operator("demo-operator".into())));
+    let page = get_html(app.clone(), &format!("/activity?{params}")).await;
+    assert!(page.contains(&format!("data-operation=\"{digest}\"")));
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("investigation", &format!("/dashboard/activity?{params}"))
+        .append_pair("page_ids", &digest)
+        .append_pair("scope", "page")
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/activity/export?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 3 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value.pointer("/manifest/exported_operations"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(
+        value.pointer("/manifest/missing_selected_ids"),
+        Some(&serde_json::json!([]))
+    );
+    assert_eq!(
+        value
+            .pointer("/operations/0/id")
+            .and_then(serde_json::Value::as_str),
+        Some(digest.as_str())
+    );
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(
+            "investigation",
+            &format!("/dashboard/activity?{params}&before=1"),
+        )
+        .append_pair("scope", "range")
+        .finish();
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/activity/export?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 3 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value.pointer("/manifest/exported_operations"),
+        Some(&serde_json::json!(1))
+    );
+    assert!(
+        value
+            .pointer("/manifest/definition/filters/before")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn attention_includes_a_successful_completion_with_retired_request_evidence() {
+    let (bastion, _) = populated().await;
+    let completion = bastion
+        .ledger()
+        .entries()
+        .into_iter()
+        .rev()
+        .find(|entry| matches!(entry.event, ssh_core::audit::Event::Completed { .. }))
+        .unwrap();
+    bastion.ledger().seal_before(completion.sequence);
+    let app = routes(bastion).layer(axum::Extension(Operator("demo-operator".into())));
+    let body = get_html(app, "/activity?source=current&view=attention").await;
+    assert!(body.contains(&format!(
+        "data-operation=\"{}\"",
+        completion.digest.as_str()
+    )));
+    assert!(body.contains("Original request evidence unavailable"));
 }

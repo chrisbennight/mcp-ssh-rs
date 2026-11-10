@@ -142,7 +142,7 @@ pub(crate) enum Payload {
 }
 
 /// A bounded failure category safe to return without server or filesystem error text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Failure {
     NotFound,

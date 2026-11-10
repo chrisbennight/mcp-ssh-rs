@@ -142,8 +142,8 @@ pub struct Stream {
 }
 
 /// Where an execution has got to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunState {
     /// Still going. The same run can be asked about again.
     Running,

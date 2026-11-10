@@ -662,81 +662,10 @@ impl<C: Clock> Approvals<C> {
             _ => None,
         });
 
-        // An agreement already given for this exact command is spent here. The
-        // caller does not have to have kept the request identifier: an agent
-        // discovers the answer by retrying the command, and the command is what
-        // the approval was given for, so the command is enough to find it.
-        let agreed = requests
-            .iter()
-            .find(|(_, held)| {
-                held.asked.session == session.id
-                    && held.asked.principal == session.principal
-                    && held.action == action
-                    && matches!(held.state, State::Approved { recorded: true, .. })
-                    && now < held.redeem_by
-            })
-            .map(|(id, _)| id.clone());
-        if let Some(id) = agreed
-            && let Some(held) = requests.get_mut(&id)
-            && let State::Approved { by, .. } = &held.state
+        if let Some(existing) =
+            Self::existing_action_with(&mut requests, session, &action, now, consume)?
         {
-            let ready = consume(Grant {
-                _proof: held.proof.clone(),
-                request: RequestId(id),
-                session: held.asked.session.clone(),
-                approver: by.clone(),
-                action: held.action.clone(),
-                decided: held.asked.decided,
-                decided_digest: held.asked.decided_digest.clone(),
-            })?;
-            held.state = State::Redeemed;
-            held.proof = None;
-            return Ok(Standing::Ready(Box::new(ready)));
-        }
-
-        // A standing refusal is the answer, not an invitation to ask again.
-        if let Some(refused) = requests.values().find(|held| {
-            held.asked.session == session.id
-                && held.action == action
-                && matches!(held.state, State::Refused { .. })
-        }) {
-            let State::Refused { by } = &refused.state else {
-                unreachable!("just matched on a refusal")
-            };
-            return Ok(Standing::Refused { by: by.clone() });
-        }
-
-        // An agreement whose answer is not yet in the record reads as still
-        // waiting: collectable it is not, and telling the caller anything else
-        // would either run a command the record has no entry for or queue a
-        // duplicate request in front of a human.
-        if let Some(existing) = requests.values().find(|held| {
-            held.asked.session == session.id
-                && held.action == action
-                && matches!(
-                    held.state,
-                    State::Waiting
-                        | State::Approved {
-                            recorded: false,
-                            ..
-                        }
-                )
-        }) {
-            if matches!(
-                existing.state,
-                State::Approved {
-                    recorded: false,
-                    ..
-                }
-            ) {
-                tracing::warn!(
-                    request = existing.asked.id.as_str(),
-                    "an agreement was asked for before its answer was recorded; withheld"
-                );
-            }
-            return Ok(Standing::Waiting(Box::new(Ask::Pending(
-                existing.asked.clone(),
-            ))));
+            return Ok(existing);
         }
 
         // Counted after the retry path above: asking again about something
@@ -792,6 +721,116 @@ impl<C: Clock> Approvals<C> {
             });
         }
         Ok(Standing::Waiting(Box::new(Ask::New(asked))))
+    }
+
+    /// Resumes an exact existing request without recording a second decision.
+    pub(crate) fn retry_existing_action<R, E: From<ApprovalError>>(
+        &self,
+        session: &crate::session::Session,
+        action: &crate::action::Action,
+        intent: &CommandIntent,
+        consume: impl FnOnce(Grant) -> Result<R, E>,
+    ) -> Result<Option<Standing<R>>, E> {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = self.clock.now();
+        requests.retain(|_, held| !held.forgettable(now));
+        Self::existing_action_with(
+            &mut requests,
+            session,
+            &digest_action(action, intent),
+            now,
+            consume,
+        )
+    }
+
+    fn existing_action_with<R, E: From<ApprovalError>>(
+        requests: &mut HashMap<String, Held>,
+        session: &crate::session::Session,
+        action: &str,
+        now: Millis,
+        consume: impl FnOnce(Grant) -> Result<R, E>,
+    ) -> Result<Option<Standing<R>>, E> {
+        // An agreement already given for this exact command is spent here. The
+        // caller does not have to have kept the request identifier: an agent
+        // discovers the answer by retrying the command, and the command is what
+        // the approval was given for, so the command is enough to find it.
+        let agreed = requests
+            .iter()
+            .find(|(_, held)| {
+                held.asked.session == session.id
+                    && held.asked.principal == session.principal
+                    && held.action == action
+                    && matches!(held.state, State::Approved { recorded: true, .. })
+                    && now < held.redeem_by
+            })
+            .map(|(id, _)| id.clone());
+        if let Some(id) = agreed
+            && let Some(held) = requests.get_mut(&id)
+            && let State::Approved { by, .. } = &held.state
+        {
+            let ready = consume(Grant {
+                _proof: held.proof.clone(),
+                request: RequestId(id),
+                session: held.asked.session.clone(),
+                approver: by.clone(),
+                action: held.action.clone(),
+                decided: held.asked.decided,
+                decided_digest: held.asked.decided_digest.clone(),
+            })?;
+            held.state = State::Redeemed;
+            held.proof = None;
+            return Ok(Some(Standing::Ready(Box::new(ready))));
+        }
+
+        // A standing refusal is the answer, not an invitation to ask again.
+        if let Some(refused) = requests.values().find(|held| {
+            held.asked.session == session.id
+                && held.action == action
+                && matches!(held.state, State::Refused { .. })
+        }) {
+            let State::Refused { by } = &refused.state else {
+                unreachable!("just matched on a refusal")
+            };
+            return Ok(Some(Standing::Refused { by: by.clone() }));
+        }
+
+        // An agreement whose answer is not yet in the record reads as still
+        // waiting: collectable it is not, and telling the caller anything else
+        // would either run a command the record has no entry for or queue a
+        // duplicate request in front of a human.
+        if let Some(existing) = requests.values().find(|held| {
+            held.asked.session == session.id
+                && held.action == action
+                && matches!(
+                    held.state,
+                    State::Waiting
+                        | State::Approved {
+                            recorded: false,
+                            ..
+                        }
+                )
+        }) {
+            if matches!(
+                existing.state,
+                State::Approved {
+                    recorded: false,
+                    ..
+                }
+            ) {
+                tracing::warn!(
+                    request = existing.asked.id.as_str(),
+                    "an agreement was asked for before its answer was recorded; withheld"
+                );
+            }
+            return Ok(Some(Standing::Waiting(Box::new(Ask::Pending(
+                existing.asked.clone(),
+            )))));
+        }
+
+        Ok(None)
     }
 
     /// Records a decision.

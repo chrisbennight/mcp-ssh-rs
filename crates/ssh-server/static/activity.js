@@ -1,5 +1,16 @@
 "use strict";
 (() => {
+  const formatTimes = (root = document) => {
+    for (const node of root.querySelectorAll("[data-epoch]")) {
+      const seconds = Number(node.dataset.epoch);
+      if (Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= 4294967295) {
+        const iso = new Date(seconds * 1000).toISOString();
+        node.dateTime = iso;
+        node.textContent = iso.replace("T", " ").replace(".000Z", " UTC");
+      }
+    }
+  };
+  formatTimes();
   const results = document.getElementById("activity-results");
   const freshness = document.getElementById("freshness");
   const pause = document.getElementById("pause-updates");
@@ -18,10 +29,15 @@
       const open = new Set(Array.from(region.querySelectorAll("details[open][id]")).map(row => row.id));
       region.replaceChildren(...Array.from(next[index].childNodes).map(node => document.importNode(node, true)));
       for (const row of region.querySelectorAll("details[id]")) if (open.has(row.id)) row.open = true;
+      if (region.id === "activity-results") {
+        if (next[index].dataset.investigation) region.dataset.investigation = next[index].dataset.investigation;
+        if (next[index].dataset.pageIds !== undefined) region.dataset.pageIds = next[index].dataset.pageIds;
+      }
     });
     pending = null;
     apply.hidden = true;
     freshness.textContent = "Updated just now";
+    document.dispatchEvent(new CustomEvent("activity-updated"));
   };
   pause.hidden = false;
   pause.addEventListener("click", () => {
@@ -40,6 +56,7 @@
       const response = await fetch(location.href, { credentials: "same-origin", cache: "no-store" });
       if (!response.ok || response.redirected) throw new Error("Activity unavailable");
       const page = new DOMParser().parseFromString(await response.text(), "text/html");
+      formatTimes(page);
       const next = page.getElementById("activity-results");
       if (!next || next.dataset.source !== results.dataset.source) throw new Error("Activity unavailable");
       const nextRegions = regions.map(region => page.getElementById(region.id));

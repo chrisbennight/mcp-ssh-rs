@@ -355,6 +355,7 @@ pub enum Event {
         /// join without guessing from timing.
         decided: u64,
         state: String,
+        outcome: crate::run::RunState,
         stdout: Recorded,
         stderr: Recorded,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -730,6 +731,10 @@ impl Issued {
 }
 
 impl<C: Clock> Ledger<C> {
+    /// Identifies this record's lifetime when restoring a fixed observation.
+    pub fn instance_id(&self) -> &str {
+        self.genesis.as_str()
+    }
     #[must_use]
     pub fn new(clock: C) -> Self {
         let genesis = Digest::genesis();
@@ -863,14 +868,21 @@ impl<C: Clock> Ledger<C> {
         intended: &Intended,
         grant: Grant,
     ) -> Result<(Receipt, Approver), AuditError> {
+        self.record_existing_approval(intended.decision(), intended.agent_intent(), grant)
+    }
+
+    /// A retry uses the grant's original decision proof and exact action identity.
+    pub(crate) fn record_existing_approval(
+        &self,
+        decision: &Decision,
+        agent_intent: &CommandIntent,
+        grant: Grant,
+    ) -> Result<(Receipt, Approver), AuditError> {
         let decided = grant.decided();
-        let decision = intended.decision();
         if decision.verdict() != Verdict::NeedsApproval {
             return Err(AuditError::NotHeldForApproval { sequence: decided });
         }
-        if grant.action()
-            != crate::approval::digest_action(decision.action(), intended.agent_intent())
-        {
+        if grant.action() != crate::approval::digest_action(decision.action(), agent_intent) {
             return Err(AuditError::NotItsApproval { sequence: decided });
         }
         let session = decision.session();
@@ -1077,6 +1089,7 @@ impl<C: Clock> Ledger<C> {
                 run: outcome.run().clone(),
                 decided: authorized.sequence(),
                 state: format!("{:?}", outcome.state()),
+                outcome: outcome.state(),
                 stdout: record_output(outcome.stdout()),
                 stderr: record_output(outcome.stderr()),
                 // An upload's source is kept here even though callers are not
@@ -1366,11 +1379,23 @@ impl<C: Clock> Ledger<C> {
                 _ => None,
             })
             .collect();
+        let decision_sequences = entries
+            .iter()
+            .filter(|entry| matches!(entry.event, Event::Decided { .. }))
+            .map(|entry| entry.sequence)
+            .collect::<HashSet<_>>();
+        let approved_origins = entries
+            .iter()
+            .filter_map(|entry| match &entry.event {
+                Event::Approved { decided, .. } => Some((entry.sequence, *decided)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut decisions: Vec<_> = entries
             .iter()
             .copied()
             .filter(|entry| {
-                matches!(entry.event, Event::Decided { .. })
+                (matches!(entry.event, Event::Decided { .. }) || matches!(&entry.event, Event::Completed { decided, .. } if !decision_sequences.contains(approved_origins.get(decided).unwrap_or(decided))))
                     && matches(entry)
                     && before.is_none_or(|before| entry.sequence < before)
             })
@@ -1387,7 +1412,7 @@ impl<C: Clock> Ledger<C> {
             .iter()
             .map(|entry| entry.digest.as_str())
             .collect();
-        let approvals: std::collections::HashSet<_> = entries
+        let mut approvals: std::collections::HashSet<_> = entries
             .iter()
             .filter_map(|entry| match &entry.event {
                 Event::Approved { decided, .. } if sequences.contains(decided) => {
@@ -1396,10 +1421,15 @@ impl<C: Clock> Ledger<C> {
                 _ => None,
             })
             .collect();
+        approvals.extend(decisions.iter().filter_map(|entry| match &entry.event {
+            Event::Completed { decided, .. } => Some(*decided),
+            _ => None,
+        }));
         let selected = entries
             .into_iter()
             .filter(|entry| {
                 sequences.contains(&entry.sequence)
+                    || approvals.contains(&entry.sequence)
                     || match &entry.event {
                         Event::Answered { decided, .. } | Event::Approved { decided, .. } => {
                             sequences.contains(decided)
@@ -2591,6 +2621,10 @@ mod tests {
             .expect("a run outlived the retention of its decision");
         assert_eq!(completion.entry.session, session.id);
         assert!(ledger.verify().is_ok());
+        let (operations, next) = ledger.operation_activity(None, 20, |_| true);
+        assert!(next.is_none());
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].digest, completion.entry.digest);
     }
 
     /// The digest identifies the entry, and that survives sealing. Another

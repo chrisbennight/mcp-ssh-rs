@@ -1,0 +1,6 @@
+{% macro detail(file) %}
+<dl>{% for field in file.fields %}<dt>{{ field.0 }}</dt><dd class="mono preserve">{{ field.1 }}</dd>{% endfor %}{% match file.modified %}{% when Some with (modified) %}<dt>Modified (UTC)</dt><dd><time data-epoch="{{ modified }}">{{ modified }} seconds since Unix epoch</time></dd>{% when None %}{% endmatch %}</dl>
+{% if !file.notice.is_empty() %}<p class="notice">{{ file.notice }}</p>{% endif %}
+{% if !file.entries.is_empty() %}<div class="directory-result" role="region" aria-label="Retained directory entries" tabindex="0"><table><thead><tr><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Bytes</th><th scope="col">Mode</th><th scope="col">Modified (UTC)</th></tr></thead><tbody>{% for entry in file.entries %}<tr><td class="mono">{{ entry.name }}</td><td>{{ entry.kind }}</td><td>{{ entry.bytes }}</td><td class="mono">{{ entry.permissions }}</td><td>{% match entry.modified %}{% when Some with (modified) %}<time data-epoch="{{ modified }}">{{ modified }} seconds since Unix epoch</time>{% when None %}Unavailable{% endmatch %}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+{% if !file.artifact.is_empty() %}<p class="muted">{{ file.artifact }}</p>{% endif %}
+{% endmacro %}

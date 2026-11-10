@@ -265,12 +265,44 @@ changes after inspecting an expanded operation. **Saved history** reads the
 configured log service. **Audit events** retains the individual-record view.
 Sources and missing evidence are labeled explicitly.
 
-Search commands, recorded context and paths, or filter by host, principal and
-operation type. Output contents are not searched. An initial approval request and
-the client's collection decision may still appear separately. State views narrow
-the displayed page; follow Older operations to inspect earlier requests.
-Current activity remains limited by retention and restart. Missing saved history
-does not disable current session controls.
+Search literal command arguments, intent, purpose, paths or recorded identifiers.
+Use **More filters** to narrow by account, request, run, session approval,
+approval status or advisory assessment. Choose whether the time range selects
+requests or completions. Saved run lookup depends on a recorded completion association through the fixed observation cutoff; an unresolved association is reported as incomplete, and later evidence is not imported into an earlier observation. Output contents are not searched. Scope chips remove
+one filter at a time. **Refresh time range** starts a new observation.
+
+Retries waiting for a human answer and the agent's later collection stay on one
+operation. A subsequent independent execution remains a distinct operation.
+Live state filters select across retained metadata before limiting the page.
+Saved state and identifier searches examine at most 100 source records per page;
+continue to older operations when offered. Identifier matches appear on the page
+of their newest matching evidence. Current waiting, running and expired states
+cannot be established from saved records. Missing evidence and unknown outcomes
+have separate labels. Current evidence remains limited by retention and restart;
+missing saved history does not disable current session controls.
+
+File operations show typed metadata, directory entries and transfer details when
+recorded. Withheld names, incomplete listings and unavailable artifact access are
+explicit. An operator evidence export does not grant access to an agent's file
+reference or retrieve remote file contents.
+
+**Reusable views** exports a versioned filter definition for later import.
+Recurring views reopen a relative time range; fixed investigations preserve the
+source and observation bounds. Fixed current-service observations depend on the
+same service instance. Device storage is optional, scoped to the signed-in
+operator and cleared with **Reset remembered views**. View links and definitions
+remain subject to dashboard authentication.
+
+**Export evidence** prepares a selected operation, the displayed page identities,
+or a filtered time range as JSON, CSV or a text report. Retained output previews
+require an explicit choice. Preparation is bounded to 500 operations, 2 MiB,
+25 source pages and 15 seconds, with two preparations at a time. The preparation
+status and file manifest distinguish ready, incomplete and limit-reached results;
+missing identities and source failures remain explicit. The file includes its
+query, provenance, coverage and original record digests. It is an operator
+projection rather than a full audit archive or full-chain verification. Downloads
+have a response content digest and are not cached; a prepared browser download
+expires after five minutes. CSV cells neutralize spreadsheet formulas.
 
 To recover a slot, open **End session…**, check the target and owner, and confirm.
 The session is removed and its SSH connection is disconnected. Running commands

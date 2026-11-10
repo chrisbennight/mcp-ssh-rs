@@ -4,6 +4,13 @@ use serde::Serialize;
 use ssh_core::audit::Event;
 use ssh_core::run::{Cancellation, RunState};
 
+#[path = "dashboard_current.rs"]
+mod current;
+
+#[path = "dashboard_exports.rs"]
+mod exports;
+pub(super) use exports::{export_activity, export_view};
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ActivityQuery {
@@ -19,6 +26,17 @@ pub(super) struct ActivityQuery {
     pub kind: String,
     pub view: String,
     pub selected: String,
+    pub role: String,
+    pub request: String,
+    pub agreement: String,
+    pub run: String,
+    pub approval: String,
+    pub assessment: String,
+    pub time_basis: String,
+    pub service_start: Option<u64>,
+    pub service_end: Option<u64>,
+    pub instance: String,
+    pub page_ids: String,
 }
 
 impl ActivityQuery {
@@ -35,16 +53,39 @@ impl ActivityQuery {
                 self.kind.as_str(),
                 "" | "execute" | "files" | "upload" | "download" | "stat" | "list" | "checksum"
             )
+            && state::Preset::parse(&self.view).is_some()
+            && self.role.len() <= 128
+            && (self.role.is_empty() || ssh_core::RoleId::parse(&self.role).is_ok())
+            && (self.request.is_empty()
+                || ssh_core::approval::RequestId::parse(&self.request).is_ok())
+            && (self.agreement.is_empty()
+                || ssh_core::approval::AgreementId::parse(&self.agreement).is_ok())
+            && (self.run.is_empty() || RunId::parse(&self.run).is_ok())
             && matches!(
-                self.view.as_str(),
-                "" | "waiting" | "running" | "attention" | "assessments"
+                self.approval.as_str(),
+                "" | "waiting" | "approved" | "refused" | "not_required" | "expired"
             )
+            && matches!(
+                self.assessment.as_str(),
+                "" | "supports_intent" | "does_not_support_intent" | "uncertain"
+            )
+            && matches!(self.time_basis.as_str(), "" | "requested" | "completed")
+            && self
+                .service_start
+                .zip(self.service_end)
+                .is_none_or(|(start, end)| start <= end)
+            && (self.instance.is_empty() || is_digest(&self.instance))
+            && self.page_ids.len() <= 4096
+            && (self.page_ids.is_empty()
+                || self.page_ids.split(',').count() <= 40
+                    && self.page_ids.split(',').all(is_digest))
     }
 
     fn matches(&self, entry: &ssh_core::audit::Entry) -> bool {
         if (!self.session.is_empty() && entry.session.as_str() != self.session)
             || (!self.host.is_empty() && entry.host.as_str() != self.host)
             || (!self.principal.is_empty() && entry.principal.as_str() != self.principal)
+            || (!self.role.is_empty() && entry.role.as_str() != self.role)
         {
             return false;
         }
@@ -83,6 +124,21 @@ impl ActivityQuery {
             ("kind", &self.kind),
             ("view", &self.view),
             ("selected", &self.selected),
+            ("role", &self.role),
+            ("request", &self.request),
+            ("agreement", &self.agreement),
+            ("run", &self.run),
+            ("approval", &self.approval),
+            ("assessment", &self.assessment),
+            ("time_basis", &self.time_basis),
+            (
+                "instance",
+                if source == "current" {
+                    &self.instance
+                } else {
+                    ""
+                },
+            ),
         ] {
             if !value.is_empty() {
                 pairs.append_pair(key, value);
@@ -99,6 +155,22 @@ impl ActivityQuery {
                 },
             ),
             ("end", if source == "history" { self.end } else { None }),
+            (
+                "service_start",
+                if source == "current" {
+                    self.service_start
+                } else {
+                    None
+                },
+            ),
+            (
+                "service_end",
+                if source == "current" {
+                    self.service_end
+                } else {
+                    None
+                },
+            ),
         ] {
             if let Some(value) = value {
                 pairs.append_pair(key, &value.to_string());
@@ -108,7 +180,21 @@ impl ActivityQuery {
     }
 }
 
-pub(super) fn investigation_return(value: &str) -> Option<String> {
+fn checksum_digest(info: Option<&ssh_core::files::FileInfo>) -> Option<&str> {
+    match info {
+        Some(ssh_core::files::FileInfo::Checksum { sha256, .. }) => Some(sha256),
+        _ => None,
+    }
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_investigation(value: &str) -> Option<ActivityQuery> {
     if value.len() > 4096 {
         return None;
     }
@@ -117,12 +203,14 @@ pub(super) fn investigation_return(value: &str) -> Option<String> {
         return None;
     }
     let Query(query) = Query::<ActivityQuery>::try_from_uri(&uri).ok()?;
-    query
-        .valid()
-        .then(|| query.url(&query.source, query.before))
+    query.valid().then_some(query)
 }
 
-#[derive(Serialize)]
+pub(super) fn investigation_return(value: &str) -> Option<String> {
+    parse_investigation(value).map(|query| query.url(&query.source, query.before))
+}
+
+#[derive(Default, Serialize)]
 struct OperationShown {
     id: String,
     session: String,
@@ -148,6 +236,182 @@ struct OperationShown {
     assessment: Option<AssessmentExport>,
     open: bool,
     attention: bool,
+    file: Option<files::FileShown>,
+    execution: state::Execution,
+    approval_state: state::Approval,
+    reasons: Vec<String>,
+    request: String,
+    run: String,
+    agreement: String,
+    requested_at: Option<u64>,
+    sequence: u64,
+    raw_arguments: Vec<String>,
+    assessment_verdict: Option<ssh_core::audit::EvaluationVerdict>,
+    missing_request: bool,
+    completed_at: Option<u64>,
+    raw_intent: String,
+    raw_purpose: String,
+    evidence_records: Vec<EvidenceShown>,
+    investigation: String,
+    session_url: String,
+    agreement_url: String,
+    file_info: Option<ssh_core::files::FileInfo>,
+    file_identity: Option<ArtifactMetadata>,
+}
+
+#[derive(Serialize)]
+struct ArtifactMetadata {
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct EvidenceShown {
+    sequence: u64,
+    digest: String,
+    previous: String,
+    recorded_at: u64,
+    event: String,
+    summary: String,
+}
+
+impl OperationShown {
+    fn needs_review(&self) -> bool {
+        self.approval_state == state::Approval::AwaitingDecision
+    }
+    fn classify(&mut self) {
+        self.status = self.execution.label();
+        self.reasons.clear();
+        if self.approval_state == state::Approval::AwaitingDecision {
+            self.reasons.push("Awaiting decision".to_owned());
+        }
+        if self.execution.failed()
+            || self.execution.unknown()
+            || self.execution.missing()
+            || matches!(self.execution, state::Execution::Observed(RunState::Ended))
+        {
+            self.reasons.push(self.status.clone());
+        }
+        if self.missing_request {
+            self.reasons
+                .push("Original request evidence unavailable".to_owned());
+        }
+        if matches!(
+            self.assessment_verdict,
+            Some(
+                ssh_core::audit::EvaluationVerdict::DoesNotSupportIntent
+                    | ssh_core::audit::EvaluationVerdict::Uncertain
+            )
+        ) {
+            self.reasons.push(format!(
+                "Advisory assessment: {}",
+                self.assessment
+                    .as_ref()
+                    .map(|assessment| assessment.verdict.as_str())
+                    .unwrap_or("unavailable")
+            ));
+        }
+        if !self.cancellation.is_empty() {
+            self.reasons.push(self.cancellation.clone());
+        }
+        self.attention = !self.reasons.is_empty();
+    }
+
+    fn matches_view(&self, query: &ActivityQuery) -> bool {
+        let view = state::Preset::parse(&query.view).is_some_and(|preset| {
+            preset.includes(
+                self.execution,
+                self.approval_state,
+                self.assessment.is_some(),
+                self.attention,
+            ) || (preset == state::Preset::Evidence && self.missing_request)
+        });
+        if !view {
+            return false;
+        }
+        if !query.role.is_empty() && self.role != query.role
+            || !query.request.is_empty() && self.request != query.request
+            || !query.run.is_empty() && self.run != query.run
+            || !query.agreement.is_empty() && self.agreement != query.agreement
+        {
+            return false;
+        }
+        if !query.kind.is_empty()
+            && query.kind != self.kind
+            && !(query.kind == "files" && self.kind != "execute" && self.kind != "unknown")
+        {
+            return false;
+        }
+        if !query.page_ids.is_empty() && !query.page_ids.split(',').any(|id| id == self.id) {
+            return false;
+        }
+        if !query.approval.is_empty()
+            && !match query.approval.as_str() {
+                "waiting" => self.approval_state == state::Approval::AwaitingDecision,
+                "approved" => matches!(
+                    self.approval_state,
+                    state::Approval::ApprovedOnce | state::Approval::Session
+                ),
+                "refused" => self.approval_state == state::Approval::Refused,
+                "expired" => self.approval_state == state::Approval::Expired,
+                "not_required" => self.approval_state == state::Approval::NotRequired,
+                _ => false,
+            }
+        {
+            return false;
+        }
+        if !query.assessment.is_empty()
+            && self
+                .assessment_verdict
+                .and_then(|value| serde_json::to_value(value).ok())
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .as_deref()
+                != Some(query.assessment.as_str())
+        {
+            return false;
+        }
+        if !query.q.is_empty()
+            && !self
+                .raw_arguments
+                .iter()
+                .any(|argument| argument.contains(&query.q))
+            && !self.raw_intent.contains(&query.q)
+            && !self.raw_purpose.contains(&query.q)
+            && checksum_digest(self.file_info.as_ref()) != Some(query.q.as_str())
+            && !self
+                .file_identity
+                .as_ref()
+                .is_some_and(|file| file.sha256 == query.q)
+            && ![
+                self.id.as_str(),
+                self.session.as_str(),
+                self.request.as_str(),
+                self.run.as_str(),
+                self.agreement.as_str(),
+            ]
+            .contains(&query.q.as_str())
+            && !self.evidence_records.iter().any(|record| {
+                record.digest == query.q
+                    || record.sequence.to_string() == query.q
+                    || format!("#{}", record.sequence) == query.q
+            })
+        {
+            return false;
+        }
+        if self.evidence == "history" {
+            let at = if query.time_basis == "completed" {
+                self.completed_at
+            } else {
+                self.requested_at
+            };
+            if at.is_none_or(|at| {
+                query.start.is_some_and(|start| at < start) || query.end.is_some_and(|end| at > end)
+            }) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Serialize)]
@@ -167,6 +431,7 @@ struct AssessmentExport {
     side_effects: Vec<String>,
 }
 
+#[cfg_attr(test, derive(Default))]
 #[derive(Template)]
 #[template(path = "activity.html")]
 struct ActivityPage {
@@ -182,6 +447,16 @@ struct ActivityPage {
     source: String,
     live: bool,
     page_size: usize,
+    matching: Option<usize>,
+    available: bool,
+    unsupported: bool,
+    limited: bool,
+    scanned: usize,
+    investigation: String,
+    page_ids: String,
+    chips: Vec<(String, String)>,
+    clear_view_url: String,
+    refresh_url: String,
 }
 
 pub(super) fn preview(arguments: &[String], kind: &str) -> String {
@@ -269,25 +544,6 @@ fn file_result(
     fields
 }
 
-fn execution_status(state: &RunState) -> String {
-    match state {
-        RunState::Running => "Running".to_owned(),
-        RunState::Exited { code } => format!("Completed · exit {code}"),
-        RunState::Ended => "Ended · exit status unavailable".to_owned(),
-        RunState::Refused => "Refused to start".to_owned(),
-        RunState::Indeterminate => "Outcome unknown".to_owned(),
-        RunState::TransferFailed {
-            remote_write_may_be_partial,
-            ..
-        } => if *remote_write_may_be_partial {
-            "Transfer failed · remote file may be partial"
-        } else {
-            "Transfer failed"
-        }
-        .to_owned(),
-    }
-}
-
 fn cancellation_status(value: Cancellation) -> &'static str {
     match value {
         Cancellation::NotRequested => "",
@@ -319,7 +575,58 @@ fn shown(
         let Ok(session) = SessionId::parse(&decision.session) else {
             continue;
         };
-        let related = entries;
+        let authorizations = entries
+            .iter()
+            .filter(|entry| {
+                entry.session == decision.session
+                    && wire_event_name(&entry.event) == "approved"
+                    && wire_u64(&entry.event, "decided") == Some(decision.sequence)
+            })
+            .map(|entry| entry.sequence)
+            .collect::<std::collections::HashSet<_>>();
+        let related =
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.session == decision.session
+                        && (entry.sequence == decision.sequence
+                            || match wire_event_name(&entry.event) {
+                                "approved" | "answered" => {
+                                    wire_u64(&entry.event, "decided") == Some(decision.sequence)
+                                }
+                                "completed" | "cancellation_requested" => {
+                                    wire_u64(&entry.event, "decided").is_some_and(|sequence| {
+                                        sequence == decision.sequence
+                                            || authorizations.contains(&sequence)
+                                    })
+                                }
+                                "evaluated" => {
+                                    entry.event.get("artifact").and_then(|artifact| {
+                                        wire_string(artifact, "decision_digest")
+                                    }) == Some(decision.digest.as_str())
+                                }
+                                _ => false,
+                            })
+                })
+                .collect::<Vec<_>>();
+        // Related evidence is read through the fixed observation boundary.
+        // Keep identifier matches on their newest matching evidence page.
+        if source == "history"
+            && query.run.is_empty()
+            && query.request.is_empty()
+            && query.agreement.is_empty()
+            && audit_history::is_operation_identifier(&query.q)
+            && query.before.is_some_and(|cursor| {
+                related.iter().any(|entry| {
+                    entry.source_nanos > cursor
+                        && (query.time_basis != "completed"
+                            || wire_event_name(&entry.event) == "completed")
+                        && audit_history::operation_identifier_matches(entry, &query.q)
+                })
+            })
+        {
+            continue;
+        }
         let completion = related.iter().find(|entry| {
             entry.session == decision.session
                 && wire_event_name(&entry.event) == "completed"
@@ -401,7 +708,142 @@ fn shown(
             let state = wire_string(&entry.event, "state").unwrap_or("");
             state != "exit 0" && state != "Exited { code: 0 }"
         });
+        let approval_entry = entries.iter().find(|entry| {
+            entry.session == decision.session
+                && wire_event_name(&entry.event) == "approved"
+                && wire_u64(&entry.event, "decided") == Some(decision.sequence)
+        });
+        let answer = entries.iter().find(|entry| {
+            entry.session == decision.session
+                && wire_event_name(&entry.event) == "answered"
+                && wire_u64(&entry.event, "decided") == Some(decision.sequence)
+        });
+        let refused = wire_string(&decision.event, "verdict") == Some("deny")
+            || answer.is_some_and(|entry| {
+                entry
+                    .event
+                    .get("agreed")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            });
+        let approval_state = if refused {
+            state::Approval::Refused
+        } else if approval_entry.is_some_and(|entry| {
+            entry
+                .event
+                .get("standing")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }) {
+            state::Approval::Session
+        } else if approval_entry.is_some() || answer.is_some() {
+            state::Approval::ApprovedOnce
+        } else if wire_string(&decision.event, "verdict") == Some("permit") {
+            state::Approval::NotRequired
+        } else {
+            state::Approval::HistoricalUnconfirmed
+        };
+        let execution = completion
+            .map(|entry| state::Execution::from_completion(&entry.event))
+            .unwrap_or(
+                if approval_entry.is_some() || approval_state == state::Approval::NotRequired {
+                    state::Execution::EvidenceMissing
+                } else {
+                    state::Execution::NotStarted
+                },
+            );
+        let raw_arguments = decision
+            .event
+            .get("argv")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let assessment_verdict = entries
+            .iter()
+            .find(|entry| {
+                entry.session == decision.session
+                    && wire_event_name(&entry.event) == "evaluated"
+                    && entry
+                        .event
+                        .get("artifact")
+                        .and_then(|artifact| wire_string(artifact, "decision_digest"))
+                        == Some(decision.digest.as_str())
+            })
+            .and_then(|entry| entry.event.get("artifact"))
+            .and_then(|artifact| artifact.get("verdict"))
+            .and_then(|verdict| serde_json::from_value(verdict.clone()).ok());
         operations.push(OperationShown {
+            execution,
+            approval_state,
+            reasons: Vec::new(),
+            missing_request: false,
+            completed_at: completion.map(|entry| {
+                if source == "current" {
+                    entry.at
+                } else {
+                    entry.source_nanos
+                }
+            }),
+            raw_intent: wire_string(&decision.event, "agent_intent")
+                .unwrap_or_default()
+                .to_owned(),
+            raw_purpose: wire_string(&decision.event, "purpose")
+                .unwrap_or_default()
+                .to_owned(),
+            evidence_records: related
+                .iter()
+                .map(|entry| EvidenceShown {
+                    sequence: entry.sequence,
+                    digest: entry.digest.clone(),
+                    previous: entry.previous.clone(),
+                    recorded_at: if source == "current" {
+                        entry.at
+                    } else {
+                        entry.source_nanos
+                    },
+                    event: wire_event_name(&entry.event).to_owned(),
+                    summary: wire_summary(&entry.event),
+                })
+                .collect(),
+            request: approval_entry
+                .or(answer)
+                .and_then(|entry| wire_string(&entry.event, "request"))
+                .unwrap_or_default()
+                .to_owned(),
+            agreement: approval_entry
+                .and_then(|entry| wire_string(&entry.event, "agreement"))
+                .unwrap_or_default()
+                .to_owned(),
+            run: completion
+                .and_then(|entry| wire_string(&entry.event, "run"))
+                .unwrap_or_default()
+                .to_owned(),
+            requested_at: Some(if source == "current" {
+                decision.at
+            } else {
+                decision.source_nanos
+            }),
+            sequence: decision.sequence,
+            raw_arguments: raw_arguments.clone(),
+            assessment_verdict,
+            investigation: String::new(),
+            session_url: String::new(),
+            agreement_url: String::new(),
+            file_info: completion
+                .and_then(|entry| entry.event.get("info"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
+            file_identity: completion
+                .and_then(|entry| entry.event.get("file"))
+                .and_then(|file| {
+                    Some(ArtifactMetadata {
+                        bytes: file.get("bytes")?.as_u64()?,
+                        sha256: file.get("sha256")?.as_str()?.to_owned(),
+                    })
+                }),
+            file: files::describe(&kind, &raw_arguments, completion.map(|entry| &entry.event)),
             id: decision.digest.clone(),
             session: session.as_str().to_owned(),
             host: visible(&decision.host),
@@ -432,6 +874,133 @@ fn shown(
             attention,
         });
     }
+    for entry in entries
+        .iter()
+        .filter(|entry| wire_event_name(&entry.event) == "completed")
+    {
+        let authority = wire_u64(&entry.event, "decided").and_then(|sequence| {
+            entries.iter().find(|candidate| {
+                candidate.session == entry.session && candidate.sequence == sequence
+            })
+        });
+        let original = authority.and_then(|authority| match wire_event_name(&authority.event) {
+            "decided" => Some(authority),
+            "approved" => wire_u64(&authority.event, "decided").and_then(|sequence| {
+                entries.iter().find(|candidate| {
+                    candidate.session == entry.session
+                        && candidate.sequence == sequence
+                        && wire_event_name(&candidate.event) == "decided"
+                })
+            }),
+            _ => None,
+        });
+        if original.is_some() || operations.iter().any(|row| row.id == entry.digest) {
+            continue;
+        }
+        let file_info = entry.event.get("info").and_then(|value| {
+            serde_json::from_value::<ssh_core::files::FileInfo>(value.clone()).ok()
+        });
+        let kind = files::retained_operation(
+            file_info.as_ref(),
+            entry.event.get("file").is_some_and(|file| !file.is_null()),
+        )
+        .to_owned();
+        let approval_state =
+            if authority.is_some_and(|authority| wire_event_name(&authority.event) == "approved") {
+                if authority.is_some_and(|authority| {
+                    authority
+                        .event
+                        .get("standing")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                }) {
+                    state::Approval::Session
+                } else {
+                    state::Approval::ApprovedOnce
+                }
+            } else {
+                state::Approval::HistoricalUnconfirmed
+            };
+        let run = wire_string(&entry.event, "run")
+            .unwrap_or_default()
+            .to_owned();
+        let outputs = wire_outputs(&entry.event)
+            .into_iter()
+            .map(|output| OutputExport {
+                label: output.label.to_owned(),
+                preview: output.preview,
+                note: output.note,
+                url: if source == "current" {
+                    format!(
+                        "/dashboard/sessions/{}/runs/{}/{}?source=current",
+                        entry.session, run, output.label
+                    )
+                } else {
+                    retained_output_url(&entry.session, &run, output.label, before, start, end)
+                },
+            })
+            .collect();
+        operations.push(OperationShown {
+            id: entry.digest.clone(),
+            session: entry.session.clone(),
+            host: visible(&entry.host),
+            role: visible(&entry.role),
+            principal: visible(&entry.principal),
+            preview: "Recorded result · original request unavailable".to_owned(),
+            execution: state::Execution::from_completion(&entry.event),
+            approval_state,
+            approval: "Original request evidence unavailable".to_owned(),
+            missing_request: true,
+            run,
+            request: authority
+                .and_then(|authority| wire_string(&authority.event, "request"))
+                .unwrap_or_default()
+                .to_owned(),
+            agreement: authority
+                .and_then(|authority| wire_string(&authority.event, "agreement"))
+                .unwrap_or_default()
+                .to_owned(),
+            kind: kind.clone(),
+            file: files::describe(&kind, &[], Some(&entry.event)),
+            file_info,
+            file_identity: entry.event.get("file").and_then(|file| {
+                Some(ArtifactMetadata {
+                    bytes: file.get("bytes")?.as_u64()?,
+                    sha256: file.get("sha256")?.as_str()?.to_owned(),
+                })
+            }),
+            evidence: source.to_owned(),
+            outcome: wire_summary(&entry.event),
+            outputs,
+            when: format!(
+                "Recorded {} · request time unavailable",
+                source_time(entry.source_nanos)
+            ),
+            completed_at: Some(if source == "current" {
+                entry.at
+            } else {
+                entry.source_nanos
+            }),
+            requested_at: None,
+            sequence: entry.sequence,
+            evidence_records: vec![EvidenceShown {
+                sequence: entry.sequence,
+                digest: entry.digest.clone(),
+                previous: entry.previous.clone(),
+                recorded_at: if source == "current" {
+                    entry.at
+                } else {
+                    entry.source_nanos
+                },
+                event: "completed".to_owned(),
+                summary: wire_summary(&entry.event),
+            }],
+            ..Default::default()
+        });
+    }
+    for row in &mut operations {
+        row.classify();
+    }
     operations
 }
 
@@ -439,18 +1008,50 @@ pub(super) async fn activity<C, S>(
     State(bastion): State<Arc<Bastion<C, S>>>,
     axum::Extension(operator): axum::Extension<Operator>,
     axum::Extension(reader): axum::Extension<Arc<dyn ReadsAudit>>,
-    Query(mut query): Query<ActivityQuery>,
+    Query(query): Query<ActivityQuery>,
 ) -> Response
 where
     C: Clock + 'static,
     S: CredentialSource + 'static,
 {
+    match load_activity(bastion, operator, reader, query).await {
+        Ok(page) => match page.render() {
+            Ok(html) => ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response(),
+            Err(error) => {
+                tracing::error!(%error, "activity could not be rendered");
+                state_unavailable()
+            }
+        },
+        Err(error) => error.into_response(),
+    }
+}
+
+enum ActivityError {
+    InvalidFilters,
+    StateUnavailable,
+}
+
+impl axum::response::IntoResponse for ActivityError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidFilters => (
+                StatusCode::BAD_REQUEST,
+                message_html("Choose supported activity filters."),
+            )
+                .into_response(),
+            Self::StateUnavailable => state_unavailable(),
+        }
+    }
+}
+
+async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
+    bastion: Arc<Bastion<C, S>>,
+    operator: Operator,
+    reader: Arc<dyn ReadsAudit>,
+    mut query: ActivityQuery,
+) -> Result<ActivityPage, ActivityError> {
     if !query.valid() {
-        return (
-            StatusCode::BAD_REQUEST,
-            message_html("Choose supported activity filters."),
-        )
-            .into_response();
+        return Err(ActivityError::InvalidFilters);
     }
     if query.window.is_empty() {
         query.window = "24h".to_owned();
@@ -468,47 +1069,25 @@ where
                 .filter(|(agreement, _)| agreement.session.as_str() == snapshot_query.session)
                 .map(|(agreement, remaining)| StandingShown::from(agreement, remaining))
                 .collect();
-            let duration: u64 = match snapshot_query.window.as_str() {
-                "1h" => 3_600_000,
-                "7d" => 604_800_000,
-                "30d" => 2_592_000_000,
-                _ => 86_400_000,
-            };
-            let since = state.now().saturating_sub(duration);
+            let observations = current::Current::read(&state, &snapshot_query);
             let (entries, next) = state.ledger().operation_activity(
                 snapshot_query.before,
-                audit_history::PAGE_SIZE,
-                |entry| entry.at >= since && snapshot_query.matches(entry),
+                if snapshot_query.page_ids.is_empty() {
+                    audit_history::PAGE_SIZE
+                } else {
+                    40
+                },
+                |entry| observations.includes(&snapshot_query, entry),
             );
             let entries = entries
                 .iter()
                 .map(|entry| current_entry(entry))
                 .collect::<Result<Vec<_>, _>>();
-            let progress = state
-                .runs_in_flight_with_authorization()
-                .into_iter()
-                .filter_map(|(run, authorization)| {
-                    state
-                        .observe_progress(&run)
-                        .map(|progress| (authorization, progress))
-                })
-                .collect::<Vec<_>>();
-            (
-                current,
-                standing,
-                entries,
-                next,
-                progress,
-                state.waiting_for_approval(),
-                state.uncollected_approvals(),
-                state.now(),
-            )
+            (current, standing, entries, next, observations)
         })
         .await;
-    let Ok((current, standing, current_entries, current_next, progress, waiting, uncollected, now)) =
-        snapshot
-    else {
-        return state_unavailable();
+    let Ok((current, standing, current_entries, current_next, observations)) = snapshot else {
+        return Err(ActivityError::StateUnavailable);
     };
     let source = if query.source == "history"
         || (query.source.is_empty() && !query.session.is_empty() && current.is_none())
@@ -517,10 +1096,25 @@ where
     } else {
         "current"
     };
-    let (mut operations, next, notice) = if source == "history" {
+    let mut available = true;
+    let mut limited = false;
+    let mut scanned = 0usize;
+    let filtered_history = !query.view.is_empty()
+        || !query.approval.is_empty()
+        || !query.assessment.is_empty()
+        || audit_history::is_operation_identifier(&query.q)
+        || query.time_basis == "completed";
+    let unsupported = source == "history"
+        && (matches!(query.view.as_str(), "waiting" | "waiting_agent" | "running")
+            || matches!(query.approval.as_str(), "waiting" | "expired"));
+    let (mut operations, next, notice) = if unsupported {
+        available = false;
+        limited = true;
+        (Vec::new(),None,"Current waiting, running and expired states cannot be established from saved records. Choose Current service for live state.".to_owned())
+    } else if source == "history" {
         let window = match window_value(Some(query.window.clone())) {
             Ok((_, window)) => window,
-            Err(()) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(()) => return Err(ActivityError::InvalidFilters),
         };
         let request = audit_history::OperationQuery {
             filters: audit_history::Query {
@@ -535,93 +1129,235 @@ where
             },
             end: query.end,
             kind: query.kind.clone(),
+            role: query.role.clone(),
+            request: query.request.clone(),
+            agreement: query.agreement.clone(),
+            run: query.run.clone(),
+            time_basis: query.time_basis.clone(),
+            page_ids: query
+                .page_ids
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect(),
         };
-        match reader.operations(&request).await {
-            Ok(page) => {
-                query.start = Some(page.window_start);
-                query.end = Some(page.window_end);
-                (shown(&page.entries, &query, source, query.before.unwrap_or(page.window_end), page.window_start, page.window_end), page.next_before,
-                    if page.evidence_limited { "Saved history · cancellation evidence reached the retrieval limit; some requests may be missing. Other related evidence is shown.".to_owned() } else { "Saved history · requested in the selected window. Related evidence may have later timestamps.".to_owned() })
-            }
-            Err(_) => (Vec::new(), None, "Saved history unavailable. Current service activity and session controls remain available.".to_owned()),
+        let mut request = request;
+        let mut rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut run_resolved = query.run.is_empty() || query.time_basis == "completed";
+        let mut missing_request_time = false;
+        let mut next = None;
+        let mut notice = "Saved history · request records in the selected window; related evidence is read through the fixed upper bound.".to_owned();
+        if audit_history::is_operation_identifier(&query.q) {
+            notice.push_str(" Identifier lookup selects matching evidence records; their original requests may predate this interval.");
         }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(8))
+            .ok_or(ActivityError::StateUnavailable)?;
+        let passes = if filtered_history { 5 } else { 1 };
+        for _ in 0..passes {
+            let result = tokio::time::timeout_at(deadline, reader.operations(&request)).await;
+            let page = match result {
+                Ok(Ok(page)) => page,
+                _ => {
+                    available = false;
+                    limited = true;
+                    notice = if rows.is_empty() { "Saved history unavailable or query budget exhausted. Narrow the range, retry, or inspect Current service; session controls remain available." } else { "Incomplete saved results: a source read failed or exceeded the query budget. Previously read evidence is shown." }.to_owned();
+                    break;
+                }
+            };
+            query.start = Some(page.window_start);
+            query.end = Some(page.window_end);
+            request.filters.start = query.start;
+            request.end = query.end;
+            let output_start = page
+                .entries
+                .iter()
+                .map(|entry| entry.source_nanos)
+                .min()
+                .unwrap_or(page.window_start)
+                .min(page.window_start);
+            let page_rows = shown(
+                &page.entries,
+                &query,
+                source,
+                page.window_end,
+                output_start,
+                page.window_end,
+            );
+            run_resolved |= page_rows.iter().any(|row| row.run == query.run);
+            missing_request_time |= query.time_basis != "completed"
+                && page_rows.iter().any(|row| row.requested_at.is_none());
+            scanned = scanned.saturating_add(page_rows.len());
+            rows.extend(
+                page_rows
+                    .into_iter()
+                    .filter(|row| row.matches_view(&query) && seen.insert(row.id.clone())),
+            );
+            limited |= page.evidence_limited;
+            next = page.next_before;
+            if rows.len() >= audit_history::PAGE_SIZE || next.is_none() {
+                break;
+            }
+            request.filters.before = next;
+        }
+        if limited && available {
+            notice.push_str(" Related cancellation evidence reached its retrieval limit; some requests may be absent.");
+        }
+        if !run_resolved {
+            limited = true;
+            notice.push_str(" The run association is unavailable through this fixed observation cutoff. A later completion cannot establish an earlier observation; use Current service or refresh the time range.");
+        }
+        if missing_request_time {
+            limited = true;
+            notice.push_str(" Some original request times are unavailable. Select Completed in range to inspect retained result records.");
+        }
+        if filtered_history && next.is_some() {
+            notice.push_str(" Matching examines at most 100 source records per page. Continue to older operations for remaining evidence.");
+        }
+        (rows, next, notice)
     } else {
         let Ok(entries) = current_entries else {
-            return state_unavailable();
+            return Err(ActivityError::StateUnavailable);
         };
         let mut operations = shown(&entries, &query, source, 0, 0, 0);
         for row in &mut operations {
             if let Some(decision) = entries.iter().find(|entry| entry.digest == row.id) {
-                row.when = format!("{} ago", elapsed_time(now.saturating_sub(decision.at)));
-                if let Some((_, progress)) = progress.iter().find(|(authorization, _)| {
-                    authorization.session().as_str() == row.session
-                        && (authorization.sequence() == decision.sequence
-                            || entries.iter().any(|entry| {
-                                entry.session == row.session
-                                    && entry.sequence == authorization.sequence()
-                                    && wire_u64(&entry.event, "decided") == Some(decision.sequence)
-                            }))
-                }) {
-                    row.status = execution_status(&progress.state);
-                    row.progress = format!(
-                        "{} elapsed · stdout {} bytes · stderr {} bytes · transfer {} source bytes read",
-                        elapsed_time(progress.elapsed_ms),
-                        progress.stdout_bytes,
-                        progress.stderr_bytes,
-                        progress.transfer_bytes_read
-                    );
-                    let observed = cancellation_status(progress.cancellation);
-                    if !observed.is_empty() {
-                        row.cancellation = observed.to_owned();
-                    }
-                } else if waiting.iter().any(|request| {
-                    request.session.as_str() == row.session && request.decided == decision.sequence
-                }) {
-                    row.status = "Awaiting decision".to_owned();
-                } else if let Some((_, active)) = uncollected.iter().find(|(request, _)| {
-                    request.session.as_str() == row.session && request.decided == decision.sequence
-                }) {
-                    row.status = if *active {
-                        "Approved · waiting for agent"
+                row.when = format!(
+                    "{}{} ago{}",
+                    if row.missing_request { "Recorded " } else { "" },
+                    elapsed_time(observations.now.saturating_sub(decision.at)),
+                    if row.missing_request {
+                        " · request time unavailable"
                     } else {
-                        "Approval expired · not collected"
+                        ""
                     }
-                    .to_owned();
-                }
+                );
+                observations.apply(row, decision.sequence);
             }
         }
-        (operations, current_next, "Current service · retained operation evidence only; older activity may have expired or been lost on restart.".to_owned())
+        let notice = if !query.instance.is_empty() && query.instance != observations.instance {
+            available = false;
+            limited = true;
+            "This fixed observation belongs to an earlier service instance. Open Current service for a fresh observation or choose Saved history."
+        } else {
+            "Current service · retained operation evidence only; older activity may have expired or been lost on restart."
+        };
+        (operations, current_next, notice.to_owned())
     };
-    operations.retain(|row| match query.view.as_str() {
-        "waiting" => row.status == "Awaiting decision",
-        "running" => row.status == "Running",
-        "attention" => {
-            row.attention || row.status == "Awaiting decision" || !row.cancellation.is_empty()
+    operations.retain(|row| row.matches_view(&query));
+    let mut snapshot = query.clone();
+    snapshot.source = source.to_owned();
+    if source == "current" {
+        let duration = match query.window.as_str() {
+            "1h" => 3_600_000,
+            "7d" => 604_800_000,
+            "30d" => 2_592_000_000,
+            _ => 86_400_000,
+        };
+        snapshot.service_start = Some(
+            query
+                .service_start
+                .unwrap_or(observations.now.saturating_sub(duration)),
+        );
+        snapshot.service_end = Some(query.service_end.unwrap_or(observations.now));
+        if query.instance.is_empty() {
+            snapshot.instance.clone_from(&observations.instance);
         }
-        "assessments" => row.assessment.is_some(),
-        _ => true,
-    });
+    }
+    let investigation = snapshot.url(source, query.before);
+    let page_ids = operations
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    for row in &mut operations {
+        let mut selected = snapshot.clone();
+        selected.selected.clone_from(&row.id);
+        row.investigation = selected.url(source, query.before);
+        selected.session.clone_from(&row.session);
+        row.session_url = selected.url(source, None);
+        if !row.agreement.is_empty() {
+            selected.agreement.clone_from(&row.agreement);
+            row.agreement_url = selected.url(source, None);
+        }
+    }
+    let mut live_query = query.clone();
+    live_query.instance.clear();
+    live_query.service_start = None;
+    live_query.service_end = None;
+    live_query.start = None;
+    live_query.end = None;
+    let mut clear_view = snapshot.clone();
+    clear_view.view.clear();
+    clear_view.selected.clear();
+    let mut chips = Vec::new();
+    for (key, label, value) in [
+        ("session", "Session", &snapshot.session),
+        ("host", "Host", &snapshot.host),
+        ("principal", "Principal", &snapshot.principal),
+        ("role", "Account", &snapshot.role),
+        ("agreement", "Session approval", &snapshot.agreement),
+        ("request", "Request", &snapshot.request),
+        ("run", "Run", &snapshot.run),
+        ("q", "Search", &snapshot.q),
+        ("kind", "Operation", &snapshot.kind),
+        ("approval", "Approval", &snapshot.approval),
+        ("assessment", "Assessment", &snapshot.assessment),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
+        let mut removed = snapshot.clone();
+        match key {
+            "session" => removed.session.clear(),
+            "host" => removed.host.clear(),
+            "principal" => removed.principal.clear(),
+            "role" => removed.role.clear(),
+            "agreement" => removed.agreement.clear(),
+            "request" => removed.request.clear(),
+            "run" => removed.run.clear(),
+            "q" => removed.q.clear(),
+            "kind" => removed.kind.clear(),
+            "approval" => removed.approval.clear(),
+            "assessment" => removed.assessment.clear(),
+            _ => {}
+        }
+        removed.selected.clear();
+        chips.push((
+            format!("Remove {label}: {value}"),
+            removed.url(source, None),
+        ));
+    }
     let page = ActivityPage {
         operator: operator.0,
+        chips,
+        clear_view_url: clear_view.url(source, None),
+        refresh_url: live_query.url(source, None),
         current,
         standing,
         operations,
         notice,
-        next_url: next.map_or_else(String::new, |before| query.url(source, Some(before))),
-        current_url: query.url("current", None),
+        next_url: next.map_or_else(String::new, |before| snapshot.url(source, Some(before))),
+        current_url: live_query.url("current", None),
         history_url: query.url("history", None),
         source: source.to_owned(),
-        live: query.before.is_none() && query.end.is_none(),
-        page_size: audit_history::PAGE_SIZE,
+        live: query.before.is_none() && query.end.is_none() && query.service_end.is_none(),
+        page_size: if source == "history" && filtered_history {
+            40
+        } else {
+            audit_history::PAGE_SIZE
+        },
+        matching: (source == "current").then_some(observations.matches),
+        available,
+        unsupported,
+        limited,
+        scanned,
+        investigation,
+        page_ids,
         query,
     };
-    match page.render() {
-        Ok(html) => ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response(),
-        Err(error) => {
-            tracing::error!(%error, "activity could not be rendered");
-            state_unavailable()
-        }
-    }
+    Ok(page)
 }
 
 #[cfg(test)]
@@ -700,6 +1436,166 @@ mod tests {
         );
         let second = rows.iter().find(|row| row.session == other).unwrap();
         assert!(second.status.contains("7"));
+    }
+
+    #[test]
+    fn an_identifier_operation_stays_on_its_newest_matching_saved_page() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let run = "abcdef0123456789-abcdef0123456789abcdef0123456789";
+        let request = "e".repeat(32);
+        let digest = "e".repeat(64);
+        for needle in [digest.clone(), request.clone(), run.to_owned(), "#4".into()] {
+            let mut original = entry(
+                session,
+                1,
+                'a',
+                json!({
+                    "event":"decided", "operation":"upload", "program":"file.upload",
+                    "argv":["file.upload","/srv/report","12",digest,"create","direct"],
+                    "agent_intent":format!("place the approved file {needle}"),
+                    "purpose":"diagnose", "access_class":"privileged",
+                    "verdict":"needs_approval", "policies":["default"]
+                }),
+            );
+            original.source_nanos = 10;
+            let mut answer = entry(
+                session,
+                2,
+                'b',
+                json!({
+                    "event":"answered", "decided":1, "request":request,
+                    "operator":"chris", "agreed":true
+                }),
+            );
+            answer.source_nanos = 20;
+            let mut authorization = entry(
+                session,
+                3,
+                'c',
+                json!({
+                    "event":"approved", "decided":1, "request":request,
+                    "approver":"chris", "override_of":null, "standing":false,
+                    "mode":"direct", "agreement":null
+                }),
+            );
+            authorization.source_nanos = 21;
+            let mut completion = entry(
+                session,
+                4,
+                'd',
+                json!({
+                    "event":"completed", "decided":3, "run":run,
+                    "state":"Exited { code: 0 }", "file":{"bytes":12,"sha256":digest}
+                }),
+            );
+            completion.source_nanos = 30;
+            let mut entries = vec![original, answer, authorization, completion];
+            let mut query = ActivityQuery {
+                q: needle,
+                ..Default::default()
+            };
+            assert_eq!(shown(&entries, &query, "history", 40, 0, 40).len(), 1);
+            query.before = Some(15);
+            assert!(shown(&entries, &query, "history", 40, 0, 40).is_empty());
+            assert_eq!(shown(&entries, &query, "current", 40, 0, 40).len(), 1);
+            if query.q == digest {
+                *entries
+                    .get_mut(3)
+                    .unwrap()
+                    .event
+                    .get_mut("file")
+                    .unwrap()
+                    .get_mut("sha256")
+                    .unwrap() = json!("f".repeat(64));
+                assert_eq!(
+                    shown(&entries, &query, "history", 40, 0, 40).len(),
+                    1,
+                    "later evidence that does not match must not hide the older request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_time_basis_selects_the_matching_operation_timestamp() {
+        let row = OperationShown {
+            evidence: "history".into(),
+            requested_at: Some(100),
+            completed_at: Some(200),
+            ..Default::default()
+        };
+        let mut query = ActivityQuery {
+            start: Some(150),
+            end: Some(250),
+            time_basis: "requested".into(),
+            ..Default::default()
+        };
+        assert!(!row.matches_view(&query));
+        query.time_basis = "completed".into();
+        assert!(row.matches_view(&query));
+        query.start = Some(50);
+        query.end = Some(150);
+        query.time_basis = "requested".into();
+        assert!(row.matches_view(&query));
+        query.time_basis = "completed".into();
+        assert!(!row.matches_view(&query));
+    }
+
+    #[test]
+    fn a_retained_file_result_renders_when_its_original_request_is_unavailable() {
+        let digest = "e".repeat(64);
+        let retained = entry(
+            "0123456789abcdef0123456789abcdef",
+            2,
+            'b',
+            json!({"event":"completed","decided":1,"run":"abcdef0123456789-abcdef0123456789abcdef0123456789","state":"exit 0","info":{"operation":"checksum","bytes":12,"sha256":digest}}),
+        );
+        let query = ActivityQuery {
+            time_basis: "completed".into(),
+            ..Default::default()
+        };
+        let operations = shown(&[retained], &query, "history", 10, 0, 10);
+        let page = ActivityPage {
+            operations,
+            query,
+            available: true,
+            source: "history".into(),
+            ..Default::default()
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("Original arguments and intent are unavailable"));
+        assert!(html.contains("Observed digest"));
+        assert!(html.contains(&digest));
+        assert!(!html.contains("<ol class=\"argv\""));
+    }
+
+    #[test]
+    fn checksum_result_digest_matches_both_evidence_sources() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let digest = "e".repeat(64);
+        let entries = vec![
+            entry(
+                session,
+                1,
+                'a',
+                json!({"event":"decided","operation":"checksum","argv":["file.checksum","/srv/report"],"verdict":"permit"}),
+            ),
+            entry(
+                session,
+                2,
+                'b',
+                json!({"event":"completed","decided":1,"run":"abcdef0123456789-abcdef0123456789abcdef0123456789","state":"exit 0","info":{"operation":"checksum","bytes":12,"sha256":digest}}),
+            ),
+        ];
+        for source in ["current", "history"] {
+            let query = ActivityQuery {
+                q: digest.clone(),
+                ..Default::default()
+            };
+            let rows = shown(&entries, &query, source, 10, 0, 10);
+            assert_eq!(rows.len(), 1);
+            assert!(rows.first().unwrap().matches_view(&query));
+        }
     }
 
     #[test]

@@ -488,6 +488,71 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         let session = self.sessions.use_session(session, principal)?;
         let action = action().map_err(Into::into)?;
         let decision = self.engine.decide_action(&session, action.clone());
+        if decision.verdict() == Verdict::NeedsApproval
+            && let Some(existing) = self.approvals.retry_existing_action(
+                &session,
+                &action,
+                &agent_intent,
+                |grant| -> Result<_, MediationError> {
+                    Ok(self
+                        .ledger
+                        .record_existing_approval(&decision, &agent_intent, grant)?)
+                },
+            )?
+        {
+            let admission = match existing {
+                Standing::Ready(recorded) => {
+                    let (receipt, approver) = *recorded;
+                    Admission::Ready {
+                        decision,
+                        receipt: Box::new(receipt),
+                        approved_by: Some(approver),
+                    }
+                }
+                Standing::Refused { by } => Admission::Held(Executed::Refused {
+                    decision,
+                    refused_by: Some(by),
+                }),
+                Standing::Waiting(asked) => {
+                    let request = asked.asked().id.clone();
+                    let recorded = self.approvals.use_standing(
+                        &session.id,
+                        |standing| -> Result<_, MediationError> {
+                            self.apply_answer(&request, standing, true)?;
+                            self.approvals.redeem_action_with(
+                                &request,
+                                principal,
+                                &action,
+                                &agent_intent,
+                                |grant| -> Result<_, MediationError> {
+                                    Ok(self.ledger.record_existing_approval(
+                                        &decision,
+                                        &agent_intent,
+                                        grant,
+                                    )?)
+                                },
+                            )
+                        },
+                    );
+                    if let Some(recorded) = recorded {
+                        let (receipt, approver) = recorded?;
+                        Admission::Ready {
+                            decision,
+                            receipt: Box::new(receipt),
+                            approved_by: Some(approver),
+                        }
+                    } else {
+                        Admission::Held(Executed::AwaitingApproval { decision, asked })
+                    }
+                }
+                Standing::Lapsed { asked, by } => Admission::Held(Executed::ApprovalLapsed {
+                    decision,
+                    asked,
+                    lapsed_from: by,
+                }),
+            };
+            return Ok((session, admission));
+        }
         let intended = self.ledger.record_intent(decision, agent_intent)?;
         let admission = match intended.decision().verdict() {
             Verdict::Deny => {
@@ -2299,7 +2364,11 @@ mod tests {
                     "proof admission must have a bounded limit"
                 );
             }
-            drop(blockers.pop());
+            // A fresh standing-agreement operation needs a decision slot as
+            // well as an approval slot; collection reuses its existing decision.
+            if standing {
+                drop(blockers.pop());
+            }
             assert!(matches!(
                 bastion.exec(&alice(), &session.id, command.clone()).await,
                 Err(MediationError::Audit(AuditError::Full))
@@ -3998,6 +4067,73 @@ mod tests {
                 .unwrap(),
             Executed::Ran { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn waiting_and_collecting_keep_one_operation_but_a_new_execution_is_distinct() {
+        let bastion = bastion_with(Arc::new(TestClock::at(1_000)), Limits::default()).await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let Executed::AwaitingApproval { asked, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["true"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected review");
+        };
+        for _ in 0..3 {
+            let Executed::AwaitingApproval { asked: retry, .. } = bastion
+                .exec(&alice(), &session.id, argv(&["true"]))
+                .await
+                .unwrap()
+            else {
+                panic!("expected the same request");
+            };
+            assert_eq!(retry.asked().id, asked.asked().id);
+        }
+        bastion
+            .decide(
+                &asked.asked().id,
+                Approver::Human {
+                    who: "chris".to_owned(),
+                },
+                true,
+            )
+            .unwrap();
+        assert!(matches!(
+            bastion
+                .exec(&alice(), &session.id, argv(&["true"]))
+                .await
+                .unwrap(),
+            Executed::Ran { .. }
+        ));
+        assert_eq!(
+            bastion
+                .ledger()
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry.event, Event::Decided { .. }))
+                .count(),
+            1
+        );
+        let Executed::AwaitingApproval {
+            asked: repeated, ..
+        } = bastion
+            .exec(&alice(), &session.id, argv(&["true"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected new review");
+        };
+        assert_ne!(repeated.asked().id, asked.asked().id);
+        assert_eq!(
+            bastion
+                .ledger()
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry.event, Event::Decided { .. }))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
