@@ -3587,6 +3587,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identifier_search_output_links_open_the_retained_output_handler() {
+        let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
+            .layer(axum::Extension(Operator("chris".into())));
+        let response = app.clone().oneshot(HttpRequest::builder().uri("/activity?source=history&session=0123456789abcdef0123456789abcdef&run=0123456789abcdef-0123456789abcdef0123456789abcdef").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let link = body
+            .split("href=\"")
+            .filter_map(|value| value.split_once('"').map(|(link, _)| link))
+            .find(|link| link.starts_with("/dashboard/sessions/") && link.contains("/stdout?"))
+            .unwrap()
+            .replace("&#38;", "&")
+            .replace("&amp;", "&");
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(link.strip_prefix("/dashboard").unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("TAIL"));
+    }
+
+    #[tokio::test]
     async fn evidence_exports_freeze_identities_and_make_output_an_explicit_choice() {
         let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
             .layer(axum::Extension(Operator("chris".into())));

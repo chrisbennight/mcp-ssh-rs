@@ -180,6 +180,13 @@ impl ActivityQuery {
     }
 }
 
+fn checksum_digest(info: Option<&ssh_core::files::FileInfo>) -> Option<&str> {
+    match info {
+        Some(ssh_core::files::FileInfo::Checksum { sha256, .. }) => Some(sha256),
+        _ => None,
+    }
+}
+
 fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -370,6 +377,7 @@ impl OperationShown {
                 .any(|argument| argument.contains(&query.q))
             && !self.raw_intent.contains(&query.q)
             && !self.raw_purpose.contains(&query.q)
+            && checksum_digest(self.file_info.as_ref()) != Some(query.q.as_str())
             && !self
                 .file_identity
                 .as_ref()
@@ -1129,22 +1137,19 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
             query.end = Some(page.window_end);
             request.filters.start = query.start;
             request.end = query.end;
-            let related_lookup = !query.page_ids.is_empty()
-                || query.time_basis == "completed"
-                || !query.run.is_empty()
-                || !query.request.is_empty()
-                || !query.agreement.is_empty()
-                || audit_history::is_operation_identifier(&query.q);
+            let output_start = page
+                .entries
+                .iter()
+                .map(|entry| entry.source_nanos)
+                .min()
+                .unwrap_or(page.window_start)
+                .min(page.window_start);
             let page_rows = shown(
                 &page.entries,
                 &query,
                 source,
-                if related_lookup {
-                    u64::MAX
-                } else {
-                    request.filters.before.unwrap_or(page.window_end)
-                },
-                if related_lookup { 0 } else { page.window_start },
+                page.window_end,
+                output_start,
                 page.window_end,
             );
             scanned = scanned.saturating_add(page_rows.len());
@@ -1390,6 +1395,35 @@ mod tests {
         );
         let second = rows.iter().find(|row| row.session == other).unwrap();
         assert!(second.status.contains("7"));
+    }
+
+    #[test]
+    fn checksum_result_digest_matches_both_evidence_sources() {
+        let session = "0123456789abcdef0123456789abcdef";
+        let digest = "e".repeat(64);
+        let entries = vec![
+            entry(
+                session,
+                1,
+                'a',
+                json!({"event":"decided","operation":"checksum","argv":["file.checksum","/srv/report"],"verdict":"permit"}),
+            ),
+            entry(
+                session,
+                2,
+                'b',
+                json!({"event":"completed","decided":1,"run":"abcdef0123456789-abcdef0123456789abcdef0123456789","state":"exit 0","info":{"operation":"checksum","bytes":12,"sha256":digest}}),
+            ),
+        ];
+        for source in ["current", "history"] {
+            let query = ActivityQuery {
+                q: digest.clone(),
+                ..Default::default()
+            };
+            let rows = shown(&entries, &query, source, 10, 0, 10);
+            assert_eq!(rows.len(), 1);
+            assert!(rows.first().unwrap().matches_view(&query));
+        }
     }
 
     #[test]

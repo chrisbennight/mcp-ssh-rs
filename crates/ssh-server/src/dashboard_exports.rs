@@ -223,7 +223,6 @@ where
         query.request.clear();
         query.agreement.clear();
         query.run.clear();
-        query.time_basis.clear();
     }
     let Some(deadline) =
         tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(15))

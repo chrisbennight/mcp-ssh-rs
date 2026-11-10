@@ -228,6 +228,11 @@ impl Current {
                     if let Some(file) = file {
                         row.identifiers.push(file.sha256.clone());
                     }
+                    if let Event::Completed { info, .. } = &entry.event
+                        && let Some(digest) = checksum_digest(info.as_ref())
+                    {
+                        row.identifiers.push(digest.to_owned());
+                    }
                     if row.missing_request
                         && let Some(authority) = entries
                             .iter()

@@ -503,3 +503,70 @@ async fn waiting_for_agent_is_selected_before_the_page_limit() {
     assert!(body.contains("Waiting for agent"));
     assert!(body.contains("1 matching operations"));
 }
+
+#[tokio::test]
+async fn completion_time_page_exports_keep_the_displayed_operation_identity() {
+    let (bastion, _) = populated().await;
+    let entries = bastion.ledger().entries();
+    let (root, completion) = entries
+        .iter()
+        .find_map(|completion| {
+            let ssh_core::audit::Event::Completed { decided, .. } = &completion.event else {
+                return None;
+            };
+            let authority = entries.iter().find(|entry| entry.sequence == *decided)?;
+            let root = if let ssh_core::audit::Event::Approved { decided, .. } = &authority.event {
+                entries.iter().find(|entry| entry.sequence == *decided)?
+            } else {
+                authority
+            };
+            (root.at < completion.at).then_some((root, completion))
+        })
+        .expect("loopback fixture contains a request before its completion");
+    let digest = root.digest.as_str().to_owned();
+    let params = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("source", "current")
+        .append_pair("time_basis", "completed")
+        .append_pair("service_start", &completion.at.to_string())
+        .append_pair("service_end", &completion.at.to_string())
+        .append_pair("instance", bastion.ledger().instance_id())
+        .finish();
+    let app = routes(bastion).layer(axum::Extension(Operator("demo-operator".into())));
+    let page = get_html(app.clone(), &format!("/activity?{params}")).await;
+    assert!(page.contains(&format!("data-operation=\"{digest}\"")));
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("investigation", &format!("/dashboard/activity?{params}"))
+        .append_pair("page_ids", &digest)
+        .append_pair("scope", "page")
+        .finish();
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/activity/export?{query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 3 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value.pointer("/manifest/exported_operations"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(
+        value.pointer("/manifest/missing_selected_ids"),
+        Some(&serde_json::json!([]))
+    );
+    assert_eq!(
+        value
+            .pointer("/operations/0/id")
+            .and_then(serde_json::Value::as_str),
+        Some(digest.as_str())
+    );
+}
