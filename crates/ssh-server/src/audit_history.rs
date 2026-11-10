@@ -87,6 +87,7 @@ pub struct TranscriptPage {
     /// follow an older decision, so later pages continue to query through this
     /// edge rather than stopping at the decision cursor.
     pub window_end: u64,
+    pub evidence_limited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +96,13 @@ pub struct TranscriptQuery {
     pub start: Option<u64>,
     pub end: Option<u64>,
     pub session: SessionId,
+}
+
+#[derive(Clone, Debug)]
+pub struct OperationQuery {
+    pub filters: Query,
+    pub kind: String,
+    pub end: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +131,26 @@ pub struct Entry {
 }
 
 pub trait ReadsAudit: Send + Sync {
+    fn operations<'a>(
+        &'a self,
+        query: &'a OperationQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptPage, ReadError>> + Send + 'a>> {
+        Box::pin(async move {
+            let session =
+                SessionId::parse(&query.filters.session).map_err(|_| ReadError::NotConfigured)?;
+            if !query.filters.text.is_empty() || !query.kind.is_empty() {
+                return Err(ReadError::NotConfigured);
+            }
+            self.transcript(&TranscriptQuery {
+                session,
+                before: query.filters.before,
+                start: query.filters.start,
+                end: query.end,
+            })
+            .await
+        })
+    }
+
     fn page<'a>(
         &'a self,
         query: &'a Query,
@@ -271,6 +299,7 @@ impl Loki {
                 next_before,
                 window_start: start,
                 window_end,
+                evidence_limited: false,
             });
         }
 
@@ -330,6 +359,120 @@ impl Loki {
             next_before,
             window_start: start,
             window_end,
+            evidence_limited: false,
+        })
+    }
+
+    async fn read_operations(&self, query: &OperationQuery) -> Result<TranscriptPage, ReadError> {
+        let _permit =
+            tokio::time::timeout(QUERY_WITHIN, Arc::clone(&self.one_query).acquire_owned())
+                .await
+                .map_err(|_| ReadError::Unavailable)?
+                .map_err(|_| ReadError::Unavailable)?;
+        let (start, window_end) =
+            read_window(None, query.filters.start, query.end, query.filters.window)?;
+        let decision_end = query.filters.before.unwrap_or(window_end);
+        if decision_end < start || decision_end > window_end {
+            return Err(ReadError::InvalidWindow);
+        }
+        let mut filters = query.filters.clone();
+        filters.event = "decided".to_owned();
+        filters.text.clear();
+        let mut expression = logql(&filters);
+        if !query.kind.is_empty() {
+            if query.kind == "files" {
+                expression.push_str(" |~ ");
+                expression.push_str(&logql_string(
+                    "\"operation\":\"(upload|download|stat|list|checksum)\"",
+                ));
+            } else if query.kind == "execute" {
+                expression.push_str(" !~ ");
+                expression.push_str(&logql_string(
+                    "\"operation\":\"(upload|download|stat|list|checksum)\"",
+                ));
+            } else {
+                expression.push_str(" |= ");
+                expression.push_str(&logql_string(&json_fragment("operation", &query.kind)));
+            }
+        }
+        if !query.filters.text.is_empty() {
+            let encoded = serde_json::to_string(&query.filters.text)
+                .map_err(|_| ReadError::MalformedResponse)?;
+            let content = encoded
+                .strip_prefix('"')
+                .and_then(|text| text.strip_suffix('"'))
+                .ok_or(ReadError::MalformedResponse)?;
+            expression.push_str(" |= ");
+            expression.push_str(&logql_string(content));
+        }
+        let mut decisions = self
+            .fetch(expression, start, decision_end, FETCH_LIMIT)
+            .await?;
+        let next_before = collision_safe_page(&mut decisions)?;
+        let mut evidence_limited = false;
+        if !decisions.is_empty() {
+            let maximum = decisions.len().saturating_mul(6);
+            let mut related = self
+                .fetch(
+                    operation_relations_logql(&decisions, false),
+                    start,
+                    window_end,
+                    maximum.saturating_add(1),
+                )
+                .await?;
+            if related.len() > maximum {
+                return Err(ReadError::MalformedResponse);
+            }
+            let approvals: Vec<_> = related
+                .iter()
+                .filter(|entry| event_name(entry) == Some("approved"))
+                .cloned()
+                .collect();
+            if !approvals.is_empty() {
+                let maximum = approvals.len().saturating_mul(2);
+                let mut completions = self
+                    .fetch(
+                        operation_relations_logql(&approvals, true),
+                        start,
+                        window_end,
+                        maximum.saturating_add(1),
+                    )
+                    .await?;
+                if completions.len() > maximum {
+                    return Err(ReadError::MalformedResponse);
+                }
+                related.append(&mut completions);
+            }
+            let mut cancellation_keys = decisions.clone();
+            cancellation_keys.extend(approvals);
+            let maximum = PAGE_SIZE.saturating_mul(8);
+            let mut cancellations = self
+                .fetch(
+                    format!(
+                        "{} |= {}",
+                        operation_relation_pattern(&cancellation_keys, true),
+                        logql_string(&json_fragment("event", "cancellation_requested"))
+                    ),
+                    start,
+                    window_end,
+                    maximum.saturating_add(1),
+                )
+                .await?;
+            evidence_limited = cancellations.len() > maximum;
+            cancellations.truncate(maximum);
+            related.append(&mut cancellations);
+            decisions.append(&mut related);
+        }
+        let mut seen = HashSet::new();
+        decisions.retain(|entry| seen.insert((entry.session.clone(), entry.digest.clone())));
+        decisions
+            .sort_unstable_by_key(|entry| std::cmp::Reverse((entry.source_nanos, entry.sequence)));
+        Ok(TranscriptPage {
+            entries: decisions,
+            next_before,
+            window_start: start,
+            window_end,
+            evidence_limited,
         })
     }
 
@@ -607,6 +750,36 @@ fn validate_event(event: &Value) -> Result<(), ()> {
             validate_recorded(object.get("stdout").ok_or(())?)?;
             validate_recorded(object.get("stderr").ok_or(())?)
         }
+        "session_approval_granted" => {
+            exact_keys(
+                object,
+                &[
+                    "event",
+                    "agreement",
+                    "operator",
+                    "request",
+                    "until",
+                    "supersedes",
+                ],
+            )?;
+            ssh_core::approval::AgreementId::parse(required_string(object, "agreement")?)
+                .map_err(|_| ())?;
+            ssh_core::approval::RequestId::parse(required_string(object, "request")?)
+                .map_err(|_| ())?;
+            non_blank_string(required_string(object, "operator")?)?;
+            required_u64(object, "until")?;
+            if let Some(value) = object.get("supersedes").filter(|value| !value.is_null()) {
+                ssh_core::approval::AgreementId::parse(value.as_str().ok_or(())?)
+                    .map_err(|_| ())?;
+            }
+            Ok(())
+        }
+        "session_approval_revoked" => {
+            exact_keys(object, &["event", "agreement", "operator"])?;
+            ssh_core::approval::AgreementId::parse(required_string(object, "agreement")?)
+                .map_err(|_| ())?;
+            non_blank_string(required_string(object, "operator")?)
+        }
         "cancellation_requested" => {
             exact_keys(object, &["event", "run", "decided"])?;
             RunId::parse(required_string(object, "run")?).map_err(|_| ())?;
@@ -815,6 +988,17 @@ struct Artifact {
 }
 
 impl ReadsAudit for Loki {
+    fn operations<'a>(
+        &'a self,
+        query: &'a OperationQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptPage, ReadError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::timeout(QUERY_WITHIN, self.read_operations(query))
+                .await
+                .map_err(|_| ReadError::Unavailable)?
+        })
+    }
+
     fn page<'a>(
         &'a self,
         query: &'a Query,
@@ -943,6 +1127,41 @@ fn transcript_relation_logql(session: &SessionId, pattern: &str) -> String {
     expression
 }
 
+fn operation_relations_logql(entries: &[Entry], completions: bool) -> String {
+    let events = if completions {
+        "\"event\":\"completed\""
+    } else {
+        "\"event\":\"(approved|answered|completed|evaluated)\""
+    };
+    format!(
+        "{} |~ {}",
+        operation_relation_pattern(entries, completions),
+        logql_string(events)
+    )
+}
+
+fn operation_relation_pattern(entries: &[Entry], completions: bool) -> String {
+    // Session IDs and digests have already passed the reader's strict
+    // validation. Bind each sequence to its session across service lifetimes.
+    let patterns: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let relation = if completions {
+                json_number_relation("decided", &[entry.sequence])
+            } else {
+                format!(
+                    "({}|\\\"decision_digest\\\":\\\"{}\\\")",
+                    json_number_relation("decided", &[entry.sequence]),
+                    entry.digest
+                )
+            };
+            let session = json_fragment("session", &entry.session);
+            format!("({session}.*{relation}|{relation}.*{session})")
+        })
+        .collect();
+    format!("{} |~ {}", audit_logql(), logql_string(&patterns.join("|")))
+}
+
 fn joined_numbers(values: &[u64]) -> String {
     values
         .iter()
@@ -1047,6 +1266,30 @@ mod tests {
             "digest": digest.to_string().repeat(64),
         })
         .to_string()
+    }
+
+    #[test]
+    fn structured_session_approval_events_are_readable_history() {
+        for event in [
+            ssh_core::audit::Event::SessionApprovalGranted {
+                agreement: "a".repeat(32),
+                operator: "chris".to_owned(),
+                request: "b".repeat(32),
+                until: 60_000,
+                supersedes: Some("c".repeat(32)),
+            },
+            ssh_core::audit::Event::SessionApprovalRevoked {
+                agreement: "a".repeat(32),
+                operator: "chris".to_owned(),
+            },
+        ] {
+            let mut entry: Entry =
+                serde_json::from_str(&event_line(1, serde_json::to_value(event).unwrap(), 'a'))
+                    .unwrap();
+            assert!(validate_entry(&entry).is_ok());
+            *entry.event.get_mut("operator").unwrap() = serde_json::json!("");
+            assert!(validate_entry(&entry).is_err());
+        }
     }
 
     #[test]
@@ -1237,6 +1480,96 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![12, 11, 10]
         );
+    }
+
+    #[tokio::test]
+    async fn global_operation_search_hydrates_evidence_without_searching_the_result_text() {
+        const NEEDLE: &str = r#"needle "quoted" \ path"#;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/loki/api/v1/query_range", get({
+            let calls = Arc::clone(&calls);
+            move |AxumQuery(params): AxumQuery<HashMap<String, String>>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let phase = calls.fetch_add(1, Ordering::Relaxed);
+                    let expression = params.get("query").unwrap();
+                    assert_eq!(params.get("start").map(String::as_str), Some("1"));
+                    let (at, sequence, event, digest) = match phase {
+                        0 => {
+                            assert!(expression.contains("needle"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("100"));
+                            let event = serde_json::json!({
+                                "event":"decided", "agent_intent":"inspect",
+                                "argv":["printf",NEEDLE], "program":"printf", "access_class":"read_only",
+                                "purpose":"diagnose", "verdict":"needs_approval", "policies":["default"]
+                            });
+                            let term: String = serde_json::from_str(expression.rsplit(" |= ").next().unwrap()).unwrap();
+                            assert!(event_line(10, event.clone(), 'd').contains(&term), "the saved text predicate must match the serialized legacy command");
+                            assert!(expression.contains(" !~ "), "Commands must include legacy decisions without an operation field");
+                            (90, 10, event, 'd')
+                        }
+                        1 => {
+                            assert!(!expression.contains("needle"));
+                            assert!(expression.contains("0123456789abcdef0123456789abcdef"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("200"));
+                            (150, 11, serde_json::json!({
+                                "event":"approved", "decided":10, "request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                "approver":"operator", "override_of":null, "standing":false,
+                                "mode":"direct", "agreement":null
+                            }), 'b')
+                        }
+                        2 => {
+                            assert!(!expression.contains("needle"));
+                            assert_eq!(params.get("end").map(String::as_str), Some("200"));
+                            (160, 12, serde_json::json!({
+                                "event":"completed", "run":"abcdef0123456789-abcdef0123456789abcdef0123456789",
+                                "decided":11, "state":"Exited { code: 0 }",
+                                "stdout":{"kind":"kept","text":"ok","truncated":false,"bytes":2},
+                                "stderr":{"kind":"kept","text":"","truncated":false,"bytes":0}
+                            }), 'c')
+                        }
+                        3 => {
+                            assert!(expression.contains("cancellation_requested"));
+                            let values = (13_u64..=15).map(|sequence| [sequence.saturating_add(160).to_string(), event_line(sequence, serde_json::json!({"event":"cancellation_requested", "run":"abcdef0123456789-abcdef0123456789abcdef0123456789", "decided":11}), char::from(b'1' + u8::try_from(sequence - 13).unwrap()))]).collect::<Vec<_>>();
+                            return axum::Json(serde_json::json!({"status":"success", "data":{"resultType":"streams", "result":[{"stream":{}, "values":values}]}}));
+                        }
+                        _ => panic!("unbounded operation query"),
+                    };
+                    axum::Json(serde_json::json!({
+                        "status":"success", "data":{"resultType":"streams", "result":[{
+                            "stream":{}, "values":[[at.to_string(), event_line(sequence, event, digest)]]
+                        }]}
+                    }))
+                }
+            }
+        }));
+        let reader = Loki::new(
+            server(app).await,
+            Labels::parse(r#"{"service":"ssh"}"#).unwrap(),
+        )
+        .unwrap();
+        let page = reader
+            .operations(&OperationQuery {
+                filters: Query {
+                    text: NEEDLE.to_owned(),
+                    before: Some(100),
+                    start: Some(1),
+                    ..Default::default()
+                },
+                kind: "execute".to_owned(),
+                end: Some(200),
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![15, 14, 13, 12, 11, 10]
+        );
+        assert_eq!(page.window_end, 200);
     }
 
     #[tokio::test]

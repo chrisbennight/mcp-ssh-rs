@@ -44,7 +44,7 @@ test ledger; it does not exercise a deployed log collector. The browser uses a
 fixed demo operator in this test only. No production authentication is changed.
 Stop the test when finished; it also stops after two hours.
 
-Inspect recent activity and its older page, expand output, revoke approval, and
+Inspect Activity and its older page, expand output, revoke approval, and
 end a selected session. Check that its principal's usage drops from eight slots
 to seven. Use only this loopback demo for destructive browser checks.
 

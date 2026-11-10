@@ -124,8 +124,9 @@ the font files retain their accompanying licenses.
 | Documentation entry point | [Documentation guide](../README.md) |
 | GitHub social preview | `assets/social-preview.png`, uploaded through repository settings |
 | Application/browser mark and icons | [Server static assets](../../crates/ssh-server/static) |
-| Review queue and standing agreements | [Approval template](../../crates/ssh-server/templates/approvals.html) |
-| Inventory, sessions, transcripts, output, audit, evaluations | [Operations template](../../crates/ssh-server/templates/operations.html) |
+| Review requests and session approvals | [Approval template](../../crates/ssh-server/templates/approvals.html) |
+| Activity and session inspection | [Activity template](../../crates/ssh-server/templates/activity.html) |
+| Hosts, sessions, retained output, audit events, evaluations | [Operations template](../../crates/ssh-server/templates/operations.html) |
 | Product screenshots | [Capture guidance](../images/README.md) |
 
 Historical releases retain their original artifacts. CLI protocol identifiers,

@@ -245,22 +245,67 @@ preserve.
 
 ## Inspect and end sessions
 
-In the dashboard, open **Sessions** and filter by host or principal. Each row
-shows current work and the principal's slot usage across all hosts. Open a row
+In the dashboard, open **Hosts** for account-level work counts across all held
+sessions. These totals are calculated before the session list limit. **Sessions**
+can filter by host, account, principal and current activity, including running,
+awaiting decision, waiting for agent collection, and no active work. Each row
+shows the latest retained requested operation, usable expiry and the principal's
+slot usage across all hosts. Open a row
 to inspect its command requests, outputs, approval, and expiry.
 
-**Recent activity** reads the records still held by this service, including
-commands executed after a session-wide approval. **Saved history** reads the
-configured log service. Both views page through command requests; an initial
-approval request and the client's later execution request can appear separately.
-Recent activity is limited by retention and restart. Missing saved history does
-not disable the current session's controls.
+**Activity** uses the same operation list globally and within a session.
+Expand a short preview to inspect exact arguments, file-operation fields,
+retained output, approval evidence, and advisory assessments. The session context
+contains approval and expiry information and the existing session controls.
+
+**Current service** reads retained process-local evidence and observes running
+work without collecting its result or extending session idleness. Visible
+current pages update automatically; pause updates to read, or apply pending
+changes after inspecting an expanded operation. **Saved history** reads the
+configured log service. **Audit events** retains the individual-record view.
+Sources and missing evidence are labeled explicitly.
+
+Search commands, recorded context and paths, or filter by host, principal and
+operation type. Output contents are not searched. An initial approval request and
+the client's collection decision may still appear separately. State views narrow
+the displayed page; follow Older operations to inspect earlier requests.
+Current activity remains limited by retention and restart. Missing saved history
+does not disable current session controls.
 
 To recover a slot, open **End session…**, check the target and owner, and confirm.
 The session is removed and its SSH connection is disconnected. Running commands
 may be interrupted; detached remote processes may continue. The recorded event
 names the operator who ended the session. **Revoke session approval** only changes
 approval for future commands; it does not end the session or release its slot.
+
+## Review requests and session approvals
+
+**Review** separates Needs approval, Session approvals and History. Requests
+show waiting age and a server-observed decision deadline, with oldest-first or
+expiring-first ordering. Notification fragments still select the exact request.
+Approve once and Refuse remain direct actions. **Approve session…** opens a
+separate duration form with 15 minutes selected; longer durations and remaining
+session lifetime require an explicit choice. The current usable session time is
+shown separately because idle expiry can occur before the approval deadline.
+
+After a decision, the page reads the recorded answer and offers an explicit Next
+request link. Session approvals show current work, effective remaining time,
+latest retained operation, grantor and uses observed in retained evidence. Quiet
+approvals exclude running work, pending decisions and usable approvals awaiting
+agent collection. Expiring approvals use a displayed ten-minute threshold.
+
+Grant, replacement and withdrawal records join retained decision history. Natural
+expiry is labeled as inferred from a recorded deadline; a missing transition is
+not described as a human withdrawal. If recording a new session approval fails,
+that grant does not become active. If recording a completed withdrawal fails,
+the withdrawal remains effective and the operator sees the recording failure.
+History in this tab is the bounded service view; use saved audit events for older
+records. These history reads do not depend on the optional log service.
+
+Visible Review, Hosts and Sessions views refresh observations and support pause,
+resume and applying pending updates. Open details and focused controls hold
+changes for explicit application. A failed refresh retains the last observation
+with an unavailable message. Counts describe service work rather than host health.
 
 ## Operational metrics
 

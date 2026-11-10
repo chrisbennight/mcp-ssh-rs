@@ -263,6 +263,17 @@ pub enum EvaluationError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    SessionApprovalGranted {
+        agreement: String,
+        operator: String,
+        request: String,
+        until: Millis,
+        supersedes: Option<String>,
+    },
+    SessionApprovalRevoked {
+        agreement: String,
+        operator: String,
+    },
     SessionOpened {
         purpose: String,
         access_class: AccessClass,
@@ -1159,6 +1170,39 @@ impl<C: Clock> Ledger<C> {
         )
     }
 
+    pub(crate) fn record_session_approval_granted(
+        &self,
+        asked: &crate::approval::Asked,
+        agreement: &crate::approval::StandingApproval,
+        supersedes: Option<&crate::approval::AgreementId>,
+    ) -> Result<Entry, AuditError> {
+        self.append(
+            Attribution::about(asked),
+            Event::SessionApprovalGranted {
+                agreement: agreement.id.as_str().to_owned(),
+                operator: agreement.who.clone(),
+                request: asked.id.as_str().to_owned(),
+                until: agreement.until,
+                supersedes: supersedes.map(|id| id.as_str().to_owned()),
+            },
+        )
+    }
+
+    pub(crate) fn record_session_approval_revoked(
+        &self,
+        session: &Session,
+        agreement: &crate::approval::AgreementId,
+        operator: String,
+    ) -> Result<Entry, AuditError> {
+        self.append(
+            Attribution::of(session),
+            Event::SessionApprovalRevoked {
+                agreement: agreement.as_str().to_owned(),
+                operator,
+            },
+        )
+    }
+
     pub(crate) fn record_cancellation(
         &self,
         run: &RunId,
@@ -1300,13 +1344,25 @@ impl<C: Clock> Ledger<C> {
         before: Option<u64>,
         limit: usize,
     ) -> (Vec<Arc<Entry>>, Option<u64>) {
+        self.operation_activity(before, limit, |entry| &entry.session == session)
+    }
+
+    /// Selects operations before joining their retained evidence. The predicate
+    /// is applied to decisions, so command search does not discard their results.
+    #[must_use]
+    pub fn operation_activity(
+        &self,
+        before: Option<u64>,
+        limit: usize,
+        matches: impl Fn(&Entry) -> bool,
+    ) -> (Vec<Arc<Entry>>, Option<u64>) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let entries: Vec<_> = state
             .entries
             .iter()
             .rev()
             .filter_map(|held| match held {
-                Held::Intact(entry) if &entry.session == session => Some(entry),
+                Held::Intact(entry) => Some(entry),
                 _ => None,
             })
             .collect();
@@ -1315,6 +1371,7 @@ impl<C: Clock> Ledger<C> {
             .copied()
             .filter(|entry| {
                 matches!(entry.event, Event::Decided { .. })
+                    && matches(entry)
                     && before.is_none_or(|before| entry.sequence < before)
             })
             .take(limit.saturating_add(1))
@@ -1347,7 +1404,8 @@ impl<C: Clock> Ledger<C> {
                         Event::Answered { decided, .. } | Event::Approved { decided, .. } => {
                             sequences.contains(decided)
                         }
-                        Event::Completed { decided, .. } => {
+                        Event::Completed { decided, .. }
+                        | Event::CancellationRequested { decided, .. } => {
                             sequences.contains(decided) || approvals.contains(decided)
                         }
                         Event::Evaluated { artifact, .. } => {
@@ -1829,6 +1887,29 @@ mod tests {
 
     fn recorded_run(ledger: &Ledger<TestClock>, session: &Session, argv: &[&str]) -> Receipt {
         recorded_decision(ledger, session, argv).expect("this command is permitted to run")
+    }
+
+    #[test]
+    fn operation_search_selects_decisions_before_joining_their_completion() {
+        let ledger = ledger();
+        let session = session();
+        let receipt = recorded_run(&ledger, &session, &["printf", "find-this-operation"]);
+        ledger
+            .record_outcome(outcome_for(&receipt, "its-result"))
+            .unwrap();
+        let unrelated = recorded_run(&ledger, &session, &["true"]);
+        ledger
+            .record_outcome(outcome_for(&unrelated, "other-result"))
+            .unwrap();
+        let (page, next) = ledger.operation_activity(None, 1, |entry| match &entry.event {
+            Event::Decided { argv, .. } => argv.iter().any(|arg| arg == "find-this-operation"),
+            _ => false,
+        });
+        assert!(next.is_none());
+        assert!(page.iter().any(|entry| matches!(&entry.event,
+            Event::Completed { decided, .. } if *decided == receipt.sequence())));
+        assert!(!page.iter().any(|entry| matches!(&entry.event,
+            Event::Completed { decided, .. } if *decided == unrelated.sequence())));
     }
 
     fn recorded_decision(

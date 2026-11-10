@@ -850,10 +850,20 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         self.approvals
             .waiting(|session| self.sessions.holds(session))
     }
+
+    #[must_use]
+    pub fn uncollected_approvals(&self) -> Vec<(Asked, bool)> {
+        self.approvals
+            .uncollected(|session| self.sessions.holds(session))
+    }
     /// A bounded newest-first session view for the authenticated workspace.
     #[must_use]
     pub fn recent_session_snapshots(&self, limit: usize) -> Vec<SessionSnapshot> {
         self.sessions.recent_snapshots(limit)
+    }
+
+    pub fn account_session_counts(&self) -> HashMap<(HostId, RoleId), usize> {
+        self.sessions.account_counts()
     }
 
     pub fn session_snapshots(
@@ -867,6 +877,17 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
 
     pub fn session_snapshot(&self, id: &SessionId) -> Option<SessionSnapshot> {
         self.sessions.snapshot(id)
+    }
+
+    pub fn session_snapshots_matching(
+        &self,
+        limit: usize,
+        host: Option<&HostId>,
+        principal: Option<&PrincipalId>,
+        matches: impl Fn(&Session) -> bool,
+    ) -> Vec<SessionSnapshot> {
+        self.sessions
+            .filtered_snapshots_matching(limit, host, principal, matches)
     }
 
     pub fn session_usage(&self, principal: &PrincipalId) -> (usize, usize) {
@@ -1027,9 +1048,26 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
         let answer = self.apply_answer(request, Approver::Human { who: who.clone() }, true)?;
         let session = answer.asked().session.clone();
         let until = self.standing_until(&session, for_millis);
-        let agreement =
-            self.approvals
-                .grant_standing(&session, who, until, StandingCoverage::Session);
+        let agreement = self
+            .approvals
+            .grant_standing_recorded(
+                &session,
+                who,
+                until,
+                StandingCoverage::Session,
+                |agreement, previous| {
+                    if !self.sessions.holds(&session) {
+                        return Err(MediationError::Approval(ApprovalError::Lapsed));
+                    }
+                    self.ledger.record_session_approval_granted(
+                        answer.asked(),
+                        agreement,
+                        previous,
+                    )?;
+                    Ok(())
+                },
+            )
+            .map_err(|cause| MediationError::SessionApprovalNotActivated(Box::new(cause)))?;
         tracing::info!(
             session = session.as_str(),
             request = request.as_str(),
@@ -1072,15 +1110,25 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
 
     /// Withdraws one agreement. Not a refusal: the next matching held command
     /// waits for a person again unless another agreement covers it.
-    pub fn revoke_standing(&self, agreement: &AgreementId) -> bool {
-        let revoked = self.approvals.revoke_standing(agreement);
-        if revoked {
-            tracing::info!(
-                agreement = agreement.as_str(),
-                "a standing agreement was withdrawn"
-            );
+    pub fn revoke_standing(
+        &self,
+        agreement: &AgreementId,
+        operator: String,
+    ) -> Result<bool, MediationError> {
+        if operator.trim().is_empty() {
+            return Err(ApprovalError::Unattributed.into());
         }
-        revoked
+        let Some(withdrawn) = self.approvals.withdraw_standing(agreement) else {
+            return Ok(false);
+        };
+        // Withdrawal stays effective even when its outcome cannot be recorded.
+        let snapshot = self
+            .sessions
+            .snapshot(&withdrawn.session)
+            .ok_or(MediationError::NoConnection)?;
+        self.ledger
+            .record_session_approval_revoked(&snapshot.session, agreement, operator)?;
+        Ok(true)
     }
 
     /// Inspects an owned run without collecting its output.
@@ -1098,6 +1146,14 @@ impl<C: Clock + 'static, S: CredentialSource + 'static> Bastion<C, S> {
             .into());
         }
         Ok(self.runs.progress(run)?)
+    }
+
+    /// Observes retained progress for the authenticated operator surface.
+    /// Unlike an agent operation, observation does not touch session idleness
+    /// or collect its result. The HTTP adapter authenticates the operator.
+    #[must_use]
+    pub fn observe_progress(&self, run: &RunId) -> Option<crate::run::Progress> {
+        self.runs.progress(run).ok()
     }
 
     /// Records an explicit owner cancellation request before notifying the worker.
@@ -1547,6 +1603,8 @@ async fn own_operation<T: Send + 'static>(
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MediationError {
+    #[error("the request approval was recorded, but the session approval was not activated: {0}")]
+    SessionApprovalNotActivated(Box<MediationError>),
     #[error(
         "staged replacement needs overwrite and a distinct temporary path in the destination directory"
     )]
@@ -3611,7 +3669,11 @@ mod tests {
         );
 
         // Withdrawn, the next held command waits for a person again.
-        assert!(bastion.revoke_standing(&agreement));
+        assert!(
+            bastion
+                .revoke_standing(&agreement, "chris".to_owned())
+                .unwrap()
+        );
         let after = bastion
             .exec(&alice(), &session.id, argv(&["sh", "-c", "echo three"]))
             .await
@@ -3656,7 +3718,9 @@ mod tests {
             LIFETIME.max - 200_000,
             "the agreement claims more time than the session has"
         );
-        bastion.revoke_standing(&agreement);
+        bastion
+            .revoke_standing(&agreement, "chris".to_owned())
+            .unwrap();
 
         // A chosen time shorter than the session bounds it instead.
         let held = bastion
@@ -3869,6 +3933,109 @@ mod tests {
     /// A recording boundary the test can fail on demand, standing in for the
     /// flushed stdout write production selects.
     struct FlakyBoundary(std::sync::atomic::AtomicBool);
+
+    struct GrantBoundary(std::sync::atomic::AtomicBool);
+
+    impl Records for GrantBoundary {
+        fn wrote(&self, entry: &crate::audit::Entry) -> Result<(), crate::audit::NotRecorded> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(entry.event, Event::SessionApprovalGranted { .. })
+            {
+                Err(crate::audit::NotRecorded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_grant_preserves_the_recorded_answer_and_previous_authority() {
+        let boundary = Arc::new(GrantBoundary(std::sync::atomic::AtomicBool::new(false)));
+        let bastion = bastion_recording(
+            Arc::new(TestClock::at(1_000)),
+            Limits::default(),
+            Some(boundary.clone()),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let Executed::AwaitingApproval { asked: first, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["true"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected review");
+        };
+        let Executed::AwaitingApproval { asked: second, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["printf", "two"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected review");
+        };
+        let original = bastion
+            .approve_session(&first.asked().id, "chris".to_owned(), Some(60_000))
+            .unwrap();
+        boundary.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            bastion.approve_session(
+                &second.asked().id,
+                "another operator".to_owned(),
+                Some(60_000)
+            ),
+            Err(MediationError::SessionApprovalNotActivated(_))
+        ));
+        assert_eq!(bastion.standing_approvals().first().unwrap().0.id, original);
+        assert!(
+            bastion
+                .uncollected_approvals()
+                .iter()
+                .any(|(request, usable)| request.id == second.asked().id && *usable)
+        );
+        assert!(matches!(
+            bastion
+                .exec(&alice(), &session.id, argv(&["printf", "two"]))
+                .await
+                .unwrap(),
+            Executed::Ran { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_stays_effective_when_its_history_record_fails() {
+        let boundary = FlakyBoundary::healthy();
+        let bastion = bastion_recording(
+            Arc::new(TestClock::at(1_000)),
+            Limits::default(),
+            Some(boundary.clone()),
+        )
+        .await;
+        let session = session_for(&bastion, AccessClass::Privileged).await;
+        let Executed::AwaitingApproval { asked, .. } = bastion
+            .exec(&alice(), &session.id, argv(&["true"]))
+            .await
+            .unwrap()
+        else {
+            panic!("expected review");
+        };
+        let agreement = bastion
+            .approve_session(&asked.asked().id, "chris".to_owned(), Some(60_000))
+            .unwrap();
+        assert!(bastion.ledger().entries().iter().any(|entry| matches!(&entry.event, Event::SessionApprovalGranted { agreement: id, operator, .. } if id == agreement.as_str() && operator == "chris")));
+        boundary.fail_now();
+        assert!(matches!(
+            bastion.revoke_standing(&agreement, "chris".to_owned()),
+            Err(MediationError::Audit(_))
+        ));
+        assert!(bastion.standing_approvals().is_empty());
+        boundary.recover();
+        assert!(matches!(
+            bastion
+                .exec(&alice(), &session.id, argv(&["printf", "after withdrawal"]))
+                .await
+                .unwrap(),
+            Executed::AwaitingApproval { .. }
+        ));
+    }
 
     impl FlakyBoundary {
         fn healthy() -> Arc<Self> {

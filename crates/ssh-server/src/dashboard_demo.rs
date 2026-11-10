@@ -132,6 +132,7 @@ impl ReadsAudit for DemoHistory {
     > {
         Box::pin(async move {
             Ok(audit_history::TranscriptPage {
+                evidence_limited: false,
                 entries: self
                     .entries()
                     .into_iter()
@@ -251,9 +252,13 @@ async fn populated() -> (Arc<DemoBastion>, SessionId) {
 #[tokio::test]
 async fn commands_after_session_approval_are_present_in_history() {
     let (bastion, session) = populated().await;
+    let observed = supervision::Observation::read(&bastion).session(session.as_str());
+    assert!(observed.latest.contains("check-25.example.test"));
+    assert!(observed.latest_when.starts_with("Completed"));
+    assert!(observed.latest_outcome.contains("Exited { code: 0 }"));
     let history = DemoHistory(Arc::clone(&bastion));
     let entries = history.entries();
-    let commands = wire_journeys(&entries, &session, u64::MAX, 0, u64::MAX);
+    let commands = wire_journeys(&entries, u64::MAX, 0, u64::MAX);
     for index in 1..=25 {
         assert!(
             commands.iter().any(|command| command
@@ -307,10 +312,10 @@ async fn commands_after_session_approval_are_present_in_history() {
     let app = routes(Arc::clone(&bastion)).layer(axum::Extension(Operator("demo-operator".into())));
     let body = get_html(app.clone(), &format!("/sessions/{}", session.as_str())).await;
     assert!(body.contains("check-25.example.test"));
-    assert!(body.contains("Succeeded"));
+    assert!(body.contains("Completed · exit 0"));
     assert!(body.contains("Confirm end session"));
     assert!(body.contains("8 / 32"));
-    assert!(body.contains("Recent activity held by this service"));
+    assert!(body.contains("retained operation evidence only"));
     let (_, next) = bastion
         .ledger()
         .session_activity(&session, None, audit_history::PAGE_SIZE);
@@ -331,7 +336,7 @@ async fn commands_after_session_approval_are_present_in_history() {
         &format!("/sessions/{}?source=history", session.as_str()),
     )
     .await;
-    assert!(history.contains("Command history could not be loaded"));
+    assert!(history.contains("Saved history unavailable"));
     assert!(
         history.contains("Confirm end session"),
         "unavailable history hid recovery"

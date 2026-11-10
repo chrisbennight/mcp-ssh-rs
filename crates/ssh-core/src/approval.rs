@@ -516,6 +516,20 @@ impl<C: Clock> Approvals<C> {
         until: Millis,
         coverage: StandingCoverage,
     ) -> AgreementId {
+        self.grant_standing_recorded(session, who, until, coverage, |_, _| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    pub(crate) fn grant_standing_recorded<E>(
+        &self,
+        session: &SessionId,
+        who: String,
+        until: Millis,
+        coverage: StandingCoverage,
+        record: impl FnOnce(&StandingApproval, Option<&AgreementId>) -> Result<(), E>,
+    ) -> Result<AgreementId, E> {
         let id = AgreementId(new_identifier());
         let agreement = StandingApproval {
             id: id.clone(),
@@ -526,10 +540,14 @@ impl<C: Clock> Approvals<C> {
         };
         let now = self.clock.now();
         let mut standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = standing
+            .values()
+            .find(|existing| existing.session == agreement.session && now < existing.until);
+        record(&agreement, previous.map(|existing| &existing.id))?;
         standing
             .retain(|_, existing| now < existing.until && existing.session != agreement.session);
         standing.insert(id.as_str().to_owned(), agreement);
-        id
+        Ok(id)
     }
 
     /// Withdraws one standing agreement, saying whether there was one.
@@ -537,11 +555,16 @@ impl<C: Clock> Approvals<C> {
     /// Withdrawing is not a refusal: the next held command simply waits for a
     /// person again.
     pub fn revoke_standing(&self, agreement: &AgreementId) -> bool {
-        self.standing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(agreement.as_str())
-            .is_some()
+        self.withdraw_standing(agreement).is_some()
+    }
+
+    pub(crate) fn withdraw_standing(&self, agreement: &AgreementId) -> Option<StandingApproval> {
+        let mut standing = self.standing.lock().unwrap_or_else(|e| e.into_inner());
+        let active = standing
+            .get(agreement.as_str())
+            .is_some_and(|agreement| self.clock.now() < agreement.until);
+        let removed = standing.remove(agreement.as_str());
+        active.then_some(removed).flatten()
     }
 
     /// Holds session agreement selection and redemption against withdrawal.
@@ -975,6 +998,23 @@ impl<C: Clock> Approvals<C> {
             .collect()
     }
 
+    /// Recorded positive answers that have not been collected. The boolean
+    /// reports whether their collection window is still open.
+    #[must_use]
+    pub fn uncollected(&self, redeemable: impl Fn(&SessionId) -> bool) -> Vec<(Asked, bool)> {
+        let now = self.clock.now();
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|held| {
+                matches!(held.state, State::Approved { recorded: true, .. })
+                    && redeemable(&held.asked.session)
+            })
+            .map(|held| (held.asked.clone(), now < held.redeem_by))
+            .collect()
+    }
+
     /// Drops requests nobody can act on any more.
     ///
     /// What stops one being worth keeping depends on what became of it: an
@@ -1161,6 +1201,30 @@ mod tests {
 
     fn approvals() -> Approvals<TestClock> {
         Approvals::new(TestClock::at(1_000), WINDOWS, WAITING_PER_SESSION)
+    }
+
+    #[test]
+    fn a_failed_grant_record_cannot_replace_an_active_session_approval() {
+        let approvals = approvals();
+        let session = session("alice");
+        let original = approvals.grant_standing(
+            &session.id,
+            "chris".to_owned(),
+            60_000,
+            StandingCoverage::Session,
+        );
+        let result = approvals.grant_standing_recorded(
+            &session.id,
+            "another operator".to_owned(),
+            90_000,
+            StandingCoverage::Session,
+            |_, previous| {
+                assert_eq!(previous, Some(&original));
+                Err("record unavailable")
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(approvals.standing().first().unwrap().id, original);
     }
 
     fn human() -> Approver {
