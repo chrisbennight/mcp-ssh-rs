@@ -68,6 +68,17 @@ outcomes, pagination, and unavailable-source wording against the actual service.
 The exporter is skipped by the ordinary test suite because it writes review
 artifacts; run it explicitly when reviewing visual changes.
 
+## Browser refresh regressions
+
+From the repository root, serve the checkout with
+`python3 -m http.server 8765 --bind 127.0.0.1` and open
+`http://127.0.0.1:8765/crates/ssh-server/tests/browser/activity-refresh.html`.
+The page runs the production refresh script against a real DOM with fake reads
+and controlled timers. Every case must pass. It covers arrivals after approval,
+expanded request cards, duration preservation, focused controls, source failure,
+timeouts, page restoration, tab visibility and pause/resume. It does not contact
+SSH targets or change production state. Stop the local server when finished.
+
 ## Public presentation
 
 Inspect the README header and current screenshots on wide and narrow screens in

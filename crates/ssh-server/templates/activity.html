@@ -6,8 +6,8 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Activity · mcp-ssh-rs</title>
 {% include "styles.html" %}
-<script src="/dashboard/assets/activity.js" defer></script>
-<script src="/dashboard/assets/investigations.js" defer></script>
+<script src="/dashboard/assets/activity.js?v={{ crate::dashboard::script_version() }}" defer></script>
+<script src="/dashboard/assets/investigations.js?v={{ crate::dashboard::script_version() }}" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>
@@ -32,7 +32,7 @@
 <form method="post" action="/dashboard/approvals/standing/{{ agreement.id }}"><button class="refuse" name="decision" value="revoke">Revoke session approval</button></form>
 <p class="muted">Revoking approval affects future requests; it does not end the session or stop running work.</p>
 {% endfor %}
-<details class="end-session"><summary>End session…</summary>
+<details class="end-session" id="end-session-{{ session.id }}"><summary>End session…</summary>
 <p>Release this session's slot and disconnect its SSH connection. Commands may be interrupted; detached remote processes may continue.</p>
 <form method="post" action="/dashboard/sessions/{{ session.id }}/terminate"><button class="refuse" name="decision" value="terminate">Confirm end session</button></form>
 </details>
@@ -115,7 +115,7 @@
 {% if row.missing_request %}<p class="notice">Original arguments and intent are unavailable. Retained result evidence is shown below.</p>{% endif %}
 {% match row.file %}{% when Some with (file) %}<h2>File result and operation</h2>{% call file_ui::detail(file) %}{% endcall %}{% when None %}{% endmatch %}
 {% if !row.arguments.is_empty() %}
-{% if row.kind == "execute" %}<h2>Exact arguments</h2>{% else %}<details><summary>Exact operation representation</summary>{% endif %}
+{% if row.kind == "execute" %}<h2>Exact arguments</h2>{% else %}<details id="representation-{{ row.id }}"><summary>Exact operation representation</summary>{% endif %}
 <ol class="argv" start="0">{% for argument in row.arguments %}<li>{% if argument.is_empty() %}<em>(empty argument)</em>{% else %}{{ argument }}{% endif %}</li>{% endfor %}</ol>
 {% if row.kind != "execute" %}</details>{% endif %}
 {% endif %}
@@ -124,8 +124,8 @@
 <p class="muted">{{ output.label }} · {{ output.note }}</p>
 {% if !output.url.is_empty() %}<a href="{{ output.url }}">Inspect retained {{ output.label }}</a>{% endif %}
 {% endfor %}
-{% match row.assessment %}{% when Some with (assessment) %}<details><summary>Advisory assessment · {{ assessment.verdict }}</summary><p>{{ assessment.evaluator }} · confidence {{ assessment.confidence }}%</p><p>{{ assessment.rationale }}</p>{% if !assessment.side_effects.is_empty() %}<p>Reported potential side effects</p><ul>{% for effect in assessment.side_effects %}<li>{{ effect }}</li>{% endfor %}</ul>{% endif %}</details>{% when None %}{% endmatch %}
-<details><summary>Approval and evidence</summary><dl>
+{% match row.assessment %}{% when Some with (assessment) %}<details id="assessment-{{ row.id }}"><summary>Advisory assessment · {{ assessment.verdict }}</summary><p>{{ assessment.evaluator }} · confidence {{ assessment.confidence }}%</p><p>{{ assessment.rationale }}</p>{% if !assessment.side_effects.is_empty() %}<p>Reported potential side effects</p><ul>{% for effect in assessment.side_effects %}<li>{{ effect }}</li>{% endfor %}</ul>{% endif %}</details>{% when None %}{% endmatch %}
+<details id="evidence-{{ row.id }}"><summary>Approval and evidence</summary><dl>
 <dt>Evidence source</dt><dd>{{ row.evidence }}</dd><dt>Human answer</dt><dd>{{ row.human_answer }}</dd><dt>Execution authorization</dt><dd>{{ row.authorization }}</dd><dt>Observed result</dt><dd>{{ row.outcome }}</dd><dt>Session purpose</dt><dd>{{ row.purpose }}</dd><dt>Record identity</dt><dd class="digest">{{ row.id }}</dd>
 <dt>Request</dt><dd class="mono">{% if row.request.is_empty() %}Not recorded{% else %}{{ row.request }}{% endif %}</dd><dt>Run</dt><dd class="mono">{% if row.run.is_empty() %}Not recorded{% else %}{{ row.run }}{% endif %}</dd>
 </dl><ol class="evidence-records">{% for record in row.evidence_records %}<li><strong>{{ record.event }}</strong> · #{{ record.sequence }} · {{ record.summary }}<span class="digest">{{ record.digest }}</span></li>{% endfor %}</ol></details>

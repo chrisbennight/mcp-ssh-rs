@@ -8,7 +8,7 @@
 </head>
 <body><a class="skip-link" href="#main-content">Skip to content</a><div class="shell"><aside class="sidebar">{% include "brand.html" %}{% if inventory_active %}{% call navigation::sidebar("hosts") %}{% endcall %}{% elif sessions_active %}{% call navigation::sidebar("sessions") %}{% endcall %}{% else %}{% call navigation::sidebar("activity") %}{% endcall %}{% endif %}<div class="sidebar-foot">Review requests and manage sessions.</div></aside>
 <main id="main-content" tabindex="-1"><header class="topbar"><div><p class="eyebrow">Operations</p><h1>{{ title }}</h1></div><div class="operator">Signed in as <strong>{{ operator }}</strong></div></header><div class="content">
-{% if inventory_active || sessions_active %}<script src="/dashboard/assets/activity.js" defer></script><div class="live-controls"><span id="freshness" role="status">Observed on page load</span><button id="pause-updates" type="button" hidden>Pause updates</button><button id="apply-updates" type="button" hidden>Apply updates</button></div>{% endif %}
+{% if inventory_active || sessions_active %}<script src="/dashboard/assets/activity.js?v={{ crate::dashboard::script_version() }}" defer></script><div class="live-controls"><span id="freshness" role="status">Observed on page load</span><button id="pause-updates" type="button" hidden>Pause updates</button><button id="apply-updates" type="button" hidden>Apply updates</button></div>{% endif %}
 {% if !transcript_active %}<div class="notice">{{ source_notice }}</div>{% endif %}
 {% if inventory_active %}
 <div id="activity-results" data-source="current"><div class="section-head"><div><h2>Configured targets</h2><p class="muted">Choose an account and inspect its sessions.</p></div><span class="metric">{{ inventory.len() }}</span></div>
