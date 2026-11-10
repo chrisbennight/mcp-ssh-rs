@@ -317,7 +317,6 @@ fn review_page<C: Clock + 'static, S: CredentialSource + 'static>(
                     elapsed_time(snapshot.ends_by.min(snapshot.idle_by).saturating_sub(now))
                 })
                 .unwrap_or_else(|| "unavailable".to_owned());
-            row.selected = row.id == selected;
             row
         })
         .collect();
