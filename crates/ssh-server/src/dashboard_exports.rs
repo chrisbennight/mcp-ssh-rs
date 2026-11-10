@@ -276,9 +276,7 @@ where
             }
         }
         incomplete |= !page.available || page.limited;
-        if !page.available || page.limited {
-            coverage.push(page.notice.clone());
-        }
+        coverage.push(page.notice.clone());
         continuation = page.next_url;
         for mut row in page.operations {
             if !seen.insert(row.id.clone()) {

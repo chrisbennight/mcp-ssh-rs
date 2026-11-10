@@ -54,7 +54,13 @@ pub(super) fn describe(
     arguments: &[String],
     event: Option<&serde_json::Value>,
 ) -> Option<FileShown> {
-    if kind == "execute" {
+    if kind == "execute"
+        || (kind == "unknown"
+            && event.is_none_or(|event| {
+                event.get("file").is_none_or(serde_json::Value::is_null)
+                    && event.get("info").is_none_or(serde_json::Value::is_null)
+            }))
+    {
         return None;
     }
     let program = match kind {

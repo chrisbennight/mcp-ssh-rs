@@ -99,8 +99,8 @@
 <details id="export"><summary>Export evidence</summary><p class="muted">Download operations as a bounded evidence projection. Remote file contents and byte credentials are excluded. Source or preparation limits remain in the file's manifest.</p>
 <form method="get" action="/dashboard/activity/export" id="export-evidence"><input type="hidden" name="investigation" value="{{ investigation }}"><input type="hidden" name="page_ids" value="{{ page_ids }}"><div class="filters"><label>Scope<select name="scope"><option value="page">Displayed page</option><option value="selected"{% if !query.selected.is_empty() %} selected{% endif %}>Selected operation</option><option value="range">Filtered time range</option></select></label><label>Format<select name="format"><option value="json">JSON evidence</option><option value="csv">CSV summary and manifest row</option><option value="text">Text report</option></select></label><label><input type="checkbox" name="output" value="true"> Include retained output previews</label><button type="submit">Prepare export</button></div></form><p id="export-status" role="status">Output previews are excluded by default. Preparation is limited to 500 operations, 2 MiB and 15 seconds.</p><a id="export-download" hidden>Download prepared evidence</a></details>
 
-<p class="muted">{% match matching %}{% when Some with (count) %}{{ count }} matching operations in the retained observation. {% when None %}{{ scanned }} request records examined on this page. {% endmatch %}Up to {{ page_size }} matching operations shown. {% if limited %}<strong>Evidence is incomplete.</strong>{% endif %}</p>
 <div id="activity-results" data-source="{{ source }}" data-investigation="{{ investigation }}" data-page-ids="{{ page_ids }}">
+<p class="muted">{% match matching %}{% when Some with (count) %}{{ count }} matching operations in the retained observation. {% when None %}{{ scanned }} request records examined on this page. {% endmatch %}Up to {{ page_size }} matching operations shown. {% if limited %}<strong>Evidence is incomplete.</strong>{% endif %}</p>
 {% if operations.is_empty() %}<div class="empty">{% if !available %}The evidence source could not complete this query. Retry, narrow the range, or inspect Current service.{% else %}No matching operations were found in the examined records. Adjust filters or continue to older operations if available.{% endif %}</div>{% else %}
 <div class="operation-columns" aria-hidden="true"><span>Time</span><span>Operation and target</span><span>Execution</span></div>
 {% for row in operations %}
@@ -113,9 +113,12 @@
 {% if !row.progress.is_empty() %}<p>{{ row.progress }}</p>{% endif %}
 {% if !row.cancellation.is_empty() %}<p class="notice">{{ row.cancellation }}</p>{% endif %}
 {% if row.missing_request %}<p class="notice">Original arguments and intent are unavailable. Retained result evidence is shown below.</p>{% endif %}
-{% if row.kind == "execute" || row.missing_request %}<h2>Exact arguments</h2>{% else %}<h2>File operation</h2>{% match row.file %}{% when Some with (file) %}{% call file_ui::detail(file) %}{% endcall %}{% when None %}<p class="notice">Structured file details unavailable.</p>{% endmatch %}<details><summary>Exact operation representation</summary>{% endif %}
+{% match row.file %}{% when Some with (file) %}<h2>File result and operation</h2>{% call file_ui::detail(file) %}{% endcall %}{% when None %}{% endmatch %}
+{% if !row.arguments.is_empty() %}
+{% if row.kind == "execute" %}<h2>Exact arguments</h2>{% else %}<details><summary>Exact operation representation</summary>{% endif %}
 <ol class="argv" start="0">{% for argument in row.arguments %}<li>{% if argument.is_empty() %}<em>(empty argument)</em>{% else %}{{ argument }}{% endif %}</li>{% endfor %}</ol>
-{% if row.kind != "execute" && !row.missing_request %}</details>{% endif %}
+{% if row.kind != "execute" %}</details>{% endif %}
+{% endif %}
 {% for output in row.outputs %}
 {% if !output.preview.is_empty() %}<h3>{{ output.label }}</h3><pre class="output">{{ output.preview }}</pre>{% endif %}
 <p class="muted">{{ output.label }} · {{ output.note }}</p>

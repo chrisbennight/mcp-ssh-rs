@@ -2444,6 +2444,11 @@ mod tests {
                 "/sessions",
                 Arc::new(audit_history::Unavailable) as Arc<dyn ReadsAudit>,
             ),
+            (
+                "current-activity",
+                "/activity?source=current",
+                Arc::new(audit_history::Unavailable) as Arc<dyn ReadsAudit>,
+            ),
         ] {
             let response = routes_with_audit(operations_bastion(), reader)
                 .layer(axum::Extension(Operator("visual-review".to_owned())))
@@ -3321,7 +3326,9 @@ mod tests {
                 let session = "0123456789abcdef0123456789abcdef";
                 let decision_digest = "d".repeat(64);
                 let entry = |sequence, event, digest: String| audit_history::Entry {
-                    source_nanos: 1_800_000_000_000_000_000_u64.saturating_add(sequence),
+                    source_nanos: 1_800_000_000_000_000_000_u64
+                        .saturating_sub(100)
+                        .saturating_add(sequence),
                     sequence,
                     at: sequence,
                     session: session.to_owned(),
@@ -3653,6 +3660,23 @@ mod tests {
         .unwrap();
         assert!(body.contains("belongs to an earlier service instance"));
         assert!(body.contains(&format!("instance={old}")));
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_saved_run_does_not_export_ready_empty_evidence() {
+        let app = routes_with_audit(operations_bastion(), Arc::new(SessionJourneyPage))
+            .layer(axum::Extension(Operator("chris".into())));
+        let query=url::form_urlencoded::Serializer::new(String::new()).append_pair("investigation","/dashboard/activity?source=history&time_basis=requested&run=1111111111111111-11111111111111111111111111111111").append_pair("scope","range").finish();
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/activity/export?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

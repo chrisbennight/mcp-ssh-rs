@@ -268,7 +268,7 @@ Sources and missing evidence are labeled explicitly.
 Search literal command arguments, intent, purpose, paths or recorded identifiers.
 Use **More filters** to narrow by account, request, run, session approval,
 approval status or advisory assessment. Choose whether the time range selects
-requests or completions. Output contents are not searched. Scope chips remove
+requests or completions. Saved run lookup depends on a recorded completion association through the fixed observation cutoff; an unresolved association is reported as incomplete, and later evidence is not imported into an earlier observation. Output contents are not searched. Scope chips remove
 one filter at a time. **Refresh time range** starts a new observation.
 
 Retries waiting for a human answer and the agent's later collection stay on one

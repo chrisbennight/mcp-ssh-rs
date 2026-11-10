@@ -398,13 +398,17 @@ impl OperationShown {
         {
             return false;
         }
-        if self.evidence == "history"
-            && query.time_basis == "completed"
-            && self.completed_at.is_none_or(|at| {
+        if self.evidence == "history" {
+            let at = if query.time_basis == "completed" {
+                self.completed_at
+            } else {
+                self.requested_at
+            };
+            if at.is_none_or(|at| {
                 query.start.is_some_and(|start| at < start) || query.end.is_some_and(|end| at > end)
-            })
-        {
-            return false;
+            }) {
+                return false;
+            }
         }
         true
     }
@@ -427,6 +431,7 @@ struct AssessmentExport {
     side_effects: Vec<String>,
 }
 
+#[cfg_attr(test, derive(Default))]
 #[derive(Template)]
 #[template(path = "activity.html")]
 struct ActivityPage {
@@ -1121,6 +1126,8 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
         let mut request = request;
         let mut rows = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut run_resolved = query.run.is_empty() || query.time_basis == "completed";
+        let mut missing_request_time = false;
         let mut next = None;
         let mut notice = "Saved history · request records in the selected window; related evidence is read through the fixed upper bound.".to_owned();
         if audit_history::is_operation_identifier(&query.q) {
@@ -1160,6 +1167,9 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
                 output_start,
                 page.window_end,
             );
+            run_resolved |= page_rows.iter().any(|row| row.run == query.run);
+            missing_request_time |= query.time_basis != "completed"
+                && page_rows.iter().any(|row| row.requested_at.is_none());
             scanned = scanned.saturating_add(page_rows.len());
             rows.extend(
                 page_rows
@@ -1175,6 +1185,14 @@ async fn load_activity<C: Clock + 'static, S: CredentialSource + 'static>(
         }
         if limited && available {
             notice.push_str(" Related cancellation evidence reached its retrieval limit; some requests may be absent.");
+        }
+        if !run_resolved {
+            limited = true;
+            notice.push_str(" The run association is unavailable through this fixed observation cutoff. A later completion cannot establish an earlier observation; use Current service or refresh the time range.");
+        }
+        if missing_request_time {
+            limited = true;
+            notice.push_str(" Some original request times are unavailable. Select Completed in range to inspect retained result records.");
         }
         if filtered_history && next.is_some() {
             notice.push_str(" Matching examines at most 100 request records per page. Continue to older operations for remaining evidence.");
@@ -1400,6 +1418,59 @@ mod tests {
         );
         let second = rows.iter().find(|row| row.session == other).unwrap();
         assert!(second.status.contains("7"));
+    }
+
+    #[test]
+    fn saved_time_basis_selects_the_matching_operation_timestamp() {
+        let row = OperationShown {
+            evidence: "history".into(),
+            requested_at: Some(100),
+            completed_at: Some(200),
+            ..Default::default()
+        };
+        let mut query = ActivityQuery {
+            start: Some(150),
+            end: Some(250),
+            time_basis: "requested".into(),
+            ..Default::default()
+        };
+        assert!(!row.matches_view(&query));
+        query.time_basis = "completed".into();
+        assert!(row.matches_view(&query));
+        query.start = Some(50);
+        query.end = Some(150);
+        query.time_basis = "requested".into();
+        assert!(row.matches_view(&query));
+        query.time_basis = "completed".into();
+        assert!(!row.matches_view(&query));
+    }
+
+    #[test]
+    fn a_retained_file_result_renders_when_its_original_request_is_unavailable() {
+        let digest = "e".repeat(64);
+        let retained = entry(
+            "0123456789abcdef0123456789abcdef",
+            2,
+            'b',
+            json!({"event":"completed","decided":1,"run":"abcdef0123456789-abcdef0123456789abcdef0123456789","state":"exit 0","info":{"operation":"checksum","bytes":12,"sha256":digest}}),
+        );
+        let query = ActivityQuery {
+            time_basis: "completed".into(),
+            ..Default::default()
+        };
+        let operations = shown(&[retained], &query, "history", 10, 0, 10);
+        let page = ActivityPage {
+            operations,
+            query,
+            available: true,
+            source: "history".into(),
+            ..Default::default()
+        };
+        let html = page.render().unwrap();
+        assert!(html.contains("Original arguments and intent are unavailable"));
+        assert!(html.contains("Observed digest"));
+        assert!(html.contains(&digest));
+        assert!(!html.contains("<ol class=\"argv\""));
     }
 
     #[test]
