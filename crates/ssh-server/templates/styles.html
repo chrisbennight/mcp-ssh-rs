@@ -147,4 +147,10 @@ details > summary { cursor:pointer; min-height:44px; padding:.6rem 0; font-weigh
 @media(max-width:1000px) { .steps { grid-template-columns:1fr 1fr; } }
 @media(max-width:850px) { .shell { grid-template-columns:1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--soft); padding:1rem; gap:1rem; } nav { display:flex; flex-wrap:wrap; } .sidebar-foot { display:none; } .request-grid { grid-template-columns:1fr; } .request-context { border-left:0; border-top:1px solid var(--soft); } .filters { grid-template-columns:1fr 1fr; } }
 @media(max-width:560px) { .summary,.filters,.steps { grid-template-columns:1fr; } .topbar { align-items:flex-start; flex-direction:column; } dl { grid-template-columns:1fr; } dt { padding-bottom:0; } .session { margin-left:0; } form.actions { align-items:stretch; } form.actions button { flex:1 1 auto; } .duration { flex:1 0 100%; } }
+.review-request { border:1px solid var(--soft); border-radius:.7rem; background:var(--panel); margin:.7rem 0; }
+.review-request > summary { display:flex; justify-content:space-between; gap:1rem; padding:1rem; }
+.review-request > summary .muted { display:block; }
+.session-approval { padding:.3rem 1rem 1rem; border-top:1px solid var(--soft); }
+.host-account { padding:1rem 0; border-bottom:1px solid var(--soft); }
+.host-account h3 { margin-bottom:.4rem; }
 </style>

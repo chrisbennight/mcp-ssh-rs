@@ -252,6 +252,10 @@ async fn populated() -> (Arc<DemoBastion>, SessionId) {
 #[tokio::test]
 async fn commands_after_session_approval_are_present_in_history() {
     let (bastion, session) = populated().await;
+    let observed = supervision::Observation::read(&bastion).session(session.as_str());
+    assert!(observed.latest.contains("check-25.example.test"));
+    assert!(observed.latest_when.starts_with("Completed"));
+    assert!(observed.latest_outcome.contains("Exited { code: 0 }"));
     let history = DemoHistory(Arc::clone(&bastion));
     let entries = history.entries();
     let commands = wire_journeys(&entries, u64::MAX, 0, u64::MAX);

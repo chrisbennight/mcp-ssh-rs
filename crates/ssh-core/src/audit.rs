@@ -263,6 +263,17 @@ pub enum EvaluationError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    SessionApprovalGranted {
+        agreement: String,
+        operator: String,
+        request: String,
+        until: Millis,
+        supersedes: Option<String>,
+    },
+    SessionApprovalRevoked {
+        agreement: String,
+        operator: String,
+    },
     SessionOpened {
         purpose: String,
         access_class: AccessClass,
@@ -1155,6 +1166,39 @@ impl<C: Clock> Ledger<C> {
             Event::SessionOpened {
                 purpose: session.purpose.as_str().to_owned(),
                 access_class: session.access_class,
+            },
+        )
+    }
+
+    pub(crate) fn record_session_approval_granted(
+        &self,
+        asked: &crate::approval::Asked,
+        agreement: &crate::approval::StandingApproval,
+        supersedes: Option<&crate::approval::AgreementId>,
+    ) -> Result<Entry, AuditError> {
+        self.append(
+            Attribution::about(asked),
+            Event::SessionApprovalGranted {
+                agreement: agreement.id.as_str().to_owned(),
+                operator: agreement.who.clone(),
+                request: asked.id.as_str().to_owned(),
+                until: agreement.until,
+                supersedes: supersedes.map(|id| id.as_str().to_owned()),
+            },
+        )
+    }
+
+    pub(crate) fn record_session_approval_revoked(
+        &self,
+        session: &Session,
+        agreement: &crate::approval::AgreementId,
+        operator: String,
+    ) -> Result<Entry, AuditError> {
+        self.append(
+            Attribution::of(session),
+            Event::SessionApprovalRevoked {
+                agreement: agreement.as_str().to_owned(),
+                operator,
             },
         )
     }
