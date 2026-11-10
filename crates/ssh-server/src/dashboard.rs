@@ -1586,6 +1586,11 @@ where
             before,
             start,
             end,
+            window: if start.is_some() {
+                "30d".to_owned()
+            } else {
+                String::new()
+            },
             source: match query.source {
                 ActivitySource::Auto => "",
                 ActivitySource::Current => "current",
@@ -3293,6 +3298,7 @@ mod tests {
             Box::pin(async move {
                 let page = self.page(&audit_history::Query::default()).await?;
                 Ok(audit_history::TranscriptPage {
+                    evidence_limited: false,
                     entries: page.entries,
                     next_before: page.next_before,
                     window_start: page.window_start,
